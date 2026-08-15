@@ -66,13 +66,13 @@
               <div class="break-all font-medium text-gray-900 dark:text-white">
                 {{ row.model }}
               </div>
-              <div class="break-all text-gray-500 dark:text-gray-400">
+              <div class="break-all font-medium text-emerald-600 dark:text-emerald-400">
                 <span class="mr-0.5">↳</span>{{ row.upstream_model }}
               </div>
             </div>
             <span v-else class="font-medium text-gray-900 dark:text-white">{{ row.model }}</span>
             <div
-              v-if="row.upstream_model_mismatch === true && row.upstream_response_model"
+              v-if="row.upstream_model_mismatch === true && row.upstream_response_model && !isKnownWatermarkModel(row)"
               class="break-all pl-3 text-[11px]"
               :class="isLikelyModelVariant(row) ? 'text-amber-600 dark:text-amber-400' : 'text-orange-600 dark:text-orange-400'"
               :title="modelAuditTitle(row)"
@@ -589,10 +589,16 @@ const showIpGeoToolbar = computed(() => props.columns.some((col) => col.key === 
 
 const sentUpstreamModel = (row: AdminUsageLog): string => row.upstream_model?.trim() || row.model?.trim() || ''
 
+const isKnownWatermarkModel = (row: AdminUsageLog): boolean => {
+  const sent = sentUpstreamModel(row).toLowerCase()
+  return sent.endsWith('-wm')
+}
+
 const normalizeModelVariant = (model: string): string => model
   .trim()
   .toLowerCase()
   .replace(/-latest$/, '')
+  .replace(/-wm$/, '')
   .replace(/-\d{4}-\d{2}-\d{2}$/, '')
   .replace(/-\d{8}$/, '')
 
