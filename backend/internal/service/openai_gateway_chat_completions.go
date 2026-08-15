@@ -105,8 +105,11 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 
 	// 2. Resolve model mapping early so compat prompt_cache_key injection can
 	// derive a stable seed from the final upstream model family.
-	billingModel := resolveOpenAIForwardModel(account, originalModel, defaultMappedModel)
-	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
+	billingModel, isExplicitlyMapped := resolveOpenAIForwardModelMatched(account, originalModel, defaultMappedModel)
+	upstreamModel := billingModel
+	if !isExplicitlyMapped {
+		upstreamModel = normalizeOpenAIModelForUpstream(account, billingModel)
+	}
 
 	promptCacheKey = strings.TrimSpace(promptCacheKey)
 	compatPromptCacheInjected := false

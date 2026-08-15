@@ -58,8 +58,11 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	clientStream := anthropicReq.Stream // client's original stream preference
 
 	// 2. Model mapping
-	billingModel := resolveOpenAIForwardModel(account, normalizedModel, defaultMappedModel)
-	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
+	billingModel, isExplicitlyMapped := resolveOpenAIForwardModelMatched(account, normalizedModel, defaultMappedModel)
+	upstreamModel := billingModel
+	if !isExplicitlyMapped {
+		upstreamModel = normalizeOpenAIModelForUpstream(account, billingModel)
+	}
 	promptCacheKey = strings.TrimSpace(promptCacheKey)
 	apiKeyID := getAPIKeyIDFromContext(c)
 	anthropicDigestChain := ""

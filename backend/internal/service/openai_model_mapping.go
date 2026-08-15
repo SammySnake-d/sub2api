@@ -2,23 +2,32 @@ package service
 
 import "strings"
 
+// resolveOpenAIForwardModelMatched 解析 OpenAI 兼容转发使用的模型，并返回是否命中了显式配置的映射规则。
+func resolveOpenAIForwardModelMatched(account *Account, requestedModel, messagesDispatchMappedModel string) (string, bool) {
+	messagesDispatchMappedModel = strings.TrimSpace(messagesDispatchMappedModel)
+	if account == nil {
+		if messagesDispatchMappedModel != "" {
+			return messagesDispatchMappedModel, true
+		}
+		return requestedModel, false
+	}
+
+	mappedModel, matched := account.ResolveMappedModel(requestedModel)
+	if matched {
+		return mappedModel, true
+	}
+	if messagesDispatchMappedModel != "" {
+		return messagesDispatchMappedModel, true
+	}
+	return mappedModel, false
+}
+
 // resolveOpenAIForwardModel 解析 OpenAI 兼容转发使用的模型。
 // messagesDispatchMappedModel 是调用方已为 /v1/messages 解析的显式调度结果；
 // 普通 OpenAI 请求必须传空，避免将分组配置作为通用模型兜底。
 func resolveOpenAIForwardModel(account *Account, requestedModel, messagesDispatchMappedModel string) string {
-	messagesDispatchMappedModel = strings.TrimSpace(messagesDispatchMappedModel)
-	if account == nil {
-		if messagesDispatchMappedModel != "" {
-			return messagesDispatchMappedModel
-		}
-		return requestedModel
-	}
-
-	mappedModel, matched := account.ResolveMappedModel(requestedModel)
-	if !matched && messagesDispatchMappedModel != "" {
-		return messagesDispatchMappedModel
-	}
-	return mappedModel
+	model, _ := resolveOpenAIForwardModelMatched(account, requestedModel, messagesDispatchMappedModel)
+	return model
 }
 
 // openAIOAuthForeignModelPrefixes 列出明确属于其他厂商家族的模型名前缀。
