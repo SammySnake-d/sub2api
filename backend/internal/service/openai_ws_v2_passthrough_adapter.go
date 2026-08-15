@@ -98,7 +98,11 @@ func openAIWSPassthroughPolicyModelForFrame(account *Account, payload []byte) st
 	if original == "" {
 		return ""
 	}
-	return normalizeOpenAIModelForUpstream(account, account.GetMappedModel(original))
+	m, isExplicit := resolveOpenAIForwardModelMatched(account, original, "")
+	if isExplicit {
+		return m
+	}
+	return normalizeOpenAIModelForUpstream(account, m)
 }
 
 // openAIWSPassthroughPolicyModelFromSessionFrame returns the upstream model
@@ -130,7 +134,11 @@ func openAIWSPassthroughPolicyModelFromSessionFrame(account *Account, payload []
 	if original == "" {
 		return ""
 	}
-	return normalizeOpenAIModelForUpstream(account, account.GetMappedModel(original))
+	m, isExplicit := resolveOpenAIForwardModelMatched(account, original, "")
+	if isExplicit {
+		return m
+	}
+	return normalizeOpenAIModelForUpstream(account, m)
 }
 
 type openAIWSPassthroughUsageMeta struct {

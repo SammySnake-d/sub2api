@@ -37,7 +37,11 @@ func (s *OpenAIGatewayService) ForwardAlphaSearch(ctx context.Context, c *gin.Co
 		return nil, fmt.Errorf("model is required")
 	}
 
-	upstreamModel := normalizeOpenAIModelForUpstream(account, account.GetMappedModel(requestedModel))
+	m, isExplicit := resolveOpenAIForwardModelMatched(account, requestedModel, "")
+	upstreamModel := m
+	if !isExplicit {
+		upstreamModel = normalizeOpenAIModelForUpstream(account, m)
+	}
 	if upstreamModel != "" && upstreamModel != requestedModel {
 		body = ReplaceModelInBody(body, upstreamModel)
 	}

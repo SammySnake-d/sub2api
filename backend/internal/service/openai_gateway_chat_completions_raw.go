@@ -73,8 +73,11 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 	serviceTier := extractOpenAIServiceTierFromBody(body)
 
 	// 2. Resolve model mapping (same as ForwardAsChatCompletions)
-	billingModel := resolveOpenAIForwardModel(account, originalModel, defaultMappedModel)
-	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
+	billingModel, isExplicit := resolveOpenAIForwardModelMatched(account, originalModel, defaultMappedModel)
+	upstreamModel := billingModel
+	if !isExplicit {
+		upstreamModel = normalizeOpenAIModelForUpstream(account, billingModel)
+	}
 	grokCacheIdentity := ""
 	if account.Platform == PlatformGrok {
 		// Resolve before image bridging or other body rewrites so the fallback is

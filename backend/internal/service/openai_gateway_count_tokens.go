@@ -202,8 +202,11 @@ func prepareOpenAIInputTokensCountRequest(
 	originalModel := anthropicReq.Model
 	applyOpenAICompatModelNormalization(&anthropicReq)
 	normalizedModel := anthropicReq.Model
-	billingModel := resolveOpenAIForwardModel(account, normalizedModel, strings.TrimSpace(defaultMappedModel))
-	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
+	billingModel, isExplicit := resolveOpenAIForwardModelMatched(account, normalizedModel, strings.TrimSpace(defaultMappedModel))
+	upstreamModel := billingModel
+	if !isExplicit {
+		upstreamModel = normalizeOpenAIModelForUpstream(account, billingModel)
+	}
 
 	responsesReq, err := apicompat.AnthropicToResponses(&anthropicReq)
 	if err != nil {

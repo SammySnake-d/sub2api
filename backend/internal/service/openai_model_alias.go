@@ -64,6 +64,10 @@ func normalizeKnownOpenAICodexModel(model string) string {
 		}
 	}
 
+	if strings.HasSuffix(normalized, "-wm") {
+		return ""
+	}
+
 	switch {
 	case strings.Contains(normalized, "gpt-5.6-sol"):
 		return "gpt-5.6-sol"

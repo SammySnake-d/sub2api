@@ -529,8 +529,11 @@ func (s *OpenAIGatewayService) forwardGrokChatCompletionsViaResponses(
 	}
 	originalModel := chatReq.Model
 	clientStream := chatReq.Stream
-	billingModel := resolveOpenAIForwardModel(account, originalModel, defaultMappedModel)
-	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
+	billingModel, isExplicit := resolveOpenAIForwardModelMatched(account, originalModel, defaultMappedModel)
+	upstreamModel := billingModel
+	if !isExplicit {
+		upstreamModel = normalizeOpenAIModelForUpstream(account, billingModel)
+	}
 	cacheIdentity := resolveGrokCacheIdentity(c, body, promptCacheKey, upstreamModel)
 	// Image inputs must go through the Responses bridge: the raw Chat
 	// Completions path cannot forward image_url parts to Grok's native vision
