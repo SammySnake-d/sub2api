@@ -379,6 +379,34 @@ func (s *BillingService) initFallbackPricing() {
 		SupportsCacheBreakdown:     false,
 	}
 
+	// Claude Sonnet 5。
+	// 数字来源：Anthropic 官方价目表 https://docs.anthropic.com/en/docs/about-claude/pricing
+	// 与 https://platform.claude.com/docs/en/models/sonnet-5/overview，2026-09-16 核对：
+	//   $2 输入 / $2.50 5m 写 / $4 1h 写 / $0.20 读 / $10 输出 per MTok。
+	//
+	// ⚠️ 这里曾被填成 $3/$15（sonnet-4 那一档）。那来自一条**已被官方撤销**的涨价计划，
+	// 官方在同一页逐字写明：
+	//
+	//   "The $2/$10 per million input/output token pricing for Claude Sonnet 5,
+	//    announced at launch as introductory pricing through August 31, 2026,
+	//    is now the standard price. The previously scheduled increase to $3/$15
+	//    per million input/output tokens on September 1, 2026 will not occur."
+	//
+	// 按 $3 计价会对每一个 sonnet-5 请求多收 50%。改这几个数字之前请先读上面那段。
+	//
+	// 这条 fallback 本身仍然必要（理由与价格无关）：缺它时 getFallbackPricing 会掉到
+	// claude-sonnet-4，而 sonnet-4 带 above_200k 的 2x 长上下文阶梯、Sonnet 5 没有，
+	// 长上下文请求会被再多收一倍。
+	s.fallbackPrices["claude-sonnet-5"] = &ModelPricing{
+		InputPricePerToken:         2e-6,   // $2 per MTok
+		OutputPricePerToken:        10e-6,  // $10 per MTok
+		CacheCreationPricePerToken: 2.5e-6, // $2.50 per MTok（5m）
+		CacheCreation5mPrice:       2.5e-6, // $2.50 per MTok
+		CacheCreation1hPrice:       4e-6,   // $4 per MTok
+		CacheReadPricePerToken:     0.2e-6, // $0.20 per MTok
+		SupportsCacheBreakdown:     true,
+	}
+
 	// Claude 3.5 Sonnet
 	s.fallbackPrices["claude-3-5-sonnet"] = &ModelPricing{
 		InputPricePerToken:         3e-6,    // $3 per MTok
@@ -948,6 +976,10 @@ func (s *BillingService) getFallbackPricing(model string) *ModelPricing {
 		return s.fallbackPrices["claude-3-opus"]
 	}
 	if strings.Contains(modelLower, "sonnet") {
+		// "sonnet-5" 必须先判：不能用裸 "5" 匹配，否则 claude-sonnet-4-5 会被误判。
+		if strings.Contains(modelLower, "sonnet-5") || strings.Contains(modelLower, "sonnet5") {
+			return s.fallbackPrices["claude-sonnet-5"]
+		}
 		if strings.Contains(modelLower, "4") && !strings.Contains(modelLower, "3") {
 			return s.fallbackPrices["claude-sonnet-4"]
 		}

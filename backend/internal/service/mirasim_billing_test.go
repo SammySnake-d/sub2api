@@ -122,9 +122,16 @@ var mirasimBillingEnabledModels = []mirasimBillingModel{
 // newMirasimBillingService 用**真实**价卡目录 + 生产解析路径构造计费服务。
 func newMirasimBillingService(t *testing.T) *BillingService {
 	t.Helper()
+	return NewBillingService(&config.Config{}, newMirasimPricingCatalog(t))
+}
+
+// newMirasimPricingCatalog 用**真实**价卡文件 + 生产解析路径构造价卡目录。
+// 每次调用都重建一份（含新的 map 实例），供需要跨 map 布局抽样的确定性测试使用。
+func newMirasimPricingCatalog(t *testing.T) *PricingService {
+	t.Helper()
 	body, err := os.ReadFile(mirasimBillingCatalogPath)
 	require.NoError(t, err, "真实价卡文件必须可读；读不到则本文件全部断言失去意义")
-	return NewBillingService(&config.Config{}, newStubPricingServiceFromJSON(t, string(body)))
+	return newStubPricingServiceFromJSON(t, string(body))
 }
 
 // mirasimBillingBaseline 取该模型的价卡与「n 个新鲜输入 token」的基准费用。
@@ -353,6 +360,188 @@ func TestMirasimBillingUnpricedModelGetsStablePriceCard(t *testing.T) {
 	require.Lenf(t, seen, 1,
 		"对同一个未配价模型 %s 查 %d 次（跨 %d 张重建的价卡目录），拿到 %d 张**不同**的价卡：%v —— "+
 			"计价结果依赖 Go map 迭代顺序，同一请求重放会得到不同金额",
+		probe, catalogRebuilds*probesPerCatalog, catalogRebuilds, len(seen), seen)
+}
+
+// sonnet5FallbackCatalogJSON 是一份**不含 claude-sonnet-5 条目**的最小目录，
+// 用来固定住"目录里没有该型号"这个状态 —— 修复前的 bundled 目录就是这个状态，
+// 任何还在用旧 price-mirror 的部署也是。条目内容照抄真实目录里的
+// claude-sonnet-4-20250514（含 above_200k 阶梯字段），走生产解析路径折算成
+// 阈值 200k + 2x 倍率。不用真实目录文件，是因为那份文件随 price-mirror 刷新而变，
+// 本测试要钉的恰恰是"目录缺该型号时"的行为。
+const sonnet5FallbackCatalogJSON = `{
+	"claude-sonnet-4-20250514": {"litellm_provider": "anthropic", "mode": "chat",
+		"input_cost_per_token": 3e-06, "output_cost_per_token": 1.5e-05,
+		"cache_creation_input_token_cost": 3.75e-06,
+		"cache_creation_input_token_cost_above_1hr": 6e-06,
+		"cache_read_input_token_cost": 3e-07,
+		"input_cost_per_token_above_200k_tokens": 6e-06,
+		"output_cost_per_token_above_200k_tokens": 2.25e-05,
+		"cache_read_input_token_cost_above_200k_tokens": 6e-07,
+		"cache_creation_input_token_cost_above_200k_tokens": 7.5e-06}
+}`
+
+// TestMirasimBillingSonnet5FallsBackToOwnCardNotSonnet4Ladder
+//
+// **无 cov 标签** —— 它是 BL:no-price-fallback 判红后修复的回归锁，不是第五条义务。
+//
+// 缺陷形态：claude-sonnet-5 在 fallbackPrices 里没有条目时，matchByModelFamily 的
+// Phase 2 关键字兜底把它归到 "sonnet-4" 系列，于是借用 claude-sonnet-4-20250514 的价卡。
+// 那张卡的基础单价是 $3/$15（sonnet-5 实际是 $2/$10，已经多收 50%），更隐蔽的是它还带
+// above_200k 长上下文阶梯（阈值 200k、倍率 2x），Sonnet 5 没有 —— 超过 200k 上下文的
+// sonnet-5 请求被整次会话再翻一倍，不报错、不告警。
+//
+// 显式价卡数字来源：Anthropic 官方价目表
+// https://platform.claude.com/docs/en/about-claude/pricing（2026-09-16 核对）
+// "Claude Sonnet 5" 行 = $2 / $2.50(5m) / $4(1h) / $0.20(read) / $15→$10(output)，
+// 即 $2/$10 已是 standard price，2026-09-01 的涨价计划被官方撤销。
+// 见 billing_service.go initFallbackPricing 中 claude-sonnet-5 条目的注释。
+//
+// 仪器正对照：先断言 claude-sonnet-4-20250514 这张"被借用的"价卡在本目录里确实带
+// 2x 阶梯、且确实会把 250k 请求收成两倍。正对照不成立时，下面 sonnet-5 的
+// "没有阶梯"断言没有信息量。
+func TestMirasimBillingSonnet5FallsBackToOwnCardNotSonnet4Ladder(t *testing.T) {
+	svc := NewBillingService(&config.Config{}, newStubPricingServiceFromJSON(t, sonnet5FallbackCatalogJSON))
+	const (
+		sonnet5      = "claude-sonnet-5"
+		borrowedCard = "claude-sonnet-4-20250514" // 修复前 sonnet-5 会落到的那张卡
+		longCtx      = 250_000                    // > 200k 阈值
+	)
+
+	// —— 仪器正对照：被借用的那张卡确有 2x 长上下文阶梯 ——
+	borrowed, err := svc.GetModelPricing(borrowedCard)
+	require.NoError(t, err)
+	require.EqualValues(t, 200_000, borrowed.LongContextInputThreshold,
+		"正对照前提：%s 应带 200k 长上下文阈值，否则本测试无法区分两张卡", borrowedCard)
+	require.EqualValues(t, 2, borrowed.LongContextInputMultiplier,
+		"正对照前提：%s 的长上下文倍率应为 2x", borrowedCard)
+	borrowedCost, err := svc.CalculateCost(borrowedCard, UsageTokens{InputTokens: longCtx}, 1.0)
+	require.NoError(t, err)
+	require.InEpsilon(t, float64(longCtx)*borrowed.InputPricePerToken*2, borrowedCost.InputCost, mirasimBillingEpsilon,
+		"正对照前提：%s 的 %d token 请求应被整次会话按 2x 计价", borrowedCard, longCtx)
+
+	// —— 被测：目录缺该型号时，sonnet-5 走自己的显式价卡 ——
+	require.True(t, svc.HasIdentifiedTokenPricing(sonnet5),
+		"%s 必须有显式定价条目，否则又会按子串猜成同族默认价", sonnet5)
+
+	// 带日期/变体后缀的 id 也必须落到同一张卡，而不是滑回 sonnet-4 系列。
+	//
+	// 价格出处：Anthropic 官方定价页（docs.anthropic.com/en/docs/about-claude/pricing，
+	// 2026-09-16 核对）。Sonnet 5 是 $2/$10，**不是** sonnet-4.5/4.6 那档的 $3/$15。
+	// 官方在同一页明确写了这一点，防止有人按"同族应该同价"改回去：
+	//
+	//   "The $2/$10 per million input/output token pricing for Claude Sonnet 5,
+	//    announced at launch as introductory pricing through August 31, 2026,
+	//    is now the standard price. The previously scheduled increase to $3/$15
+	//    per million input/output tokens on September 1, 2026 will not occur."
+	//
+	// 这正是这条测试要钉住的事：sonnet-5 比 sonnet-4 系列**便宜**，按同族默认价
+	// 猜会多收 50%。
+	for _, id := range []string{sonnet5, "claude-sonnet-5-20260701", "claude-sonnet-5-thinking"} {
+		pricing, err := svc.GetModelPricing(id)
+		require.NoErrorf(t, err, "%s 取不到价卡", id)
+		require.InEpsilonf(t, 2e-6, pricing.InputPricePerToken, mirasimBillingEpsilon, "%s 输入价应为 $2/MTok", id)
+		require.InEpsilonf(t, 10e-6, pricing.OutputPricePerToken, mirasimBillingEpsilon, "%s 输出价应为 $10/MTok", id)
+		require.InEpsilonf(t, 0.2e-6, pricing.CacheReadPricePerToken, mirasimBillingEpsilon, "%s cache read 应为 $0.20/MTok", id)
+		require.InEpsilonf(t, 2.5e-6, pricing.CacheCreation5mPrice, mirasimBillingEpsilon, "%s 5m cache write 应为 $2.50/MTok", id)
+		require.InEpsilonf(t, 4e-6, pricing.CacheCreation1hPrice, mirasimBillingEpsilon, "%s 1h cache write 应为 $4/MTok", id)
+		require.Truef(t, pricing.SupportsCacheBreakdown,
+			"%s 未开 5m/1h 分档，1h 写入会被 computeCacheCreationCost 按 5m 单价少收", id)
+
+		// 关键差异：sonnet-5 不得继承 sonnet-4 的长上下文阶梯。
+		require.Zerof(t, pricing.LongContextInputThreshold,
+			"%s 借到了长上下文阶梯（阈值 %d），250k 请求会被多收一倍", id, pricing.LongContextInputThreshold)
+	}
+
+	cost, err := svc.CalculateCost(sonnet5, UsageTokens{InputTokens: longCtx}, 1.0)
+	require.NoError(t, err)
+	require.InEpsilon(t, float64(longCtx)*2e-6, cost.InputCost, mirasimBillingEpsilon,
+		"%d token 的 sonnet-5 请求记了 %.10f，应为 %.10f（无长上下文溢价）",
+		longCtx, cost.InputCost, float64(longCtx)*2e-6)
+	require.Less(t, cost.InputCost, borrowedCost.InputCost,
+		"sonnet-5 与被借用的 sonnet-4 卡在 %d token 上记了同样的钱 —— 说明仍在共用那张带阶梯的卡", longCtx)
+}
+
+// TestMirasimBillingSonnet5BilledAtCurrentlyPublishedRate
+//
+// 断言的是端到端实际计价单价（无论价卡来自目录还是 fallbackPrices），对照
+// Anthropic 官方价目表 https://platform.claude.com/docs/en/about-claude/pricing
+// （2026-09-16 核对）现行行：
+//
+//	Claude Sonnet 5   $2 / $2.50 / $4 / $0.20 / $10   （input / 5m write / 1h write / cache read / output，每 MTok）
+//
+// **曾经写在这里的 "2026-09-01 起涨到 $3/$15" 是一条已被官方撤销的公告**，官方在
+// 同一页写死了这一点：
+//
+//	"The $2/$10 per million input/output token pricing for Claude Sonnet 5,
+//	 announced at launch as introductory pricing through August 31, 2026,
+//	 is now the standard price. The previously scheduled increase to $3/$15
+//	 per million input/output tokens on September 1, 2026 will not occur."
+//
+// 所以 $2/$10 就是现行价，目录条目与 fallbackPrices 都按这一档配；本测试防的是
+// 有人按"同族应该同价"把 sonnet-5 改成 sonnet-4.5/4.6 那档的 $3/$15，凭空多收 50%。
+//
+// 若将来官方真的调价，改的是这里的期望值 + billing_service.go 的 fallbackPrices，
+// 不是把断言放宽成"等于目录里写的任何值"（那样这条门就永远恒绿）。
+func TestMirasimBillingSonnet5BilledAtCurrentlyPublishedRate(t *testing.T) {
+	svc := newMirasimBillingService(t)
+	const sonnet5 = "claude-sonnet-5"
+
+	pricing, err := svc.GetModelPricing(sonnet5)
+	require.NoError(t, err)
+
+	require.InEpsilon(t, 2e-6, pricing.InputPricePerToken, mirasimBillingEpsilon,
+		"sonnet-5 输入价按 %.12g 计，官方现行价为 2e-06（$2/MTok）", pricing.InputPricePerToken)
+	require.InEpsilon(t, 10e-6, pricing.OutputPricePerToken, mirasimBillingEpsilon,
+		"sonnet-5 输出价按 %.12g 计，官方现行价为 1e-05（$10/MTok）", pricing.OutputPricePerToken)
+	require.InEpsilon(t, 0.2e-6, pricing.CacheReadPricePerToken, mirasimBillingEpsilon,
+		"sonnet-5 cache read 按 %.12g 计，官方现行价为 2e-07（$0.20/MTok）", pricing.CacheReadPricePerToken)
+	require.InEpsilon(t, 2.5e-6, pricing.CacheCreation5mPrice, mirasimBillingEpsilon,
+		"sonnet-5 5m cache write 按 %.12g 计，官方现行价为 2.5e-06（$2.50/MTok）", pricing.CacheCreation5mPrice)
+	require.InEpsilon(t, 4e-6, pricing.CacheCreation1hPrice, mirasimBillingEpsilon,
+		"sonnet-5 1h cache write 按 %.12g 计，官方现行价为 4e-06（$4/MTok）", pricing.CacheCreation1hPrice)
+}
+
+// TestMirasimBillingIdentifiedPriceCardIsStableAcrossLookups
+//
+// **无 cov 标签** —— 与上面那条 map 随机性一样，是修 K2 时发现的相邻缺陷的回归锁。
+//
+// 上面那条钉的是 matchByModelFamily 的"猜系列"路径；这条钉的是它的兄弟：
+// lookupIdentifiedModelPricingLocked（pricing_service.go）第 3 步按 extractBaseName
+// 匹配时同样 `range` 裸 map。同一个 baseName 在本仓价卡目录里对应多条：
+// claude-sonnet-4-5 / claude-sonnet-4-5-20250929 / claude-sonnet-4-5-20250929-v1:0，
+// 它们的 token 单价相同但 litellm_provider 不同（anthropic vs bedrock），
+// 而 provider 会进入 ModelPricing（如 LongContextThresholdInclusive 的 xAI 判定）。
+// 一个价卡目录尚未收录的新日期版本（claude-sonnet-4-5-<新日期>）就会随机落到其中一张。
+//
+// 抽样跨 8 张重建的目录，理由同 TestMirasimBillingUnpricedModelGetsStablePriceCard：
+// Go 的 range 随机化起始桶，单张 map 的桶布局可能让少数派概率极低 → 假绿。
+func TestMirasimBillingIdentifiedPriceCardIsStableAcrossLookups(t *testing.T) {
+	// 未收录的日期版本：精确键与 -4.5- 拼写变体都查不到，必然走第 3 步 baseName 匹配。
+	const probe = "claude-sonnet-4-5-20991231"
+
+	const (
+		catalogRebuilds  = 8
+		probesPerCatalog = 250
+	)
+	seen := make(map[string]int)
+	for range catalogRebuilds {
+		catalog := newMirasimPricingCatalog(t)
+		_, exact := catalog.pricingData[probe]
+		require.Falsef(t, exact, "探针前提：%s 不能是目录里的精确条目，否则测不到 baseName 匹配", probe)
+
+		for range probesPerCatalog {
+			pricing := catalog.GetIdentifiedModelPricing(probe)
+			require.NotNilf(t, pricing, "探针前提：%s 应能按 baseName 命中同族条目", probe)
+			seen[fmt.Sprintf("provider=%s in=%g out=%g cacheRead=%g cw1h=%g",
+				pricing.LiteLLMProvider, pricing.InputCostPerToken, pricing.OutputCostPerToken,
+				pricing.CacheReadInputTokenCost, pricing.CacheCreationInputTokenCostAbove1hr)]++
+		}
+	}
+
+	require.Lenf(t, seen, 1,
+		"对同一个模型名 %s 查 %d 次（跨 %d 张重建的价卡目录），拿到 %d 张**不同**的价卡：%v —— "+
+			"确定性识别路径同样依赖 Go map 迭代顺序",
 		probe, catalogRebuilds*probesPerCatalog, catalogRebuilds, len(seen), seen)
 }
 

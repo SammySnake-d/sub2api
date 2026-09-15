@@ -25,8 +25,13 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// mirasimAgentSystemLine is the exact text mirasim expects to lead the system
-// block. It is a wire constant, not a prompt we are free to reword.
+// mirasimAgentSystemLine is the identity line this gateway injects when the
+// caller brought none of its own.
+//
+// It is NOT "the" line mirasim requires — six live probes (2026-09-16) showed
+// the upstream accepts a SET of known identity lines, including the one real
+// Claude Code sends. What it rejects is an unknown line, even one containing
+// the exact substring "Claude Agent SDK". See isKnownClaudeIdentityPrompt.
 const mirasimAgentSystemLine = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 
 // mirasimAgentSystemBlockRaw is the pre-serialised block, kept as a literal so
@@ -60,8 +65,22 @@ func ensureMirasimAgentSystemPrompt(body []byte) []byte {
 
 	case sys.Type == gjson.String:
 		s := sys.String()
-		if strings.TrimSpace(s) == "" || s == mirasimAgentSystemLine {
+		if strings.TrimSpace(s) == "" {
 			out, err := sjson.SetRawBytes(body, "system", []byte("["+mirasimAgentSystemBlockRaw+"]"))
+			if err != nil {
+				return body
+			}
+			return out
+		}
+		if isKnownClaudeIdentityPrompt(s) {
+			// Already an accepted identity line — promote it to the block form
+			// the upstream is known to take, without prepending a second,
+			// contradicting one.
+			promoted, err := sjson.SetBytes([]byte(`{"type":"text"}`), "text", s)
+			if err != nil {
+				return body
+			}
+			out, err := sjson.SetRawBytes(body, "system", buildJSONArrayRaw([][]byte{promoted}))
 			if err != nil {
 				return body
 			}
@@ -83,10 +102,19 @@ func ensureMirasimAgentSystemPrompt(body []byte) []byte {
 
 	case sys.IsArray():
 		elems := sys.Array()
-		if len(elems) > 0 && elems[0].Get("text").String() == mirasimAgentSystemLine {
-			// Already canonical. Returning the input untouched is the whole
-			// point: re-serialising here would churn the prefix on every retry.
-			return body
+		// The upstream scans EVERY block, not just the first (probe P2: an
+		// identity line sitting in block[1] behind an unrelated block was
+		// accepted). Matching that here means a client which puts its identity
+		// line second does not get a redundant block prepended.
+		for _, e := range elems {
+			if isKnownClaudeIdentityPrompt(e.Get("text").String()) {
+				// The caller already carries an identity line the upstream
+				// accepts. Injecting would add a SECOND, contradicting claim:
+				// system[0] saying "I am the Agent SDK" ahead of the client's
+				// own "I am the Claude Code CLI". Returning the input untouched
+				// is also what makes this idempotent across retries.
+				return body
+			}
 		}
 		// buildJSONArrayRaw is a plain append of raw element bytes — it never
 		// goes through json.Marshal, so the caller's blocks (including their
@@ -104,6 +132,43 @@ func ensureMirasimAgentSystemPrompt(body []byte) []byte {
 	}
 
 	return body
+}
+
+// isKnownClaudeIdentityPrompt reports whether text is one of the identity lines
+// the mirasim upstream accepts.
+//
+// The upstream's rule was established empirically (2026-09-16, six probes
+// against the live endpoint, each observing its own request_id):
+//
+//	system: null                                                     -> 400
+//	"You are a Claude agent, built on Anthropic's Claude Agent SDK."  -> 200
+//	"You are Claude Code, …CLI for Claude, running within the …SDK."  -> 200  (what real CC sends)
+//	"You are Claude Code, Anthropic's official CLI for Claude."       -> 200
+//	"You are a helpful assistant, built on Anthropic's Claude Agent SDK." -> 400
+//	"You are a helpful assistant."                                    -> 400
+//
+// The fifth probe is the decisive one: it contains the exact substring
+// "Claude Agent SDK" and is still rejected. So the rule is NOT a substring
+// test and NOT "any non-empty system" — it is enumeration against a set of
+// known identity lines. All three accepted lines are already present in
+// sub2api's own claudeCodeSystemPrompts, which is why this reuses that table
+// rather than starting a second, drift-prone copy.
+//
+// Matching is exact (after trimming) rather than fuzzy: a substring or
+// similarity rule would let through the very string the upstream rejected.
+// If the table is missing a line the upstream would have accepted, the worst
+// case is the old behaviour — one redundant injected block — not a rejection.
+func isKnownClaudeIdentityPrompt(text string) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return false
+	}
+	for _, known := range claudeCodeSystemPrompts {
+		if t == strings.TrimSpace(known) {
+			return true
+		}
+	}
+	return false
 }
 
 // shapeMirasimRequestBody applies every mirasim-specific body requirement.

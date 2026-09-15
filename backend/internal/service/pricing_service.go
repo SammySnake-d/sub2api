@@ -1185,15 +1185,28 @@ func (s *PricingService) lookupIdentifiedModelPricingLocked(lookupCandidates []s
 
 	// 3. 尝试模糊匹配（去掉版本号后缀）
 	// claude-opus-4-5-20251101 -> claude-opus-4.5
+	//
+	// 同一个 baseName 可能对应多个条目（claude-sonnet-4-5 / claude-sonnet-4-5-20250929 /
+	// claude-sonnet-4-5-20250929-v1:0 的 baseName 都是 claude-sonnet-4-5），而它们的价卡
+	// 未必逐字段相同。直接 `range` map 取"第一个命中"会让同一个模型名在同一进程内的两次
+	// 查询落到不同价卡上（Go map 迭代顺序随机），同一请求重放会得到不同金额。
+	// 故此处改为"字典序最小的命中键"——总序、与 map 布局无关，且无日期后缀的基础条目
+	// （claude-sonnet-4-5）是其带日期兄弟的前缀，天然排在最前。
 	baseName := s.extractBaseName(lookupCandidates[0])
+	var (
+		bestKey     string
+		bestPricing *LiteLLMModelPricing
+	)
 	for key, pricing := range s.pricingData {
-		keyBase := s.extractBaseName(strings.ToLower(key))
-		if keyBase == baseName {
-			return pricing
+		keyLower := strings.ToLower(key)
+		if s.extractBaseName(keyLower) != baseName {
+			continue
+		}
+		if bestPricing == nil || keyLower < bestKey {
+			bestKey, bestPricing = keyLower, pricing
 		}
 	}
-
-	return nil
+	return bestPricing
 }
 
 // GetIdentifiedModelPricing 在价格表中确定性地识别模型，识别不到时返回 nil。
@@ -1347,6 +1360,11 @@ func (s *PricingService) matchByModelFamily(model string) *LiteLLMModelPricing {
 		{name: "opus-4.6", match: []string{"claude-opus-4-6", "claude-opus-4.6"}},
 		{name: "opus-4.5", match: []string{"claude-opus-4-5", "claude-opus-4.5"}},
 		{name: "opus-4", match: []string{"claude-opus-4", "claude-3-opus"}},
+		// Sonnet 5 与 Sonnet 4.x 不同价（现行 $2/$10 且无 above_200k 阶梯，4.x 是 $3/$15 且带 2x 阶梯），
+		// 故 pricing 只查 claude-sonnet-5 本身、不向下回退到 sonnet-4：目录里没有时返回 nil，
+		// 由 billing_service.go 的 fallbackPrices["claude-sonnet-5"] 显式价卡接手，
+		// 而不是静默借用 sonnet-4 的价卡（与 opus-5 的处理同构）。
+		{name: "sonnet-5", match: []string{"claude-sonnet-5"}, pricing: []string{"claude-sonnet-5"}},
 		{name: "sonnet-4.5", match: []string{"claude-sonnet-4-5", "claude-sonnet-4.5"}},
 		{name: "sonnet-4", match: []string{"claude-sonnet-4", "claude-3-5-sonnet"}},
 		{name: "sonnet-3.5", match: []string{"claude-3-5-sonnet", "claude-3.5-sonnet"}},
@@ -1391,6 +1409,9 @@ func (s *PricingService) matchByModelFamily(model string) *LiteLLMModelPricing {
 			}
 		case strings.Contains(model, "sonnet"):
 			switch {
+			// "sonnet-5" 必须先判：不能用裸 "5" 匹配，否则 claude-sonnet-4-5 会被误判。
+			case strings.Contains(model, "sonnet-5") || strings.Contains(model, "sonnet5"):
+				fallbackName = "sonnet-5"
 			case strings.Contains(model, "4.5") || strings.Contains(model, "4-5"):
 				fallbackName = "sonnet-4.5"
 			case strings.Contains(model, "3-5") || strings.Contains(model, "3.5"):
@@ -1426,16 +1447,59 @@ func (s *PricingService) matchByModelFamily(model string) *LiteLLMModelPricing {
 		lookups = matched.match
 	}
 	for _, pattern := range lookups {
-		for key, pricing := range s.pricingData {
-			keyLower := strings.ToLower(key)
-			if strings.Contains(keyLower, pattern) {
-				logger.LegacyPrintf("service.pricing", "[Pricing] Fuzzy matched %s -> %s", model, key)
-				return pricing
-			}
+		if key, pricing := s.bestPricingKeyForPattern(pattern); pricing != nil {
+			logger.LegacyPrintf("service.pricing", "[Pricing] Fuzzy matched %s -> %s", model, key)
+			return pricing
 		}
 	}
 
 	return nil
+}
+
+// bestPricingKeyForPattern 在价卡目录里确定性地挑出 pattern 的最佳命中条目。
+//
+// 为什么不能直接 `for key := range s.pricingData { if Contains(key, pattern) { return } }`：
+// 一个 pattern 常常命中多条（pattern "claude-sonnet-4" 在本仓价卡目录里命中
+// claude-sonnet-4-20250514 / claude-sonnet-4-5 / claude-sonnet-4-5-20250929 /
+// claude-sonnet-4-5-20250929-v1:0 / claude-sonnet-4-6 五条），而 Go 的 map 迭代顺序是
+// 随机的 —— 于是同一个未配价模型名连续两次查询会拿到不同价卡。这些价卡并不等价
+// （claude-sonnet-4-6 没有 above_200k 长上下文阶梯，其余四条有 2x），所以一个 250k
+// 上下文的请求收 1x 还是 2x 取决于那一刻的 map 迭代顺序：静默的、对不上账的金额漂移。
+//
+// 确定性规则（全序，不依赖 map 布局）：
+//  1. 与 pattern 完全相等的键最优（claude-opus-4-8 命中 claude-opus-4-8 本身）；
+//  2. 其次是"去掉日期/版本后缀后等于 pattern"的键，即该系列的本体价卡
+//     （pattern claude-sonnet-4 → claude-sonnet-4-20250514，而不是下一代的 4-5/4-6）；
+//  3. 同档内取字典序最小的键。
+//
+// 单趟 O(n) 扫描，不排序：生产价卡目录有数千条，这条路径在未知模型上每请求都会走。
+func (s *PricingService) bestPricingKeyForPattern(pattern string) (string, *LiteLLMModelPricing) {
+	const (
+		rankExact = iota
+		rankBaseName
+		rankSubstring
+	)
+	bestRank := rankSubstring + 1
+	bestKey := ""
+	var bestPricing *LiteLLMModelPricing
+
+	for key, pricing := range s.pricingData {
+		keyLower := strings.ToLower(key)
+		if !strings.Contains(keyLower, pattern) {
+			continue
+		}
+		rank := rankSubstring
+		switch {
+		case keyLower == pattern:
+			rank = rankExact
+		case s.extractBaseName(keyLower) == pattern:
+			rank = rankBaseName
+		}
+		if bestPricing == nil || rank < bestRank || (rank == bestRank && keyLower < bestKey) {
+			bestRank, bestKey, bestPricing = rank, keyLower, pricing
+		}
+	}
+	return bestKey, bestPricing
 }
 
 // matchOpenAIModel OpenAI 模型回退匹配策略
