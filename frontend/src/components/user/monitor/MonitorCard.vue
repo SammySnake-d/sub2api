@@ -23,8 +23,9 @@
           >
             {{ providerLabel(item.provider) }}
           </span>
+          <!-- 纯配额模式主模型是占位符 "quota"，展示层替换为本地化「配额」标签 -->
           <span class="font-mono text-xs truncate text-gray-500 dark:text-gray-400">
-            {{ item.primary_model }}
+            {{ formatMonitorModel(item.primary_model) }}
           </span>
           <span
             v-if="item.group_name"
@@ -100,6 +101,7 @@ const PROVIDER_TINT: Record<string, string> = {
   kimi: 'text-pink-600 dark:text-pink-300',
   zhipu: 'text-indigo-600 dark:text-indigo-300',
   deepseek: 'text-teal-600 dark:text-teal-300',
+  opencode_go: 'text-amber-700 dark:text-amber-300',
 }
 
 const props = defineProps<{
@@ -120,6 +122,7 @@ const {
   providerLabel,
   providerBadgeClass,
   formatLatency,
+  formatMonitorModel,
 } = useChannelMonitorFormat()
 
 const providerTintClass = computed(() =>

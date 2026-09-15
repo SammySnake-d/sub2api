@@ -21,11 +21,16 @@ import {
   PROVIDER_KIMI,
   PROVIDER_ZHIPU,
   PROVIDER_DEEPSEEK,
+  PROVIDER_MINIMAX,
+  PROVIDER_OPENCODE_GO,
   PROVIDERS,
   STATUS_OPERATIONAL,
   STATUS_DEGRADED,
   STATUS_FAILED,
   STATUS_ERROR,
+  CHECK_MODE_PROBE,
+  CHECK_MODE_QUOTA,
+  CHECK_MODE_QUOTA_PROBE,
 } from '@/constants/channelMonitor'
 
 const NEUTRAL_BADGE = 'bg-gray-100 text-gray-800 dark:bg-dark-700 dark:text-gray-300'
@@ -76,6 +81,21 @@ export function useChannelMonitorFormat() {
     return m || '-'
   }
 
+  /**
+   * Display label for a monitor's primary model. Pure-quota monitors carry the
+   * literal placeholder "quota" (the probe target is an account, not a model),
+   * which must not leak into the UI as a fake model name — render the
+   * localized mode label instead. quota_probe keeps a real model name.
+   */
+  const QUOTA_MODEL_PLACEHOLDER = 'quota'
+
+  function formatMonitorModel(model: string): string {
+    if (model === QUOTA_MODEL_PLACEHOLDER) {
+      return t('monitorCommon.checkMode.quota')
+    }
+    return model
+  }
+
   function providerBadgeClass(p: Provider | string): string {
     switch (p) {
       case PROVIDER_OPENAI:
@@ -96,6 +116,26 @@ export function useChannelMonitorFormat() {
         return 'bg-indigo-100 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300'
       case PROVIDER_DEEPSEEK:
         return 'bg-teal-100 text-teal-700 dark:bg-teal-500/15 dark:text-teal-300'
+      case PROVIDER_MINIMAX:
+        return 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300'
+      case PROVIDER_OPENCODE_GO:
+        return 'bg-amber-100 text-amber-800 dark:bg-amber-500/15 dark:text-amber-300'
+      default:
+        return NEUTRAL_BADGE
+    }
+  }
+
+  /**
+   * Tailwind class for the check-mode badge shown next to the provider badge
+   * in the admin monitor list. Quota-bearing modes = blue (数据源是账号配额),
+   * plain probe = neutral grey.
+   */
+  function checkModeBadgeClass(m: CheckMode | string): string {
+    switch (m) {
+      case CHECK_MODE_QUOTA:
+      case CHECK_MODE_QUOTA_PROBE:
+        return 'bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300'
+      case CHECK_MODE_PROBE:
       default:
         return NEUTRAL_BADGE
     }
@@ -140,6 +180,14 @@ export function useChannelMonitorFormat() {
         return active
           ? 'border-teal-500 bg-teal-50 text-teal-700 dark:bg-teal-500/15 dark:text-teal-300 dark:border-teal-400'
           : 'border-gray-200 bg-white text-gray-600 hover:border-teal-300 hover:text-teal-700 dark:border-dark-700 dark:bg-dark-800 dark:text-gray-400 dark:hover:border-teal-500/50'
+      case PROVIDER_MINIMAX:
+        return active
+          ? 'border-rose-500 bg-rose-50 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300 dark:border-rose-400'
+          : 'border-gray-200 bg-white text-gray-600 hover:border-rose-300 hover:text-rose-700 dark:border-dark-700 dark:bg-dark-800 dark:text-gray-400 dark:hover:border-rose-500/50'
+      case PROVIDER_OPENCODE_GO:
+        return active
+          ? 'border-amber-500 bg-amber-50 text-amber-800 dark:bg-amber-500/15 dark:text-amber-300 dark:border-amber-400'
+          : 'border-gray-200 bg-white text-gray-600 hover:border-amber-300 hover:text-amber-700 dark:border-dark-700 dark:bg-dark-800 dark:text-gray-400 dark:hover:border-amber-500/50'
       default:
         return active
           ? 'border-gray-400 bg-gray-50 text-gray-700 dark:border-dark-500 dark:bg-dark-700 dark:text-gray-200'
@@ -181,7 +229,9 @@ export function useChannelMonitorFormat() {
     statusBadgeClass,
     providerLabel,
     checkModeLabel,
+    formatMonitorModel,
     providerBadgeClass,
+    checkModeBadgeClass,
     providerPickerClass,
     formatLatency,
     formatPercent,
@@ -222,6 +272,10 @@ export function providerGradient(provider: string): string {
       return 'bg-gradient-to-br from-indigo-50 to-indigo-100 dark:from-indigo-500/10 dark:to-indigo-500/20'
     case PROVIDER_DEEPSEEK:
       return 'bg-gradient-to-br from-teal-50 to-teal-100 dark:from-teal-500/10 dark:to-teal-500/20'
+    case PROVIDER_MINIMAX:
+      return 'bg-gradient-to-br from-rose-50 to-rose-100 dark:from-rose-500/10 dark:to-rose-500/20'
+    case PROVIDER_OPENCODE_GO:
+      return 'bg-gradient-to-br from-amber-50 to-amber-100 dark:from-amber-500/10 dark:to-amber-500/20'
     default:
       return 'bg-gradient-to-br from-gray-100 to-gray-200 dark:from-dark-700 dark:to-dark-600'
   }

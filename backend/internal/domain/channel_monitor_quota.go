@@ -19,7 +19,8 @@ import "time"
 //   - "7d"         7 天窗口（Claude/Codex）
 //   - "7d-sonnet"  Claude 7 天 Sonnet 独立额度
 //   - "7d-fable"   Claude 7 天 Fable 独立额度
-//   - "weekly"     周窗口（Kimi/Zhipu coding plan）
+//   - "weekly"     周窗口（Kimi/Zhipu coding plan / OpenCode Go）
+//   - "monthly"    月窗口（OpenCode Go）
 //   - "daily"      日窗口（Gemini 日配额 / Grok 日请求）
 //   - "30d"        30 天窗口（Grok 月度）
 //   - "total"      无窗口语义的总量额度（Antigravity per-model 等）
@@ -50,6 +51,10 @@ type MonitorQuotaSnapshot struct {
 	Balances  []MonitorBalance   `json:"balances,omitempty"`   // 多币种余额（如 DeepSeek CNY+USD）
 	Currency  string             `json:"currency,omitempty"`   // 主余额币种
 	PlanLevel string             `json:"plan_level,omitempty"` // 套餐等级（如智谱 level）
+	// BalanceLow 余额低于阈值或账号被上游标记不可用（仅 cn_balance 来源）。
+	// 抓取器按 Gateway.CNProviders.BalanceThreshold 判定，口径与账号停调
+	// （CNProviderBalanceCheckService.checkOne）一致：任一币种达标即健康。
+	BalanceLow bool `json:"balance_low,omitempty"`
 	// CredentialInvalid 上游 401/403 鉴权失败（区别于网络/解析错误），
 	// 检测状态据此推导 failed 而非 error。
 	CredentialInvalid bool      `json:"credential_invalid,omitempty"`
