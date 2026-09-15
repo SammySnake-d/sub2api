@@ -204,103 +204,126 @@ func headerFromMap(m map[string]string) http.Header {
 func TestDifferentialAgainstMaRelay(t *testing.T) {
 	cases := diffJobs(t)
 
-	if refreshed, ok := regenerateVectors(t, cases); ok {
-		writeVectors(t, refreshed)
-	}
-
+	// Committed vectors: asserted always, so the gate still runs where the
+	// ma-relay tree is absent (CI).
+	var suites []vectorFile
 	raw, err := os.ReadFile(vectorsPath)
-	if err != nil {
-		t.Fatalf("read %s: %v (regenerate by running this test with the ma-relay source present)", vectorsPath, err)
-	}
-	var vf vectorFile
-	if err := json.Unmarshal(raw, &vf); err != nil {
-		t.Fatal(err)
-	}
-	if vf.ClientVersion != ClientVersion {
-		t.Fatalf("vectors were generated for client version %q but this port signs as %q; regenerate the vectors", vf.ClientVersion, ClientVersion)
-	}
-	if len(vf.Cases) != len(cases) {
-		t.Fatalf("vector file has %d cases, test defines %d", len(vf.Cases), len(cases))
+	if err == nil {
+		var vf vectorFile
+		if err := json.Unmarshal(raw, &vf); err != nil {
+			t.Fatal(err)
+		}
+		if vf.ClientVersion != ClientVersion {
+			t.Fatalf("vectors were generated for client version %q but this port signs as %q; delete %s and re-run with the ma-relay source present", vf.ClientVersion, ClientVersion, vectorsPath)
+		}
+		if len(vf.Cases) != len(cases) {
+			t.Fatalf("vector file has %d cases, test defines %d", len(vf.Cases), len(cases))
+		}
+		suites = append(suites, vf)
 	}
 
-	for _, vc := range vf.Cases {
-		t.Run(vc.Name, func(t *testing.T) {
-			if vc.Result.Err != "" {
-				t.Fatalf("reference harness errored: %s", vc.Result.Err)
-			}
-			signer, err := NewDeviceSigner(vc.Job.SeedB64)
-			if err != nil {
-				t.Fatal(err)
-			}
+	// Live differential: freshly executed ma-relay code, compared in memory.
+	// ma-relay draws a new nonce per call, so every generation produces different
+	// (but equally valid) vectors — writing them back on every run would make the
+	// committed file churn for no information, so it is only written when absent
+	// or stale.
+	fresh, live := regenerateVectors(t, cases)
+	if live {
+		suites = append(suites, fresh)
+		if err != nil {
+			writeVectors(t, fresh)
+			t.Logf("wrote missing %s", vectorsPath)
+		}
+	}
+	if len(suites) == 0 {
+		t.Fatalf("no vectors: %s is unreadable (%v) and the ma-relay source is not available to regenerate it", vectorsPath, err)
+	}
 
-			// --- identity ---
-			if signer.DeviceID != vc.Result.DeviceID {
-				t.Errorf("device id: port=%q ma-relay=%q", signer.DeviceID, vc.Result.DeviceID)
-			}
-			if signer.PublicKeyB64 != vc.Result.PublicKeyB64 {
-				t.Errorf("public key: port=%q ma-relay=%q", signer.PublicKeyB64, vc.Result.PublicKeyB64)
-			}
-
-			// --- signature headers, byte for byte ---
-			body, err := base64.StdEncoding.DecodeString(vc.Job.BodyB64)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if vc.Job.BodyB64 == "" {
-				body = nil
-			}
-			nonce, err := base64.RawURLEncoding.DecodeString(vc.Result.SigHeaders["x-mirasim-nonce"])
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, err := signer.headersWithNonce(vc.Job.Method, vc.Job.Path, body, vc.Job.Credential, vc.Job.Meta, time.UnixMilli(vc.Job.TSMillis), nonce)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, k := range []string{"x-mirasim-device", "x-mirasim-ts", "x-mirasim-nonce", "x-mirasim-sig", "x-mirasim-client"} {
-				if got[k] != vc.Result.SigHeaders[k] {
-					t.Errorf("%s: port=%q ma-relay=%q", k, got[k], vc.Result.SigHeaders[k])
+	// [[cov:SG:bytewise-parity]] For a fixed (method, path, body, deviceSeed, ts,
+	// nonce, credential, clientVersion), the five x-mirasim-* headers produced by
+	// DeviceSigner.headersWithNonce must equal ma-relay's byte for byte — the
+	// signature included, so this covers the canonical string assembly and the
+	// ccore/WASM call, not just the plaintext fields.
+	for _, vf := range suites {
+		for _, vc := range vf.Cases {
+			t.Run(vc.Name, func(t *testing.T) {
+				if vc.Result.Err != "" {
+					t.Fatalf("reference harness errored: %s", vc.Result.Err)
 				}
-			}
-			if len(got) != len(vc.Result.SigHeaders) {
-				t.Errorf("header count: port=%d ma-relay=%d", len(got), len(vc.Result.SigHeaders))
-			}
-
-			// --- deterministic seal blob, byte for byte ---
-			if vc.Job.SealPubB64 != "" {
-				if base64.StdEncoding.EncodeToString(sealPubKey) != vc.Job.SealPubB64 {
-					t.Fatalf("port seal public key differs from the one handed to ma-relay")
-				}
-				h := headerFromMap(map[string]string{})
-				_ = h
-				eph, _ := base64.StdEncoding.DecodeString(vc.Job.EphB64)
-				sn, _ := base64.StdEncoding.DecodeString(vc.Job.SealNonceB64)
-				pt, _ := base64.StdEncoding.DecodeString(vc.Job.PlaintextB64)
-				aad, _ := base64.StdEncoding.DecodeString(vc.Job.AADB64)
-				blob, err := sealBlobForTest(pt, aad, eph, sn)
+				signer, err := NewDeviceSigner(vc.Job.SeedB64)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if enc := base64.RawURLEncoding.EncodeToString(blob); enc != vc.Result.SealBlobB64 {
-					t.Errorf("seal blob: port=%q ma-relay=%q", enc, vc.Result.SealBlobB64)
-				}
-			}
 
-			// --- sealed header selection rule ---
-			if len(vc.Job.Headers) > 0 {
-				plain, _ := sealablePlaintext(headerFromMap(vc.Job.Headers))
-				portNames := make([]string, 0, len(plain))
-				for k := range plain {
-					portNames = append(portNames, k)
+				// --- identity ---
+				if signer.DeviceID != vc.Result.DeviceID {
+					t.Errorf("device id: port=%q ma-relay=%q", signer.DeviceID, vc.Result.DeviceID)
 				}
-				sort.Strings(portNames)
-				refNames := append([]string(nil), vc.Result.SealedNames...)
-				sort.Strings(refNames)
-				if strings.Join(portNames, ",") != strings.Join(refNames, ",") {
-					t.Errorf("sealed header set: port=%v ma-relay=%v", portNames, refNames)
+				if signer.PublicKeyB64 != vc.Result.PublicKeyB64 {
+					t.Errorf("public key: port=%q ma-relay=%q", signer.PublicKeyB64, vc.Result.PublicKeyB64)
 				}
-			}
-		})
+
+				// --- signature headers, byte for byte ---
+				body, err := base64.StdEncoding.DecodeString(vc.Job.BodyB64)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if vc.Job.BodyB64 == "" {
+					body = nil
+				}
+				nonce, err := base64.RawURLEncoding.DecodeString(vc.Result.SigHeaders["x-mirasim-nonce"])
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := signer.headersWithNonce(vc.Job.Method, vc.Job.Path, body, vc.Job.Credential, vc.Job.Meta, time.UnixMilli(vc.Job.TSMillis), nonce)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, k := range []string{"x-mirasim-device", "x-mirasim-ts", "x-mirasim-nonce", "x-mirasim-sig", "x-mirasim-client"} {
+					if got[k] != vc.Result.SigHeaders[k] {
+						t.Errorf("%s: port=%q ma-relay=%q", k, got[k], vc.Result.SigHeaders[k])
+					}
+				}
+				if len(got) != len(vc.Result.SigHeaders) {
+					t.Errorf("header count: port=%d ma-relay=%d", len(got), len(vc.Result.SigHeaders))
+				}
+
+				// --- deterministic seal blob, byte for byte ---
+				if vc.Job.SealPubB64 != "" {
+					if base64.StdEncoding.EncodeToString(sealPubKey) != vc.Job.SealPubB64 {
+						t.Fatalf("port seal public key differs from the one handed to ma-relay")
+					}
+					h := headerFromMap(map[string]string{})
+					_ = h
+					eph, _ := base64.StdEncoding.DecodeString(vc.Job.EphB64)
+					sn, _ := base64.StdEncoding.DecodeString(vc.Job.SealNonceB64)
+					pt, _ := base64.StdEncoding.DecodeString(vc.Job.PlaintextB64)
+					aad, _ := base64.StdEncoding.DecodeString(vc.Job.AADB64)
+					blob, err := sealBlobForTest(pt, aad, eph, sn)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if enc := base64.RawURLEncoding.EncodeToString(blob); enc != vc.Result.SealBlobB64 {
+						t.Errorf("seal blob: port=%q ma-relay=%q", enc, vc.Result.SealBlobB64)
+					}
+				}
+
+				// --- sealed header selection rule ---
+				if len(vc.Job.Headers) > 0 {
+					plain, _ := sealablePlaintext(headerFromMap(vc.Job.Headers))
+					portNames := make([]string, 0, len(plain))
+					for k := range plain {
+						portNames = append(portNames, k)
+					}
+					sort.Strings(portNames)
+					refNames := append([]string(nil), vc.Result.SealedNames...)
+					sort.Strings(refNames)
+					if strings.Join(portNames, ",") != strings.Join(refNames, ",") {
+						t.Errorf("sealed header set: port=%v ma-relay=%v", portNames, refNames)
+					}
+				}
+			})
+		}
 	}
 }
 

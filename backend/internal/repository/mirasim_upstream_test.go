@@ -333,7 +333,11 @@ func TestMirasimSignedRequestReachesTheWireUnchanged(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 
-	// What the decorator left on the request object...
+	// [[cov:SG:no-post-sign-mutation]] The sealed header and the body captured at
+	// the moment mirasim.SignAndSeal returned must be exactly what the socket
+	// receives. This runs through the real httpUpstreamService transport, so it
+	// covers the transport's own header handling too, and the body is compared
+	// bytewise rather than by digest.
 	signedEnc := req.Header.Get("x-mirasim-enc")
 	signedAuth := req.Header.Get("Authorization")
 	if signedEnc == "" {
@@ -349,6 +353,9 @@ func TestMirasimSignedRequestReachesTheWireUnchanged(t *testing.T) {
 	}
 	if got := echo.header.Get("Authorization"); got != signedAuth {
 		t.Error("Authorization changed between signing and the wire")
+	}
+	if got := echo.header.Get("x-mirasim-client"); got != mirasim.ClientVersion {
+		t.Errorf("x-mirasim-client on the wire = %q, want mirasim.ClientVersion %q", got, mirasim.ClientVersion)
 	}
 	if !bytes.Equal(echo.body, body) {
 		t.Fatalf("body changed between signing and the wire:\n got %s\nwant %s", echo.body, body)
@@ -401,6 +408,17 @@ func TestMirasimRefusesToFollowRedirects(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	// The mechanism, asserted directly: the decorator must have marked the
+	// request so the shared upstream client refuses to follow.
+	if !service.HTTPUpstreamRedirectsDisabled(req.Context()) {
+		t.Fatal("service.HTTPUpstreamRedirectsDisabled is false: the decorator did not mark the request")
+	}
+
+	// [[cov:SG:no-redirect]] mirasim.SignAndSeal covers the URL path, so a
+	// followed redirect would arrive carrying a signature for the previous path.
+	// The decorator marks the request with
+	// service.WithHTTPUpstreamRedirectsDisabled; the 307 must surface to the
+	// caller instead of being followed.
 	if resp.StatusCode != http.StatusTemporaryRedirect {
 		t.Fatalf("status = %d, want the 307 surfaced rather than followed", resp.StatusCode)
 	}

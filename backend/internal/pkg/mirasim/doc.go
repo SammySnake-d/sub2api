@@ -111,8 +111,9 @@
 //   - Redirects must not be followed: the signature covers the path, so any hop
 //     arrives unsigned for its own path. The decorator marks every mirasim
 //     request with service.WithHTTPUpstreamRedirectsDisabled.
-//   - TLS: mirasim requests go out with TLSProfile (Mirasim.app's Electron
-//     ClientHello, JA3 71dc8c533dd919ae9f4963224a4ba8fd), overriding whatever
-//     profile the caller resolved — sub2api's default is the Claude Code CLI
-//     fingerprint, which does not belong under a mirasim device signature.
+//   - TLS: mirasim requests go out with tlsfingerprint.MirasimProfile()
+//     (Mirasim.app's Electron ClientHello, JA3
+//     71dc8c533dd919ae9f4963224a4ba8fd), overriding whatever profile the caller
+//     resolved — sub2api's default is the Claude Code CLI fingerprint, which
+//     does not belong under a mirasim device signature.
 package mirasim

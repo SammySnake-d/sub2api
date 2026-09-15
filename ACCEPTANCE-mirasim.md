@@ -485,7 +485,76 @@ ma-relay 侧已实现按 token 计价 + 余额耗尽 402。
 
 ---
 
-## M. 上生产前的最终门
+## N. 部署与出口代理池(腾讯云 124.221.206.59 / agcn)
+
+**背景更正(实测 2026-09-16)**:该 VPS 到上游的网络是**通的** ——
+`mirasim-relay.mirofish.ai` 返回 404 / 0.85s,`api.anthropic.com` 返回 403 / 0.45s。
+所以"mira 无法直连"的真实含义是**国内出口 IP 不可用于打上游**(关联/风控),不是网络不可达。
+resin 的角色因此是**净化并固定出口**,不是打洞。这个区别影响判据:
+可达性不是验收项,**出口 IP 的归属与稳定性**才是。
+
+**现状**:x86_64 / 3.7G 内存(约 3G 可用)/ 51G 空闲;已跑 `caddy`(80,443)、
+`antigravity-tools`(8045)、`ma-relay-worker-agcn`(无状态执行 worker,`MemoryMax=768M`)。
+**无 PostgreSQL、无 Redis、无 resin、无 docker** —— 全部需要新装。
+
+**N1【门】出口 IP 不含中国大陆与香港**
+- 通过判据:抽 10 个账号各发一次真实请求,记录出口 IP 的 ASN 与国家,**无 CN、无 HK**。
+- 反例保护:断言出口 IP **不等于** VPS 自身的公网 IP(124.221.206.59)——
+  这条抓的是"代理没生效而请求直接裸奔出去",那种情况下功能测试全绿而出口是错的。
+
+**N2【门】一号一 IP,且每 IP 承载 2-3 个号**
+- 通过判据:N 个账号的出口 IP 分布满足:同一 IP 上的账号数 **≤ 3**;
+  且同一账号在连续 10 次请求内**始终**是同一个出口 IP。
+- 实现:resin fork 的 `max_leases_per_ip`(`SammySnake-d/Resin` 分支
+  `feat/latency-circuit-breaker`),生产设 **3**(ma-relay 侧用的是 6)。
+  机制是 `internal/routing/random.go calculateScore` 的 `overCapLeasePenalty=1e15` ——
+  超 cap 加罚分,主导任何延迟项但**有限**,所以满了会 fallback 而不是硬失败。
+
+**N3【门】按真实上游延迟选节点,不是按探测默认目标**
+- 通过判据:resin 的 `latency_test_url` 指向**真实上游**(`mirasim-relay.mirofish.ai`),
+  而非 `api.anthropic.com` 或任何默认值。
+- 背景(已踩过):上游是 `mirasim-relay.mirofish.ai`(CloudFront 13.249.182.79),
+  **不是 api.anthropic.com**。测错目标会让 `PREFER_LOW_LATENCY` 按无关延迟排序,
+  等于没开。直连上游约 92ms;好节点 +170ms 可接受,中等节点 +1s 能感觉到。
+
+**N4【门】延迟劣化时自动切走,不需要人介入**
+- 通过判据:把 `max_routable_latency_ms` 临时设到一个极小值(如 1ms),
+  断言节点被熔断、sticky 账号**自动迁移**到其他节点;恢复阈值后节点自动回到可路由集。
+  (ma-relay 侧实测过双向:阈值 1ms → 10 节点全熔断;100s → 全恢复。)
+- 生产值:`max_routable_latency_ms = 1000`。
+- 机制:`internal/probe/manager.go performLatencyProbe` 成功后调
+  `pool.EnforceLatencyCeiling(hash, domain)`,读 LatencyTable 的 EWMA 比阈值,
+  CompareAndSwap 开熔断;低于阈值时下次探测自动恢复。
+- **这一条解决的正是"纯 sticky 租到慢节点后卡死"** —— 没有它,一个账号会一直粘在劣化的节点上。
+
+**N5【门】sticky 不靠时间过期**
+- 通过判据:`sticky_ttl` 设长(ma-relay 侧用 168h),账号迁移**只由延迟熔断触发**,
+  不由 TTL 到期触发。
+- 理由:TTL 到期换 IP 对上游就是"这台设备换了网络",而延迟熔断换 IP 是有因由的;
+  前者随机发生在所有账号上,后者只发生在真的变慢的那条线路上。
+
+**N6【门】代理鉴权用对头**
+- 通过判据:账号绑定的 proxy URL 形如
+  `http://<Platform>.<Account>:<PROXY_TOKEN>@127.0.0.1:2260`,HTTPS 经 CONNECT 时
+  账号从 **proxy-auth 用户名**取。
+- 反例保护:构造一次用 `Authorization` 头而非 `Proxy-Authorization` 的请求,断言得到 407。
+- 背景(ma-relay 踩过并已修):`SetBasicAuth` 设的是 `Authorization`,
+  而 CONNECT 代理认证要 `Proxy-Authorization` → 407 会挡死整个代理集成。
+
+**N7【门】sub2api 的依赖就位且不挤垮机器**
+- 通过判据:PostgreSQL + Redis + sub2api + resin 四者同时运行时,
+  `MemoryAvailable` 仍 > 500M,且 `ma-relay-worker-agcn` 未被 OOM killer 影响。
+- 背景:总内存 3.7G,已有 worker 占用上限 768M。PostgreSQL 默认配置对这个规模偏大,
+  需要调 `shared_buffers` / `max_connections`。
+
+**N8【门】不影响既有服务**
+- 通过判据:部署前后 `caddy`、`antigravity-tools`、`ma-relay-worker-agcn`
+  三个服务的 `NRestarts` 不变,端口 80/443/8045 行为不变。
+- **ma-relay 生产在另一台机器(45.205.28.160),本次部署完全不碰它。**
+
+**N9【观测】节点源质量**
+- 免费节点池会脏,**脏 IP 会杀号**。上生产前确认用的是付费源或已验证源。
+- 读数:记录当前订阅源、健康节点数、其中非 CN/HK 的比例。
 
 **M1** A~E、G~L 的全部【门】项通过。
 **M2** `backend/` `go build ./...` 通过,新增包的测试全绿,未破坏既有构建。

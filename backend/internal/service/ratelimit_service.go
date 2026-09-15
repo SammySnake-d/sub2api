@@ -362,6 +362,15 @@ func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Acc
 		return false
 	}
 
+	// mirasim (platform=anthropic + credentials.provider=mirasim) has its own
+	// status-code semantics and a four-window quota model. The guard is the
+	// credential marker, so this branch is unreachable for every other account
+	// and handled=false hands the response straight back to the shared path
+	// below (which is what mirasim 403 / 402 deliberately keep using).
+	if handled, disable := s.handleMirasimUpstreamError(ctx, account, statusCode, headers, responseBody); handled {
+		return disable
+	}
+
 	if len(requestedModel) > 0 && s.HandleUpstreamModelNotFound(ctx, account, requestedModel[0], statusCode, responseBody) {
 		return true
 	}

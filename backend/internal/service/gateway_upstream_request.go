@@ -11,6 +11,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/mirasim"
 	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
@@ -195,6 +196,20 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 	// 账号级请求头覆写（仅 anthropic/openai api_key 账号启用时生效；OAuth 路径 no-op）。
 	// 放在所有 header 逻辑之后，确保配置值对同名头拥有最终决定权。
 	account.ApplyHeaderOverrides(req.Header)
+
+	// mirasim: one account is one device upstream, so it must present one
+	// client identity regardless of which customer's harness produced this
+	// request. Note this runs on the branch sub2api's own mimicry does NOT
+	// cover: mimicry is gated on `IsOAuth() && !isClaudeCode`, so a genuine
+	// Claude Code client forwards its own version verbatim — which makes one
+	// account's version jump between customers, and go backwards when the next
+	// customer is on an older build. Last in the chain so an account-level
+	// header override cannot reintroduce a divergent version.
+	if IsMirasimAccount(account) {
+		for k, v := range mirasim.CanonicalIdentityHeaders() {
+			setHeaderRaw(req.Header, resolveWireCasing(k), v)
+		}
+	}
 
 	// === DEBUG: 打印上游转发请求（headers + body 摘要），与 CLIENT_ORIGINAL 对比 ===
 	s.debugLogGatewaySnapshot("UPSTREAM_FORWARD", req.Header, body, map[string]string{

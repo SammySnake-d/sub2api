@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/mirasim"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -300,6 +301,10 @@ func (s *GatewayService) buildUpstreamRequestAnthropicAPIKeyPassthrough(
 	token string,
 ) (*http.Request, []byte, error) {
 	body = stripDeferredToolCacheControl(body)
+	// mirasim rejects a body whose `system` does not open with the Claude Agent
+	// SDK identity line (empirically confirmed: same request, 400 without it,
+	// 200 with it). Surgical sjson edit — see mirasim_body.go.
+	body = shapeMirasimRequestBody(account, body)
 	targetURL := claudeAPIURL
 	baseURL := account.GetBaseURL()
 	if baseURL != "" {
@@ -365,6 +370,15 @@ func (s *GatewayService) buildUpstreamRequestAnthropicAPIKeyPassthrough(
 
 	// 账号级请求头覆写（最终生效，覆盖上面所有来源的同名头）
 	account.ApplyHeaderOverrides(req.Header)
+
+	// mirasim identity normalisation — see the note in
+	// gateway_upstream_request.go. This is the branch mirasim accounts actually
+	// take (api_key + anthropic_passthrough), so it is the one that matters.
+	if IsMirasimAccount(account) {
+		for k, v := range mirasim.CanonicalIdentityHeaders() {
+			setHeaderRaw(req.Header, resolveWireCasing(k), v)
+		}
+	}
 
 	return req, body, nil
 }

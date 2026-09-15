@@ -181,6 +181,20 @@ func NewHTTPUpstream(cfg *config.Config) service.HTTPUpstream {
 	}
 }
 
+// ProvideHTTPUpstream 是注入到 DI 容器的 HTTPUpstream：基础实现外再包一层
+// mirasim 签名装饰器。非 mirasim 账号原样透传，行为与 NewHTTPUpstream 完全一致；
+// mirasim 账号在请求发出前补齐 x-mirasim-* 设备签名并封装（见
+// mirasim_upstream.go）。accountRepo 若未实现凭据读写所需的窄接口，则退化为
+// 纯基础实现。
+func ProvideHTTPUpstream(cfg *config.Config, accountRepo service.AccountRepository) service.HTTPUpstream {
+	base := NewHTTPUpstream(cfg)
+	store, ok := accountRepo.(mirasimAccountStore)
+	if !ok {
+		return base
+	}
+	return NewMirasimUpstream(base, store)
+}
+
 // Do 执行 HTTP 请求
 // 根据隔离策略获取或创建客户端，并跟踪请求生命周期
 //

@@ -570,6 +570,11 @@ const (
 	// SettingKeyOllamaCloudUsageSettings stores the opt-in global runner switch and interval.
 	SettingKeyOllamaCloudUsageSettings = "ollama_cloud_usage_settings"
 
+	// SettingKeyMirasimPlanProbeSettings stores the global enable switch and
+	// interval for reading each mirasim account's authoritative subscription
+	// tier from /auth/referral.
+	SettingKeyMirasimPlanProbeSettings = "mirasim_plan_probe_settings"
+
 	// =========================
 	// Overload Cooldown (529)
 	// =========================

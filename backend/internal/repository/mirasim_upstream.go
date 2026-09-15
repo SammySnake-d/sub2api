@@ -106,10 +106,11 @@ func (m *mirasimUpstream) Do(req *http.Request, proxyURL string, accountID int64
 		return nil, err
 	}
 	if signed {
-		// A mirasim request must reach the exact path it was signed for, so it
-		// is sent with the Mirasim.app TLS fingerprint on the redirect-free
-		// client even when the caller asked for the plain Do path.
-		return m.next.DoWithTLS(req, proxyURL, accountID, accountConcurrency, mirasim.TLSProfile)
+		// A mirasim request goes out with Mirasim.app's own TLS fingerprint
+		// (tlsfingerprint.MirasimProfile) even when the caller asked for the
+		// plain Do path: the handshake is the first packet, so the upstream
+		// classifies the client before it reads a single header.
+		return m.next.DoWithTLS(req, proxyURL, accountID, accountConcurrency, tlsfingerprint.MirasimProfile())
 	}
 	return m.next.Do(req, proxyURL, accountID, accountConcurrency)
 }
@@ -122,7 +123,7 @@ func (m *mirasimUpstream) DoWithTLS(req *http.Request, proxyURL string, accountI
 	if signed {
 		// Override whatever profile the caller resolved: sub2api's default is the
 		// Claude Code CLI fingerprint, and a mirasim account is an Electron app.
-		profile = mirasim.TLSProfile
+		profile = tlsfingerprint.MirasimProfile()
 	}
 	return m.next.DoWithTLS(req, proxyURL, accountID, accountConcurrency, profile)
 }
@@ -134,6 +135,14 @@ func (m *mirasimUpstream) sign(req *http.Request, proxyURL string, accountID int
 		return false, nil
 	}
 	ctx := req.Context()
+	// An explicitly marked control-plane call (auth server: /auth/refresh,
+	// /auth/referral) authenticates with the plain access-token bearer its caller
+	// set. Signing would overwrite that bearer with the relay-issued device
+	// ticket, which the auth server never issued. The caller still picks the
+	// proxy and TLS profile, so the egress is unchanged.
+	if service.MirasimSigningDisabled(ctx) {
+		return false, nil
+	}
 	binding, ok := m.binding(ctx, accountID)
 	if !ok || !binding.enabled {
 		return false, nil
@@ -311,7 +320,7 @@ type mirasimDoer struct {
 
 func (d *mirasimDoer) Do(req *http.Request) (*http.Response, error) {
 	*req = *req.WithContext(service.WithHTTPUpstreamRedirectsDisabled(req.Context()))
-	return d.next.DoWithTLS(req, d.proxyURL, d.accountID, d.concurrency, mirasim.TLSProfile)
+	return d.next.DoWithTLS(req, d.proxyURL, d.accountID, d.concurrency, tlsfingerprint.MirasimProfile())
 }
 
 // drainRequestBody reads the request body into memory and installs a replayable

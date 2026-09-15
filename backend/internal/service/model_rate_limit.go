@@ -90,6 +90,10 @@ func (a *Account) modelRateLimitKeysForRequest(ctx context.Context, requestedMod
 		if isAnthropicFableModel(modelKey) && modelKey != anthropicFableRateLimitKey {
 			keys = append(keys, anthropicFableRateLimitKey)
 		}
+		// mirasim accounts (platform=anthropic + credentials.provider=mirasim)
+		// additionally carry a family-level 7d window per model family. Returns
+		// nil for every other anthropic account, so nothing else changes.
+		keys = append(keys, mirasimModelRateLimitKeys(a, modelKey)...)
 	}
 	return keys
 }

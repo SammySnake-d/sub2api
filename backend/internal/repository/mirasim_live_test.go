@@ -31,6 +31,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/domain"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/mirasim"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
@@ -107,9 +108,13 @@ func TestMirasimLiveEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// [[cov:SG:query-not-signed]] The URL carries "?beta=true" — which sub2api
+	// always appends — while mirasim.SignAndSeal is given req.URL.Path only. If
+	// the query were inside the signed canonical string or the seal AAD, the
+	// upstream would reject this; HTTP 200 is the proof that it is not.
 	t.Logf("HTTP %d in %s (request-id=%s)", resp.StatusCode, elapsed.Round(time.Millisecond), resp.Header.Get("request-id"))
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("upstream returned %d: %s", resp.StatusCode, truncate(string(raw), 600))
+		t.Fatalf("upstream returned %d for a request whose URL carried ?beta=true: %s", resp.StatusCode, truncate(string(raw), 600))
 	}
 
 	var parsed struct {
@@ -147,6 +152,14 @@ func TestMirasimLiveEndToEnd(t *testing.T) {
 	if parsed.Usage.InputTokens == 0 && parsed.Usage.OutputTokens == 0 {
 		t.Fatal("HTTP 200 but usage is all zero")
 	}
+	// The accepted request declared this client version, and the signature the
+	// upstream just verified covers that same value.
+	if got := req.Header.Get("x-mirasim-client"); got != mirasim.ClientVersion {
+		t.Fatalf("accepted request declared x-mirasim-client %q, want mirasim.ClientVersion %q", got, mirasim.ClientVersion)
+	}
+	if got := req.URL.RawQuery; got != "beta=true" {
+		t.Fatalf("query = %q: the ?beta=true this obligation is about never reached the wire", got)
+	}
 }
 
 func extraForLive() map[string]any {
@@ -169,4 +182,105 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "...[truncated]"
+}
+
+// liveDoer routes mirasim's control-plane calls through the real upstream client.
+type liveDoer struct {
+	next     service.HTTPUpstream
+	proxyURL string
+}
+
+func (d *liveDoer) Do(req *http.Request) (*http.Response, error) {
+	return d.next.Do(req, d.proxyURL, 1, 4)
+}
+
+// TestMirasimLiveRejectsPathMismatch is the negative control for the whole
+// signing port: it proves the upstream actually VERIFIES the signature, rather
+// than ignoring it and letting anything through. Without this, every positive
+// result in this package is consistent with "the server does not check".
+//
+// It signs for one path and sends to another. Rejection is free — a 4xx burns no
+// tokens — so this is the cheapest assertion in the suite.
+func TestMirasimLiveRejectsPathMismatch(t *testing.T) {
+	if os.Getenv("MIRASIM_LIVE") != "1" {
+		t.Skip("set MIRASIM_LIVE=1 (and the MIRASIM_* credential env vars) to run the live negative control")
+	}
+	seed := os.Getenv("MIRASIM_DEVICE_SEED")
+	access := os.Getenv("MIRASIM_ACCESS_TOKEN")
+	if seed == "" || access == "" {
+		t.Fatal("MIRASIM_DEVICE_SEED and MIRASIM_ACCESS_TOKEN are required")
+	}
+	relayBase := envOr("MIRASIM_RELAY_BASE", mirasim.DefaultRelayBase)
+	proxyURL := os.Getenv("MIRASIM_PROXY_URL")
+
+	base := NewHTTPUpstream(nil)
+	ident := mirasim.Identity{
+		DeviceSeed:  seed,
+		AccessToken: access,
+		AuthBase:    envOr("MIRASIM_AUTH_BASE", mirasim.DefaultAuthBase),
+		RelayBase:   relayBase,
+		SessionID:   os.Getenv("MIRASIM_SESSION_ID"),
+	}
+	if v := os.Getenv("MIRASIM_EXPIRES_AT"); v != "" {
+		if ts, err := time.Parse(time.RFC3339, v); err == nil {
+			ident.ExpiresAt = ts
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	prepared, err := mirasim.NewRegistry().Prepare(ctx, 1, ident, &liveDoer{next: base, proxyURL: proxyURL}, nil, nil)
+	if err != nil {
+		t.Fatalf("prepare credential: %v", err)
+	}
+
+	// Control: the credential itself must be genuine, otherwise the rejection
+	// below would be attributable to a missing/blank bearer rather than to the
+	// path. The positive half of the pair is TestMirasimLiveEndToEnd, which sends
+	// a correctly-signed path with the same machinery and gets HTTP 200.
+	if prepared.Credential == "" || prepared.Signer == nil {
+		t.Fatal("mirasim.Registry.Prepare returned no credential/signer; a rejection would prove nothing")
+	}
+
+	body := []byte(`{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(relayBase, "/")+"/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("Authorization", "Bearer "+prepared.Credential)
+
+	const wrongPath = "/v1/deliberately-wrong-path"
+	mirasim.ApplyContextHeaders(req.Header, mirasim.ContextInput{
+		Path:       wrongPath,
+		SessionID:  prepared.SessionID,
+		AccountSub: prepared.AccountSub,
+		Locale:     prepared.Locale,
+	})
+	// [[cov:SG:path-signed]] Everything is a valid, correctly-assembled mirasim
+	// request EXCEPT that mirasim.SignAndSeal is given wrongPath while the request
+	// is sent to /v1/messages. The path is inside both the signed canonical string
+	// and the seal AAD, so the upstream must refuse it. A 200 here would mean the
+	// signature is decorative and every other result in this package is vacuous.
+	if err := mirasim.SignAndSeal(req.Header, prepared.Signer, req.Method, wrongPath, body, prepared.Credential); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := base.DoWithTLS(req, proxyURL, 1, 4, tlsfingerprint.MirasimProfile())
+	if err != nil {
+		t.Fatalf("transport error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+
+	t.Logf("path-mismatch -> HTTP %d  %s", resp.StatusCode, truncate(strings.ReplaceAll(string(raw), "\n", " "), 300))
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("upstream ACCEPTED a request signed for a different path: the signature is not being verified, so every positive signing result here proves nothing")
+	}
+	switch resp.StatusCode {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
+	default:
+		t.Fatalf("expected an authentication-class rejection, got HTTP %d: %s", resp.StatusCode, truncate(string(raw), 300))
+	}
 }

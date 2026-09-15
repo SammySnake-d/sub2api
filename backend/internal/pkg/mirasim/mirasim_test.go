@@ -277,16 +277,28 @@ func TestSignatureChangesWithBody(t *testing.T) {
 	}
 	nonce := make([]byte, nonceSize)
 	now := time.UnixMilli(1786250000123)
+
+	// [[cov:SG:body-sensitivity]] Everything else held fixed (method, path,
+	// credential, meta, ts, nonce, seed), flipping ONE BIT of the body must change
+	// x-mirasim-sig. '1' is 0x31 and '3' is 0x33: a single bit differs. Without
+	// this a signature over a body-independent constant would satisfy every other
+	// assertion in the differential suite.
 	a, err := signer.headersWithNonce("POST", "/v1/messages", []byte(`{"a":1}`), "cred", "", now, nonce)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := signer.headersWithNonce("POST", "/v1/messages", []byte(`{"a":2}`), "cred", "", now, nonce)
+	b, err := signer.headersWithNonce("POST", "/v1/messages", []byte(`{"a":3}`), "cred", "", now, nonce)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if a["x-mirasim-sig"] == b["x-mirasim-sig"] {
-		t.Fatal("signature is not covering the body — a one-byte body change produced the same signature")
+		t.Fatal("signature is not covering the body — a one-bit body change produced the same signature")
+	}
+	// The version stamped into the header must be the one the canonical string
+	// signs, i.e. ClientVersion: the two are a matched pair with the signing
+	// scheme, so a drift between them is a signing bug, not a cosmetic one.
+	if a["x-mirasim-client"] != ClientVersion || b["x-mirasim-client"] != ClientVersion {
+		t.Fatalf("x-mirasim-client = %q/%q, want ClientVersion %q", a["x-mirasim-client"], b["x-mirasim-client"], ClientVersion)
 	}
 	// ...and the path, and the credential.
 	c, _ := signer.headersWithNonce("POST", "/v1/messages/count_tokens", []byte(`{"a":1}`), "cred", "", now, nonce)

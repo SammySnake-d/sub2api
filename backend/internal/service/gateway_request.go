@@ -8,6 +8,7 @@ import (
 	"math"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"unsafe"
 
@@ -530,24 +531,31 @@ func StripEmptyTextBlocks(body []byte) []byte {
 		return body
 	}
 
-	var messages []any
-	if err := json.Unmarshal(sliceRawFromBody(body, msgsRes), &messages); err != nil {
+	// Each message is kept as its ORIGINAL bytes unless this function actually
+	// removes something from it, and even then the edit is surgical (sjson).
+	//
+	// The previous implementation unmarshalled messages into []any/map[string]any
+	// and re-marshalled. That is not byte-stable: Go sorts object keys
+	// alphabetically, escapes < > & as <…, and routes every number through
+	// float64 — so 12345678901234567890 came back as 12345678901234567000,
+	// silently changing a tool argument. Anthropic's prompt cache is a linear
+	// prefix match over tools → system → messages, so any of those rewrites
+	// invalidates the cache from that byte onward. Worse, this function is
+	// conditionally triggered (only when an empty text block is present), so the
+	// body would flip between the client's byte order and Go's sorted order from
+	// one turn to the next, costing a full cache rebuild at every flip.
+	var raws []json.RawMessage
+	if err := json.Unmarshal(sliceRawFromBody(body, msgsRes), &raws); err != nil {
 		return body
 	}
 
+	out := make([][]byte, len(raws))
 	modified := false
-	for _, msg := range messages {
-		msgMap, ok := msg.(map[string]any)
-		if !ok {
-			continue
-		}
-		content, ok := msgMap["content"].([]any)
-		if !ok {
-			continue
-		}
-		if cleaned, changed := stripEmptyTextBlocksFromSlice(content); changed {
+	for i, raw := range raws {
+		cleaned, changed := stripEmptyTextBlocksFromRawContent(raw, "content")
+		out[i] = cleaned
+		if changed {
 			modified = true
-			msgMap["content"] = cleaned
 		}
 	}
 
@@ -555,15 +563,64 @@ func StripEmptyTextBlocks(body []byte) []byte {
 		return body
 	}
 
-	msgsBytes, err := json.Marshal(messages)
+	res, err := sjson.SetRawBytes(body, "messages", buildJSONArrayRaw(out))
 	if err != nil {
 		return body
 	}
-	out, err := sjson.SetRawBytes(body, "messages", msgsBytes)
-	if err != nil {
-		return body
+	return res
+}
+
+// stripEmptyTextBlocksFromRawContent removes empty text blocks from the array at
+// `path` inside raw, recursing into tool_result content, without ever
+// round-tripping through map[string]any. Untouched bytes stay untouched.
+func stripEmptyTextBlocksFromRawContent(raw []byte, path string) ([]byte, bool) {
+	contentRes := gjson.GetBytes(raw, path)
+	if !contentRes.Exists() || !contentRes.IsArray() {
+		return raw, false
 	}
-	return out
+
+	blocks := contentRes.Array()
+	var toDelete []int
+	nested := make(map[int][]byte)
+
+	for i, b := range blocks {
+		switch b.Get("type").String() {
+		case "text":
+			// Match the original predicate exactly: only a JSON *string* that is
+			// empty counts. A missing or non-string `text` is left alone.
+			if t := b.Get("text"); t.Type == gjson.String && t.Str == "" {
+				toDelete = append(toDelete, i)
+			}
+		case "tool_result":
+			if cleaned, changed := stripEmptyTextBlocksFromRawContent([]byte(b.Raw), "content"); changed {
+				nested[i] = cleaned
+			}
+		}
+	}
+
+	if len(toDelete) == 0 && len(nested) == 0 {
+		return raw, false
+	}
+
+	out := raw
+	// Rewrite nested tool_result bodies first: indices are still the original
+	// ones at this point.
+	for i, v := range nested {
+		next, err := sjson.SetRawBytes(out, path+"."+strconv.Itoa(i), v)
+		if err != nil {
+			return raw, false
+		}
+		out = next
+	}
+	// Then delete back-to-front so earlier indices stay valid.
+	for k := len(toDelete) - 1; k >= 0; k-- {
+		next, err := sjson.DeleteBytes(out, path+"."+strconv.Itoa(toDelete[k]))
+		if err != nil {
+			return raw, false
+		}
+		out = next
+	}
+	return out, true
 }
 
 // FilterThinkingBlocks removes thinking blocks from request body
