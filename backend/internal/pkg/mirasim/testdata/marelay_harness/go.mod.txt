@@ -1,0 +1,7 @@
+module github.com/SammySnake-d/ma-relay/difftest
+
+go 1.25.0
+
+require github.com/SammySnake-d/ma-relay v0.0.0
+
+replace github.com/SammySnake-d/ma-relay => MARELAY_SRC

@@ -1,0 +1,267 @@
+{
+  "count": 43,
+  "digest": "6f38ea8fcc266ae94024cc1f7ee2c245ea2a494c4445e96d37645eb19392c127",
+  "narrowed": [],
+  "obligations": {
+    "BL:cache-read-discount": {
+      "expect": "cache_read_input_tokens 按 0.1x 计价",
+      "kind": "fault",
+      "row": "cache-read-discount",
+      "src": "BL"
+    },
+    "BL:cache-write-1h": {
+      "expect": "1 小时 TTL 的 cache_creation 按 2x 计价",
+      "kind": "fault",
+      "row": "cache-write-1h",
+      "src": "BL"
+    },
+    "BL:cache-write-5m": {
+      "expect": "5 分钟 TTL 的 cache_creation 按 1.25x 计价",
+      "kind": "fault",
+      "row": "cache-write-5m",
+      "src": "BL"
+    },
+    "BL:no-price-fallback": {
+      "expect": "每个已启用模型都有显式定价条目,不 fallback 到默认价",
+      "kind": "fault",
+      "row": "no-price-fallback",
+      "src": "BL"
+    },
+    "CP:bigint-precision": {
+      "expect": "工具入参中的大整数不丢精度(json.Marshal 经 float64 会把 12345678901234567890 变成 ...567000)",
+      "kind": "fault",
+      "row": "bigint-precision",
+      "src": "CP"
+    },
+    "CP:no-html-escape": {
+      "expect": "正文中的 < > & 不被转义成 \\u003c 等",
+      "kind": "fault",
+      "row": "no-html-escape",
+      "src": "CP"
+    },
+    "CP:no-key-reorder": {
+      "expect": "出站 body 的对象 key 顺序与入站相同(map[string]any round-trip 会按字母序重排)",
+      "kind": "fault",
+      "row": "no-key-reorder",
+      "src": "CP"
+    },
+    "CP:prefix-monotonic": {
+      "expect": "同一会话第 2 轮出站的 tools+system+messages 是第 1 轮的字节前缀(prefix-of,不是相等)",
+      "kind": "fault",
+      "row": "prefix-monotonic",
+      "src": "CP"
+    },
+    "CP:system-bytewise": {
+      "expect": "出站 system 与入站逐字节相同;cache_control 断点在原位",
+      "kind": "fault",
+      "row": "system-bytewise",
+      "src": "CP"
+    },
+    "CP:tools-bytewise": {
+      "expect": "出站 tools 与入站逐字节相同(tools 是前缀最前一段,动它整条链全废)",
+      "kind": "fault",
+      "row": "tools-bytewise",
+      "src": "CP"
+    },
+    "ID:deviceseed-db-backed": {
+      "expect": "清空 Redis 后 DeviceSeed 仍不变(必须来自 DB,不是缓存)",
+      "kind": "fault",
+      "row": "deviceseed-db-backed",
+      "src": "ID"
+    },
+    "ID:deviceseed-stable": {
+      "expect": "同一账号的 DeviceSeed 跨进程重启、跨不同客户端请求保持不变",
+      "kind": "fault",
+      "row": "deviceseed-stable",
+      "src": "ID"
+    },
+    "ID:mirasim-client-paired": {
+      "expect": "x-mirasim-client 的值与实际使用的签名算法版本属于同一组合",
+      "kind": "fault",
+      "row": "mirasim-client-paired",
+      "src": "ID"
+    },
+    "ID:sessionid-distinct": {
+      "expect": "不同账号的 SessionID 互不相同(防止被归一成同一个常量)",
+      "kind": "fault",
+      "row": "sessionid-distinct",
+      "src": "ID"
+    },
+    "ID:sessionid-stable": {
+      "expect": "x-mirasim-session fallback 跨重启不变(否则整池同步轮换 session)",
+      "kind": "fault",
+      "row": "sessionid-stable",
+      "src": "ID"
+    },
+    "ID:tls-ja3": {
+      "expect": "TLS ClientHello 的 JA3 == 71dc8c533dd919ae9f4963224a4ba8fd(Mirasim.app Electron),不是 sub2api 现成的 Claude Code profile",
+      "kind": "fault",
+      "row": "tls-ja3",
+      "src": "ID"
+    },
+    "ID:version-client-independent": {
+      "expect": "出站 claude-cli 版本与入站客户端版本无关,恒为 canonical 值",
+      "kind": "fault",
+      "row": "version-client-independent",
+      "src": "ID"
+    },
+    "ID:version-coherent": {
+      "expect": "UA 版本与 x-stainless-package-version / runtime-version 属于同一次实抓的自洽组合",
+      "kind": "fault",
+      "row": "version-coherent",
+      "src": "ID"
+    },
+    "MG:idempotent": {
+      "expect": "导入脚本重复执行结果一致,不产生重复账号",
+      "kind": "fault",
+      "row": "idempotent",
+      "src": "MG"
+    },
+    "MG:per-account-signature": {
+      "expect": "导入后对每一个账号跑签名差分,全部通过(不接受抽样)",
+      "kind": "fault",
+      "row": "per-account-signature",
+      "src": "MG"
+    },
+    "MG:source-preserved": {
+      "expect": "ma-relay 侧原始配置未被修改或删除",
+      "kind": "fault",
+      "row": "source-preserved",
+      "src": "MG"
+    },
+    "QU:fable-window-and": {
+      "expect": "fable 请求的可调度性 = 5h ∧ 7d ∧ 7d_fable 三个窗口都有余量",
+      "kind": "fault",
+      "row": "fable-window-and",
+      "src": "QU"
+    },
+    "QU:family-isolation": {
+      "expect": "7d_claude 耗尽时 opus 不可调度,但同账号 fable 仍可调度",
+      "kind": "fault",
+      "row": "family-isolation",
+      "src": "QU"
+    },
+    "QU:opus-window-and": {
+      "expect": "opus/sonnet/haiku 请求的可调度性 = 5h ∧ 7d ∧ 7d_claude 三个窗口都有余量",
+      "kind": "fault",
+      "row": "opus-window-and",
+      "src": "QU"
+    },
+    "QU:single-quota-state": {
+      "expect": "同一上游实体只有一套配额状态,不出现一侧耗尽而另一侧判定健康",
+      "kind": "fault",
+      "row": "single-quota-state",
+      "src": "QU"
+    },
+    "RG:existing-channels-unchanged": {
+      "expect": "现有渠道(openai/grok/gemini/bedrock/antigravity 等)的状态码冷却时长与禁用条件未被改变",
+      "kind": "fault",
+      "row": "existing-channels-unchanged",
+      "src": "RG"
+    },
+    "SC:400-badrequest": {
+      "expect": "不污染仅 body 相同、header 不同的后续请求(缓存键必须含 header 指纹)",
+      "kind": "fault",
+      "row": "400-badrequest",
+      "src": "SC"
+    },
+    "SC:401-expired": {
+      "expect": "触发 token refresh 并重试;不得禁用账号",
+      "kind": "fault",
+      "row": "401-expired",
+      "src": "SC"
+    },
+    "SC:402-nobalance": {
+      "expect": "本地拦截,不发出任何上游请求",
+      "kind": "fault",
+      "row": "402-nobalance",
+      "src": "SC"
+    },
+    "SC:403-banned": {
+      "expect": "账号被禁用(运营者既定决策:403 即封号,此行为被测试固定住防止重构误改)",
+      "kind": "fault",
+      "row": "403-banned",
+      "src": "SC"
+    },
+    "SC:429-5h": {
+      "expect": "写 5h scope 冷却;7d/7d_claude/7d_fable 三个 scope 不受影响",
+      "kind": "fault",
+      "row": "429-5h",
+      "src": "SC"
+    },
+    "SC:429-7d": {
+      "expect": "写 7d scope 冷却;5h scope 不受影响",
+      "kind": "fault",
+      "row": "429-7d",
+      "src": "SC"
+    },
+    "SC:429-7d-claude": {
+      "expect": "只锁 claude 族;同账号的 fable 请求仍可调度",
+      "kind": "fault",
+      "row": "429-7d-claude",
+      "src": "SC"
+    },
+    "SC:429-7d-fable": {
+      "expect": "只锁 fable 族;同账号的 opus/sonnet/haiku 请求仍可调度",
+      "kind": "fault",
+      "row": "429-7d-fable",
+      "src": "SC"
+    },
+    "SC:499-cancel": {
+      "expect": "不重试到另一个账号(取消会丢弃 in-flight 缓存写入,重试即从零重建)",
+      "kind": "fault",
+      "row": "499-cancel",
+      "src": "SC"
+    },
+    "SC:503-capacity": {
+      "expect": "账号保持 schedulable,不写任何冷却字段(该模型此刻无容量,账号本身健康)",
+      "kind": "fault",
+      "row": "503-capacity",
+      "src": "SC"
+    },
+    "SG:body-sensitivity": {
+      "expect": "body 改 1 bit,签名必须变化(防止签了个与 body 无关的常量)",
+      "kind": "fault",
+      "row": "body-sensitivity",
+      "src": "SG"
+    },
+    "SG:bytewise-parity": {
+      "expect": "固定输入下,五个 x-mirasim-* 头与 ma-relay 实现逐字节相同",
+      "kind": "fault",
+      "row": "bytewise-parity",
+      "src": "SG"
+    },
+    "SG:no-post-sign-mutation": {
+      "expect": "签名后到发出为止,body sha256 与 header 快照不变",
+      "kind": "fault",
+      "row": "no-post-sign-mutation",
+      "src": "SG"
+    },
+    "SG:no-redirect": {
+      "expect": "禁止跟随重定向(Go 跳转会换 path,必然破坏 path 签名)",
+      "kind": "fault",
+      "row": "no-redirect",
+      "src": "SG"
+    },
+    "SG:path-signed": {
+      "expect": "构造错误 path 时上游拒绝(证明签名真在起作用)",
+      "kind": "fault",
+      "row": "path-signed",
+      "src": "SG"
+    },
+    "SG:query-not-signed": {
+      "expect": "URL 追加 ?beta=true 后仍 200(sub2api 确实会加这个 query)",
+      "kind": "fault",
+      "row": "query-not-signed",
+      "src": "SG"
+    },
+    "SG:retry-resigns": {
+      "expect": "失败重试路径产生全新请求并重新签名,不改写并重发已签请求",
+      "kind": "fault",
+      "row": "retry-resigns",
+      "src": "SG"
+    }
+  },
+  "schema": "acceptance-atlas/obligations/2",
+  "source": "ACCEPTANCE.yaml:structure_sources"
+}

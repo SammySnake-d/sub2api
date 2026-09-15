@@ -1,0 +1,144 @@
+// Command marelaysig is the reference side of the mirasim differential test.
+//
+// It lives OUTSIDE the ma-relay repository (which is live production and must
+// never be modified) but declares a module path under
+// github.com/SammySnake-d/ma-relay/..., which is what lets it import ma-relay's
+// internal packages while a `replace` points the module at the read-only source
+// tree. Everything it reports is produced by ma-relay's own executed code, not
+// by a re-derivation.
+//
+// Protocol: one JSON job on stdin, one JSON result on stdout.
+package main
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/SammySnake-d/ma-relay/internal/relay"
+	"github.com/SammySnake-d/ma-relay/internal/relay/ccore"
+)
+
+type job struct {
+	SeedB64    string `json:"seed_b64"`
+	Method     string `json:"method"`
+	Path       string `json:"path"`
+	BodyB64    string `json:"body_b64"`
+	Credential string `json:"credential"`
+	Meta       string `json:"meta"`
+	TSMillis   int64  `json:"ts_millis"`
+
+	// Deterministic ccore.Seal probe.
+	SealPubB64   string `json:"seal_pub_b64"`
+	EphB64       string `json:"eph_b64"`
+	SealNonceB64 string `json:"seal_nonce_b64"`
+	PlaintextB64 string `json:"plaintext_b64"`
+	AADB64       string `json:"aad_b64"`
+
+	// Header set whose sealable subset should be observed.
+	Headers map[string]string `json:"headers"`
+}
+
+type result struct {
+	DeviceID     string            `json:"device_id"`
+	PublicKeyB64 string            `json:"public_key_b64"`
+	SigHeaders   map[string]string `json:"sig_headers"`
+	SealBlobB64  string            `json:"seal_blob_b64"`
+	SealedNames  []string          `json:"sealed_names"`
+	SurvivingEnc string            `json:"surviving_enc"`
+	Err          string            `json:"err,omitempty"`
+}
+
+func main() {
+	var j job
+	if err := json.NewDecoder(os.Stdin).Decode(&j); err != nil {
+		fail(err)
+	}
+	var out result
+
+	signer, err := relay.NewDeviceSigner(j.SeedB64)
+	if err != nil {
+		fail(err)
+	}
+	out.DeviceID = signer.DeviceID
+	out.PublicKeyB64 = signer.PublicKeyB64
+
+	body, err := base64.StdEncoding.DecodeString(j.BodyB64)
+	if err != nil {
+		fail(err)
+	}
+	// ma-relay's DeviceSigner.Headers draws its 32-byte nonce from crypto/rand
+	// with no injection point. The nonce it picked comes back in the header map,
+	// so the port is driven with THAT nonce and the signatures stay comparable
+	// byte for byte.
+	hdrs, err := signer.Headers(j.Method, j.Path, body, j.Credential, j.Meta, time.UnixMilli(j.TSMillis))
+	if err != nil {
+		fail(err)
+	}
+	out.SigHeaders = hdrs
+
+	if j.SealPubB64 != "" {
+		pub := mustB64(j.SealPubB64)
+		eph := mustB64(j.EphB64)
+		nonce := mustB64(j.SealNonceB64)
+		pt := mustB64(j.PlaintextB64)
+		aad := mustB64(j.AADB64)
+		blob, err := ccore.Seal(pub, eph, nonce, pt, aad)
+		if err != nil {
+			fail(err)
+		}
+		out.SealBlobB64 = base64.RawURLEncoding.EncodeToString(blob)
+	}
+
+	if len(j.Headers) > 0 {
+		// ma-relay's plaintext collector is unexported, but SealHeaders DELETES
+		// exactly the headers it sealed. Diffing the header map before/after is
+		// therefore a direct observation of ma-relay's sealable key set — from
+		// executed code, not from reading its source.
+		h := http.Header{}
+		for k, v := range j.Headers {
+			h.Set(k, v)
+		}
+		before := map[string]bool{}
+		for k := range h {
+			before[strings.ToLower(k)] = true
+		}
+		if err := relay.SealHeaders(h, j.Method, j.Path); err != nil {
+			fail(err)
+		}
+		after := map[string]bool{}
+		for k := range h {
+			after[strings.ToLower(k)] = true
+		}
+		for k := range before {
+			if !after[k] {
+				out.SealedNames = append(out.SealedNames, k)
+			}
+		}
+		sort.Strings(out.SealedNames)
+		out.SurvivingEnc = h.Get("x-mirasim-enc")
+	}
+
+	if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
+		fail(err)
+	}
+}
+
+func mustB64(s string) []byte {
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		fail(err)
+	}
+	return b
+}
+
+func fail(err error) {
+	_ = json.NewEncoder(os.Stdout).Encode(result{Err: err.Error()})
+	fmt.Fprintln(os.Stderr, "marelaysig:", err)
+	os.Exit(1)
+}

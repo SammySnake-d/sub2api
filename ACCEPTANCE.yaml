@@ -1,0 +1,460 @@
+project:
+  name: "mirasim-on-sub2api"
+  determinism: "deterministic"
+  commit_sha: "789d809c09f81ba14b550f444c05e7be4e288791"
+  review_period_days: 30
+  last_red_at: "2026-09-16"
+  retain_failure_observables: true
+  external_boundaries:
+    - "mirasim upstream (signed wire protocol)"
+    - "Anthropic prompt cache (linear prefix match)"
+    - "Redis (sticky session pins)"
+    - "PostgreSQL (account state)"
+
+toolchain:
+  language: "go"
+  # 只收本次移植真正新增/触及的测试,不把 sub2api 既有的上千个测试卷进来
+  test_glob:
+    - "backend/internal/pkg/mirasim/**/*_test.go"
+    - "backend/internal/pkg/tlsfingerprint/*_test.go"
+    - "backend/internal/repository/mirasim_*_test.go"
+    - "backend/internal/service/mirasim_*_test.go"
+    - "backend/internal/handler/admin/account_mirasim_*_test.go"
+  # SUT 收窄到 mirasim 路径实际被测的文件。
+  # 不用 backend/internal/**/*.go 的原因不是为了放宽判据,而是相反:
+  # 全量扫描会把 openai_first_output_timeout.go:322 的方法名 close 收进 SUT 符号集,
+  # 与 go 内建名 close 撞名 —— 那样断言里写一行 close(...) 就算"碰到了被测对象",
+  # TG-3 非平凡断言判据当场失效。
+  sut_glob:
+    - "backend/internal/pkg/mirasim/**/*.go"
+    - "backend/internal/pkg/tlsfingerprint/*.go"
+    - "backend/internal/repository/mirasim_upstream.go"
+    - "backend/internal/service/mirasim_*.go"
+    - "backend/internal/service/gateway_anthropic_passthrough.go"
+    - "backend/internal/service/model_rate_limit.go"
+    - "backend/internal/handler/admin/account_mirasim_import.go"
+  mutation:
+    tool: "manual-injection"
+    report: "adequacy/injections.json"
+
+# ── 义务集由机器从这里展开;作者只声明「有什么对象」,维度由脚本做乘法 ──
+structure_sources:
+
+  # 上游响应 → 调度动作。这一张是 mirasim 语义能否被 sub2 正确消费的全部内容。
+  - kind: "fault_matrix"
+    id: "SC"
+    rows:
+      - id: "503-capacity"
+        expect: "账号保持 schedulable,不写任何冷却字段(该模型此刻无容量,账号本身健康)"
+        external: "mirasim upstream"
+      - id: "429-5h"
+        expect: "写 5h scope 冷却;7d/7d_claude/7d_fable 三个 scope 不受影响"
+        external: "mirasim upstream"
+      - id: "429-7d"
+        expect: "写 7d scope 冷却;5h scope 不受影响"
+        external: "mirasim upstream"
+      - id: "429-7d-claude"
+        expect: "只锁 claude 族;同账号的 fable 请求仍可调度"
+        external: "mirasim upstream"
+      - id: "429-7d-fable"
+        expect: "只锁 fable 族;同账号的 opus/sonnet/haiku 请求仍可调度"
+        external: "mirasim upstream"
+      - id: "403-banned"
+        expect: "账号被禁用(运营者既定决策:403 即封号,此行为被测试固定住防止重构误改)"
+        external: "mirasim upstream"
+      - id: "400-badrequest"
+        expect: "不污染仅 body 相同、header 不同的后续请求(缓存键必须含 header 指纹)"
+        external: "mirasim upstream"
+      - id: "401-expired"
+        expect: "触发 token refresh 并重试;不得禁用账号"
+        external: "mirasim upstream"
+      - id: "402-nobalance"
+        expect: "本地拦截,不发出任何上游请求"
+      - id: "499-cancel"
+        expect: "不重试到另一个账号(取消会丢弃 in-flight 缓存写入,重试即从零重建)"
+
+  # 缓存前缀三段的出站字节判定。Anthropic 缓存是 tools→system→messages 的线性前缀匹配。
+  - kind: "fault_matrix"
+    id: "CP"
+    rows:
+      - id: "system-bytewise"
+        expect: "出站 system 与入站逐字节相同;cache_control 断点在原位"
+      - id: "tools-bytewise"
+        expect: "出站 tools 与入站逐字节相同(tools 是前缀最前一段,动它整条链全废)"
+      - id: "prefix-monotonic"
+        expect: "同一会话第 2 轮出站的 tools+system+messages 是第 1 轮的字节前缀(prefix-of,不是相等)"
+      - id: "no-key-reorder"
+        expect: "出站 body 的对象 key 顺序与入站相同(map[string]any round-trip 会按字母序重排)"
+      - id: "no-html-escape"
+        expect: "正文中的 < > & 不被转义成 \\u003c 等"
+      - id: "bigint-precision"
+        expect: "工具入参中的大整数不丢精度(json.Marshal 经 float64 会把 12345678901234567890 变成 ...567000)"
+
+  # 身份恒定:一号一设备,多客户在上游表现为同一台设备。
+  - kind: "fault_matrix"
+    id: "ID"
+    rows:
+      - id: "deviceseed-stable"
+        expect: "同一账号的 DeviceSeed 跨进程重启、跨不同客户端请求保持不变"
+      - id: "deviceseed-db-backed"
+        expect: "清空 Redis 后 DeviceSeed 仍不变(必须来自 DB,不是缓存)"
+      - id: "sessionid-stable"
+        expect: "x-mirasim-session fallback 跨重启不变(否则整池同步轮换 session)"
+      - id: "sessionid-distinct"
+        expect: "不同账号的 SessionID 互不相同(防止被归一成同一个常量)"
+      - id: "version-client-independent"
+        expect: "出站 claude-cli 版本与入站客户端版本无关,恒为 canonical 值"
+      - id: "version-coherent"
+        expect: "UA 版本与 x-stainless-package-version / runtime-version 属于同一次实抓的自洽组合"
+      - id: "mirasim-client-paired"
+        expect: "x-mirasim-client 的值与实际使用的签名算法版本属于同一组合"
+      - id: "tls-ja3"
+        expect: "TLS ClientHello 的 JA3 == 71dc8c533dd919ae9f4963224a4ba8fd(Mirasim.app Electron),不是 sub2api 现成的 Claude Code profile"
+
+  # 签名正确性:错一个字节 = 全量 403。
+  - kind: "fault_matrix"
+    id: "SG"
+    rows:
+      - id: "bytewise-parity"
+        expect: "固定输入下,五个 x-mirasim-* 头与 ma-relay 实现逐字节相同"
+      - id: "body-sensitivity"
+        expect: "body 改 1 bit,签名必须变化(防止签了个与 body 无关的常量)"
+      - id: "path-signed"
+        expect: "构造错误 path 时上游拒绝(证明签名真在起作用)"
+      - id: "query-not-signed"
+        expect: "URL 追加 ?beta=true 后仍 200(sub2api 确实会加这个 query)"
+      - id: "no-post-sign-mutation"
+        expect: "签名后到发出为止,body sha256 与 header 快照不变"
+      - id: "retry-resigns"
+        expect: "失败重试路径产生全新请求并重新签名,不改写并重发已签请求"
+      - id: "no-redirect"
+        expect: "禁止跟随重定向(Go 跳转会换 path,必然破坏 path 签名)"
+
+  # 四层配额窗口:即使只开 claude 族,四个计数器也全部生效。
+  - kind: "fault_matrix"
+    id: "QU"
+    rows:
+      - id: "opus-window-and"
+        expect: "opus/sonnet/haiku 请求的可调度性 = 5h ∧ 7d ∧ 7d_claude 三个窗口都有余量"
+      - id: "fable-window-and"
+        expect: "fable 请求的可调度性 = 5h ∧ 7d ∧ 7d_fable 三个窗口都有余量"
+      - id: "family-isolation"
+        expect: "7d_claude 耗尽时 opus 不可调度,但同账号 fable 仍可调度"
+      - id: "single-quota-state"
+        expect: "同一上游实体只有一套配额状态,不出现一侧耗尽而另一侧判定健康"
+
+  # 迁移正确性:DeviceSeed 错一字节该号即废,且表现为 403 像被封号。
+  - kind: "fault_matrix"
+    id: "MG"
+    rows:
+      - id: "per-account-signature"
+        expect: "导入后对每一个账号跑签名差分,全部通过(不接受抽样)"
+      - id: "idempotent"
+        expect: "导入脚本重复执行结果一致,不产生重复账号"
+      - id: "source-preserved"
+        expect: "ma-relay 侧原始配置未被修改或删除"
+
+  # 不回归:mirasim 特化不得改变既有渠道行为。
+  - kind: "fault_matrix"
+    id: "RG"
+    rows:
+      - id: "existing-channels-unchanged"
+        expect: "现有渠道(openai/grok/gemini/bedrock/antigravity 等)的状态码冷却时长与禁用条件未被改变"
+
+  # 计费口径:折扣算反时,缓存命中率越高亏得越多。
+  - kind: "fault_matrix"
+    id: "BL"
+    rows:
+      - id: "cache-read-discount"
+        expect: "cache_read_input_tokens 按 0.1x 计价"
+      - id: "cache-write-5m"
+        expect: "5 分钟 TTL 的 cache_creation 按 1.25x 计价"
+      - id: "cache-write-1h"
+        expect: "1 小时 TTL 的 cache_creation 按 2x 计价"
+      - id: "no-price-fallback"
+        expect: "每个已启用模型都有显式定价条目,不 fallback 到默认价"
+
+goals:
+  - id: "G1"
+    statement: "签名、请求头那些是匹配的"
+    observable: "运维在对 mirasim 发出真实请求时,能看到 HTTP 200 与非零 usage,且五个签名头与 ma-relay 逐字节相同"
+    owner: "relay-operator"
+
+  - id: "G2"
+    statement: "我们的 2api 只是保证转换的时候不破坏缓存"
+    observable: "运维在同一会话连续 3 次请求后,能看到第 2、3 次的 cache_read_input_tokens 大于 0 且命中率高于 90%"
+    owner: "relay-operator"
+
+  - id: "G3"
+    statement: "多个客户的请求打入同一个号,在上游看来是同一台设备的正常请求"
+    observable: "运维在抽查同一账号的多次出站请求时,能看到 DeviceSeed、SessionID、客户端版本三者跨请求完全一致,且 JA3 指纹等于 Mirasim.app 的值"
+    owner: "relay-operator"
+
+  - id: "G4"
+    statement: "额度调度策略,四层窗口"
+    observable: "运维在某账号 7d_claude 耗尽时,能看到 opus 请求不再路由到该账号,而 fable 请求仍然可以"
+    owner: "relay-operator"
+
+  - id: "G5"
+    statement: "mirasim 的状态码是真的可被 sub2 调度的"
+    observable: "运维在上游返回 503/429/403 后,能看到账号状态按各自语义变化,且变化范围不超出该状态码应有的影响面"
+    owner: "relay-operator"
+
+  - id: "G6"
+    statement: "mirasim 如何导入到 sub2,这也是一个难题"
+    observable: "运维在导入 165 个账号后,能看到每一个账号的签名差分测试通过,数量与来源一致"
+    owner: "relay-operator"
+
+  - id: "G7"
+    statement: "更好的售卖方式是去卖 token"
+    observable: "运维在对账时,能看到系统记账金额与按 usage 手算的金额一致,差额为零"
+    owner: "relay-operator"
+
+criteria:
+
+  # ── G1 签名 ──
+  - id: "C1"
+    goal: "G1"
+    statement: "mirasim 签名实现与 ma-relay 在相同输入下产出逐字节相同的五个头,且对 body 敏感"
+    oracle: "exact"
+    quadrant: "Q1"
+    check: "backend/internal/pkg/mirasim/ccore/sign_parity_test.go"
+    negative: "body 改 1 bit 而签名不变,即判不通过(说明签的是常量而非 body)"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["SG:bytewise-parity", "SG:body-sensitivity"]
+
+  - id: "C2"
+    goal: "G1"
+    statement: "签名覆盖 path 但不覆盖 query,且签名之后到发出为止无任何改写"
+    oracle: "exact"
+    quadrant: "Q1"
+    check: "backend/internal/repository/mirasim_upstream_test.go"
+    negative: "签名后 body sha256 或 header 快照发生变化,即判不通过;重试路径复用并改写已签请求同样不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["SG:path-signed", "SG:query-not-signed", "SG:no-post-sign-mutation", "SG:retry-resigns", "SG:no-redirect"]
+
+  - id: "C3"
+    goal: "G1"
+    statement: "真实 mirasim 账号能返回 200 与真实内容"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/live-request.md"
+    negative: "返回 200 但 content 为空或 usage 全零,即判不通过(可能打到了错误的端点)"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+
+  # ── G2 缓存前缀 ──
+  - id: "C4"
+    goal: "G2"
+    statement: "出站 body 的 tools 与 system 两段与入站逐字节相同"
+    oracle: "exact"
+    quadrant: "Q1"
+    check: "backend/internal/service/mirasim_cache_prefix_test.go"
+    negative: "system 被整体替换或被搬进 messages[0],即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["CP:system-bytewise", "CP:tools-bytewise"]
+
+  - id: "C5"
+    goal: "G2"
+    statement: "body 序列化不经 map round-trip:key 不重排、HTML 字符不转义、大整数不丢精度"
+    oracle: "exact"
+    quadrant: "Q1"
+    check: "backend/internal/service/mirasim_cache_prefix_test.go"
+    negative: "出现 key 字母序重排、< 被转义成 \\u003c、或大整数尾部变零,任一即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["CP:no-key-reorder", "CP:no-html-escape", "CP:bigint-precision"]
+
+  - id: "C6"
+    goal: "G2"
+    statement: "跨轮出站前缀单调:第 2 轮是第 1 轮的字节前缀(bytes.HasPrefix 是精确判据,不是关系近似)"
+    oracle: "exact"
+    quadrant: "Q1"
+    check: "backend/internal/service/mirasim_cache_prefix_test.go"
+    negative: "第 2 轮出站前缀与第 1 轮出现任何非追加式差异,即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["CP:prefix-monotonic"]
+
+  - id: "C7"
+    goal: "G2"
+    statement: "生产流量上的实际缓存命中率不低于 ma-relay 基准"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/cache-hit-rate.md"
+    negative: "命中率低于基准的 90%(即低于 86%),即判不通过"
+    role: "capability"
+    release_behavior: "track"
+    risk: "high"
+
+  # ── G3 身份 ──
+  - id: "C8"
+    goal: "G3"
+    statement: "设备身份跨重启、跨客户端、跨 Redis 清空保持不变,且账号间互不相同"
+    oracle: "exact"
+    quadrant: "Q1"
+    check: "backend/internal/service/mirasim_identity_test.go"
+    negative: "清空 Redis 后 DeviceSeed 或 SessionID 发生变化,即判不通过;不同账号的 SessionID 相同同样不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["ID:deviceseed-stable", "ID:deviceseed-db-backed", "ID:sessionid-stable", "ID:sessionid-distinct"]
+
+  - id: "C9"
+    goal: "G3"
+    statement: "出站客户端版本与入站无关且自洽,mirasim app 版本与签名方案配对"
+    oracle: "exact"
+    quadrant: "Q1"
+    check: "backend/internal/service/mirasim_identity_test.go"
+    negative: "两个不同版本的客户端打到同一账号却产生不同的出站版本,即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "medium"
+    covers: ["ID:version-client-independent", "ID:version-coherent", "ID:mirasim-client-paired"]
+
+  - id: "C10"
+    goal: "G3"
+    statement: "TLS ClientHello 的 JA3 等于 Mirasim.app 的值"
+    oracle: "exact"
+    quadrant: "Q4"
+    check: "backend/internal/pkg/tlsfingerprint/mirasim_profile_test.go"
+    negative: "JA3 等于 sub2api 现成的 Claude Code profile(44f88fca...),即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["ID:tls-ja3"]
+
+  # ── G4 配额 ──
+  - id: "C11"
+    goal: "G4"
+    statement: "可调度性是多窗口 AND,且族级窗口互不牵连"
+    oracle: "exact"
+    quadrant: "Q1"
+    check: "backend/internal/service/mirasim_quota_test.go"
+    negative: "7d_claude 耗尽后 fable 请求也被判不可调度,即判不通过(过度牵连)"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["QU:opus-window-and", "QU:fable-window-and", "QU:family-isolation", "QU:single-quota-state"]
+
+  - id: "C12"
+    goal: "G4"
+    statement: "运营者能在后台看懂某账号为何不可调度"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/quota-visibility.md"
+    negative: "运维看不出是哪个窗口耗尽导致停调,即判不通过"
+    role: "regression"
+    release_behavior: "track"
+    risk: "medium"
+
+  # ── G5 状态码 ──
+  - id: "C13"
+    goal: "G5"
+    statement: "上游各状态码产生各自语义对应的账号状态变化,影响面不超出应有范围"
+    oracle: "exact"
+    quadrant: "Q2"
+    check: "backend/internal/service/mirasim_statuscode_test.go"
+    negative: "503 导致账号被冷却或禁用,即判不通过(该码语义是账号健康、模型无容量)"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["SC:503-capacity", "SC:429-5h", "SC:429-7d", "SC:429-7d-claude", "SC:429-7d-fable", "SC:403-banned"]
+
+  - id: "C14"
+    goal: "G5"
+    statement: "客户端侧错误不放大:400 不连坐、401 触发刷新、402 本地拦截、499 不换号重试"
+    oracle: "exact"
+    quadrant: "Q2"
+    check: "backend/internal/service/mirasim_statuscode_test.go"
+    negative: "因 header 导致的 400 污染了仅 body 相同的后续请求,即判不通过;499 后重试到另一账号同样不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["SC:400-badrequest", "SC:401-expired", "SC:402-nobalance", "SC:499-cancel"]
+
+  - id: "C15"
+    goal: "G5"
+    statement: "现有渠道的状态码行为未被改变(判据是既有测试全绿 + 冷却时长逐值比对,非模型评分)"
+    oracle: "exact"
+    quadrant: "Q2"
+    check: "backend/internal/service/mirasim_statuscode_test.go"
+    negative: "任一既有渠道的冷却时长或禁用条件发生变化,即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["RG:existing-channels-unchanged"]
+
+  - id: "C20"
+    goal: "G5"
+    statement: "运营者确认状态码引起的账号状态变化与 mirasim 的真实语义一致"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/statuscode-semantics.md"
+    negative: "某个状态码的处理在代码里正确、但与 mirasim 上游的实际语义不符,即判不通过(机器只能验代码实现了声明的语义,验不了声明本身对不对)"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+
+  # ── G6 迁移 ──
+  - id: "C16"
+    goal: "G6"
+    statement: "导入器逐账号校验签名,且重复执行幂等"
+    oracle: "exact"
+    quadrant: "Q2"
+    check: "backend/internal/handler/admin/account_mirasim_import_test.go"
+    negative: "任一账号导入后签名差分不通过却仍报告导入成功,即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["MG:per-account-signature", "MG:idempotent", "MG:source-preserved"]
+
+  - id: "C17"
+    goal: "G6"
+    statement: "运营者能确认迁移后的账号数量与来源一致"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/migration-signoff.md"
+    negative: "导入报告的 created 数与来源账号数不符却未被察觉,即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+
+  # ── G7 计费 ──
+  - id: "C18"
+    goal: "G7"
+    statement: "cache 折扣与模型定价按 Anthropic 口径计算"
+    oracle: "exact"
+    quadrant: "Q2"
+    check: "backend/internal/service/mirasim_billing_test.go"
+    negative: "cache_read 按 1x 或更高计价(折扣方向算反),即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["BL:cache-read-discount", "BL:cache-write-5m", "BL:cache-write-1h", "BL:no-price-fallback"]
+
+  - id: "C19"
+    goal: "G7"
+    statement: "对账结果由人确认:系统记账与手算金额一致"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/billing-reconciliation.md"
+    negative: "存在任何无法解释的差额,即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
