@@ -2651,7 +2651,16 @@ func (s *GatewayService) isModelSupportedByAccount(account *Account, requestedMo
 	if account.Platform == PlatformOpenAI && account.IsOpenAIPassthroughEnabled() {
 		return true
 	}
-	// OAuth/SetupToken 账号使用 Anthropic 标准映射（短ID → 长ID）
+	// 这里只做「转发时会真正替换掉模型名」的那种归一化：OAuth/SetupToken 走 Anthropic
+	// 标准映射（短ID → 长ID），ServiceAccount 再叠一层 Vertex 的 name@date 形态。
+	//
+	// 注意本条件里的 Type != AccountTypeAPIKey 不是白名单查表的类型开关。白名单的
+	// 短名/长名互认已经收到 normalizeRequestedModelForLookup（account.go）里，对
+	// platform=anthropic 的 apikey 账号同样生效——2026-09-16 13:56 运维把 mapping 键
+	// 改成带日期后，143/143 个 mirasim（anthropic + apikey）账号在此处被剔除、14:13
+	// 全量 404，直到 14:18 把键改回裸名。别把归一化搬回这里：转发阶段 apikey 账号查的
+	// 是 account.GetMappedModel，与 IsModelSupported 共用那个查表函数，两处各自归一化
+	// 会让选号通过而转发用原名，故障从 404 变成静默的映射失效。
 	if account.Platform == PlatformAnthropic && account.Type != AccountTypeAPIKey {
 		if account.Type == AccountTypeServiceAccount {
 			requestedModel = normalizeVertexAnthropicModelID(claude.NormalizeModelID(requestedModel))

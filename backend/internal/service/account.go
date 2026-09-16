@@ -15,6 +15,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/domain"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/geminicli"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
@@ -801,18 +802,64 @@ func mappingHasWildcardForModel(mapping map[string]string, model string) bool {
 	return false
 }
 
+// normalizeRequestedModelForLookup 给出请求模型名在 model_mapping 里的「另一种合法写法」，
+// 供 IsModelSupported / ResolveMappedModel 在精确键与通配符都未命中时再查一次。
+// 返回值等于入参就表示没有替代写法——调用方据此跳过第二次查表，所以这里绝不能返回
+// 一个「和入参不是同一个模型」的名字：那等于把未配置的模型归一化成已配置的键，
+// 整张白名单会静默失效（功能缺陷换成权限缺陷）。
 func normalizeRequestedModelForLookup(platform, requestedModel string) string {
 	trimmed := strings.TrimSpace(requestedModel)
 	if trimmed == "" {
 		return ""
 	}
-	if platform != PlatformGemini && platform != PlatformAntigravity {
+	switch platform {
+	case PlatformGemini, PlatformAntigravity:
+		if trimmed == "gemini-3.1-pro-preview-customtools" {
+			return "gemini-3.1-pro-preview"
+		}
 		return trimmed
-	}
-	if trimmed == "gemini-3.1-pro-preview-customtools" {
-		return "gemini-3.1-pro-preview"
+	case PlatformAnthropic:
+		return alternateAnthropicModelIDForLookup(trimmed)
 	}
 	return trimmed
+}
+
+// alternateAnthropicModelIDForLookup 在「短名 claude-haiku-4-5」与「带日期
+// claude-haiku-4-5-20251001」之间互换。两者是同一个模型的两种合法写法，运维在
+// model_mapping 里写哪一种，两种写法的请求都应该命中同一条白名单项。
+//
+// 为什么必须对 type=apikey 的账号也生效——下一个人最想做的错事，就是把类型条件收
+// 回去、理由是「apikey 账号不该用 OAuth 的映射表」。这条「优化」在生产上炸过：
+//
+//	2026-09-16 13:56:32  运维把 model_mapping 的键改成带日期的 claude-haiku-4-5-20251001
+//	2026-09-16 14:13:29  客户端发裸名 claude-haiku-4-5
+//	          ~14:13:32  143/143 个账号被「模型支持」判据剔除，候选集空 →
+//	                     ErrNoAvailableAccounts → 被归类成 404 model_not_found
+//	2026-09-16 14:18:27  运维把键改回裸名才恢复（也就是说当时只修对了一边：
+//	                     裸名能用了，带日期的请求会吃到完全对称的 404）
+//
+// 那 143 个账号是 platform=anthropic + type=apikey 的 mirasim 上游：它走 Anthropic
+// 协议（凭据是 ed25519 设备签名，所以账号类型落在 apikey），模型名空间与 OAuth 完全
+// 相同。claude.ModelIDOverrides 描述的是「Anthropic 的模型名有短/长两种写法」这个
+// 协议事实，不是 OAuth 专属的鉴权细节；按账号类型去掐它，等于让同一个模型在 UI 里
+// 有两种写法而只有一种能用。
+//
+// 归一化放在查表函数里、而不是放在 isModelSupportedByAccount 里，也是刻意的：转发
+// 阶段 apikey 账号查的是 account.GetMappedModel → ResolveMappedModel
+// （gateway_forward.go 的模型映射段），与 IsModelSupported 共用本函数。若只在选号
+// 判据处归一化，选号会通过、但转发时仍找不到那条 mapping，于是把请求里的原名直接发
+// 给上游——把一个显眼的 404 换成「映射静默失效」的难查故障。
+//
+// 严格走这两张表、不做「正则剥掉结尾 8 位日期」之类的宽松匹配：伪造/过期的日期后缀
+// （claude-haiku-4-5-20240101）必须继续被白名单拒绝。
+func alternateAnthropicModelIDForLookup(model string) string {
+	if dated, ok := claude.ModelIDOverrides[model]; ok {
+		return dated
+	}
+	if short, ok := claude.ModelIDReverseOverrides[model]; ok {
+		return short
+	}
+	return model
 }
 
 func mappingSupportsRequestedModel(mapping map[string]string, requestedModel string) bool {
