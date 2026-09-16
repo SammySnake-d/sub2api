@@ -765,6 +765,15 @@ func (s *RateLimitService) handleMirasimUpstreamError(
 		if s.persistMirasimWindowLimits(ctx, account, headers) {
 			return true, false
 		}
+		// header 没给窗口，再看 **body**。mirasim 把"哪个窗口耗尽"写在
+		// error.code 里（credit_exhausted_7d_claude 这种形态），而这条信息此前被
+		// 完全忽略 —— 结果是一个 7 天窗口的耗尽只换来 5 秒冷却，耗尽的账号 5 秒后
+		// 又回到候选池、又被选中、又 429。线上实测：一次请求 21 秒内换了 15 个账号
+		// 全部 429，而同期 143 个号里有 125 个的 7d_claude 用量还不到 80%。
+		// 详见 mirasim_429_body_window.go。
+		if s.persistMirasimWindowLimitFromBody(ctx, account, responseBody) {
+			return true, false
+		}
 		// No window header we recognise. sub2api has no region / shared-quota
 		// 429 dimension, so this lands on the configurable seconds-scale
 		// fallback rather than a multi-hour window guess.
