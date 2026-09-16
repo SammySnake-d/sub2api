@@ -35,14 +35,34 @@
 
 ## 完整迁移(四件套全搬)
 
-### 1. 本机:构建镜像
+### 1. 构建镜像
+
+**推荐在目标机上原生构建**,而不是本机交叉构建:
 
 ```bash
-cd deploy/migrate
-RESIN_REPO=/path/to/Resin bash build.sh
+# 本机：只传源码（git archive，干净且小 —— 实测 sub2api 15MB / resin 3.5MB）
+cd /path/to/sub2api && git archive --format=tar HEAD | gzip -1 > /tmp/sub2api-src.tar.gz
+cd /path/to/Resin   && git archive --format=tar HEAD | gzip -1 > /tmp/resin-src.tar.gz
+scp /tmp/{sub2api,resin}-src.tar.gz 新机:/opt/sub2api-stack/build/
+
+# 目标机：原生 amd64 构建
+cd /opt/sub2api-stack/build
+tar -C sub2api -xzf sub2api-src.tar.gz && tar -C resin -xzf resin-src.tar.gz
+docker build -t sub2api-stack/resin:local   resin/
+docker build -t sub2api-stack/sub2api:local -f sub2api/deploy/Dockerfile sub2api/
 ```
 
-产出 `images-<时间戳>.tar.gz`。
+> **为什么不在 Apple Silicon 上交叉构建。** 实测 `--platform linux/amd64` 会让**所有**
+> stage 都跑在 QEMU 模拟下,包括前端那一层;Vite 构建在模拟环境里直接 OOM
+> (`exit code 134` = SIGABRT,Node 堆溢出),即使 Dockerfile 里已经设了
+> `--max-old-space-size=1536`。
+>
+> 而且交叉编译前端**本来就是浪费** —— 前端产物是一堆架构无关的静态文件,
+> 让它在模拟器里跑纯属白费。目标机是原生 amd64、6.6G 可用内存,网络到 npm 只要
+> 0.27s(法国离得近),在那里构建又快又省事。
+>
+> `build.sh` 保留了本机构建 + `docker save` 那条路(不依赖 registry),但它只适合
+> 本机本来就是 amd64 的情况。
 
 > **必须用我们自己构建的 resin 镜像。** 上游 `ghcr.io/resinat/resin` 不含二开改动
 > (延迟天花板熔断、每 IP 租约上限、单请求内换节点重试、失格租约回收)。用错镜像的
@@ -70,19 +90,40 @@ SUB2API_HOST=agcn RESIN_HOST=loon-resin bash export.sh
 ### 3. 传输
 
 ```bash
-scp images-*.tar.gz migrate-bundle-*.tar.gz deploy/migrate/{docker-compose.yml,import.sh,.env.example} 新机:/opt/sub2api-stack/
+scp migrate-bundle-*.tar.gz deploy/migrate/{docker-compose.yml,import.sh,verify-migration.sh,.env.example} 新机:/opt/sub2api-stack/
 ```
 
-> 这两个包里有明文凭据(数据库口令、resin token、账号 credentials)。走 scp,
+> 这个包里有明文凭据(数据库口令、resin token、账号 credentials)。走 scp,
 > 不要经任何对象存储或聊天工具;导入完成后删掉。
+
+> **部署目录不要用 `/opt/sub2api`。** 目标机上那个路径可能已经属于别的项目
+> (实测 2026-09-16:目标机已有一套独立的 sub2api 部署)。用 `/opt/sub2api-stack`。
 
 ### 4. 新机:导入
 
 ```bash
 cd /opt/sub2api-stack
-docker load -i images-*.tar.gz
 bash import.sh migrate-bundle-*.tar.gz
 ```
+
+### 5. 数据对照(切流量前必做)
+
+```bash
+OLD_SUB2API=agcn OLD_RESIN=loon-resin \
+NEW_HOST='ssh -p 2222 -i ~/.ssh/新机密钥 root@新机IP' \
+bash verify-migration.sh
+```
+
+逐项对照五类数据,退出码 0 才算等价。**`import.sh` 里的核对不够** —— 它只比行数,
+而行数一致完全可能内容已经漂了。最容易漂的恰恰是配置:
+
+- **sub2api 的配置有两个来源,DB 那份优先。** `config.yaml` 只是启动兜底,运维在
+  管理后台改的每一项都落在 `settings` 表里(`setting_service.go:326` 让 DB 存值覆盖
+  文件值)。只对照 config.yaml 会漏掉**全部** UI 改动。
+- **resin 的平台配置不在文件里**,在它自己的 SQLite 里。订阅源白名单丢了不报错,
+  只会让出口池悄悄退回"什么源都用"。
+- **设备根指纹**:脚本对 `mirasim_device_seed` 做聚合哈希对照(不导出明文),
+  证明是**同一批设备**而不只是"数量一样" —— 数量对而种子变了,上游看到的是一批全新设备。
 
 ---
 

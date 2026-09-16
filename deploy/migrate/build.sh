@@ -29,13 +29,13 @@ RESIN_IMAGE="${RESIN_IMAGE:-sub2api-stack/resin:local}"
 # 否则会产出 arm64 镜像,而它在目标机上**能 load、不能跑**,报 exec format error。
 PLATFORM="${PLATFORM:-linux/amd64}"
 
-echo "[1/3] 构建 sub2api（$PLATFORM）..."
+echo "[1/3] 构建 sub2api（${PLATFORM}）..."
 docker build --platform "$PLATFORM" \
   -f "$SUB2API_REPO/deploy/Dockerfile" \
   -t "$SUB2API_IMAGE" \
   "$SUB2API_REPO"
 
-echo "[2/3] 构建 resin（$PLATFORM）..."
+echo "[2/3] 构建 resin（${PLATFORM}）..."
 # 记录 git 信息进镜像,这样线上能查出跑的是哪个版本 ——
 # 二开分支尤其需要,否则分不清跑的是我们的版本还是上游的。
 docker build --platform "$PLATFORM" \

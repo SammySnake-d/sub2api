@@ -35,6 +35,17 @@
 # 订阅源节点数增长,而节点数是会变的。
 # =============================================================================
 
+# **刻意不给任何 service 写 container_name。**
+#
+# 目标机(2026-09-16 实测)上已经跑着另一个项目，它的容器就叫 sub2api /
+# sub2api-postgres / sub2api-redis —— 与这份编排原来写死的名字逐字相同。
+# container_name 占用的是 **Docker 全局** 命名空间,不受 compose project 隔离,
+# 所以那样部署的后果不是"我起不来"这么简单:一旦我先占住这些名字,
+# **别人那个项目就重启不了**。
+#
+# 去掉之后容器名由 compose 按 `<project>-<service>-<序号>` 生成,天然隔离。
+# 代价只是 `docker exec` 要敲长名字,而本仓所有脚本用的都是
+# `docker compose exec <service>`，不依赖容器名。
 name: sub2api-stack
 
 services:
@@ -43,7 +54,6 @@ services:
   # ---------------------------------------------------------------------------
   resin:
     image: ${RESIN_IMAGE:-sub2api-stack/resin:local}
-    container_name: resin
     restart: unless-stopped
     environment:
       # 所有 resin 环境变量都必须带 RESIN_ 前缀。
@@ -85,7 +95,6 @@ services:
 
   postgres:
     image: postgres:18-alpine
-    container_name: sub2api-postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-sub2api}
@@ -113,7 +122,6 @@ services:
 
   redis:
     image: redis:8-alpine
-    container_name: sub2api-redis
     restart: unless-stopped
     # maxmemory 配在 limits 之下,让 redis 自己按 LRU 淘汰,
     # 而不是让内核 OOM killer 来决定 —— 后者会直接杀进程。
@@ -139,7 +147,6 @@ services:
 
   sub2api:
     image: ${SUB2API_IMAGE:-sub2api-stack/sub2api:local}
-    container_name: sub2api
     restart: unless-stopped
     depends_on:
       postgres: {condition: service_healthy}
@@ -174,7 +181,8 @@ services:
 
 networks:
   stack:
-    name: sub2api-stack
+    # 网络名也带 project 前缀，与目标机上既有的 sub2api_sub2api-network 区分开。
+    name: sub2api-stack-net
     driver: bridge
 
 volumes:
