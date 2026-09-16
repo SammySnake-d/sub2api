@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -513,24 +514,57 @@ func (s *adminServiceImpl) BatchUpdateLimits(ctx context.Context, userIDs []int6
 	return affected, nil
 }
 
+// 余额调整支持的动作。
+const (
+	BalanceOperationSet      = "set"
+	BalanceOperationAdd      = "add"
+	BalanceOperationSubtract = "subtract"
+
+	// BalanceOperationSetZero 由服务端自己把余额清零，不接受客户端送来的金额。
+	//
+	// 存在的理由是一条真实缺陷链：余额列是 numeric(20,8)（ent schema user.go 的
+	// decimal(20,8)，生产 information_schema 实测一致），但 Go / JSON / 前端全程是
+	// float64。管理面板的"提取全部"按钮把 GET 回来的余额原样当作 subtract 金额回传，
+	// 于是真值 999999876.73707879 经 float64 往返后变成 999999876.7370788；
+	// lib/pq 用 strconv.AppendFloat(v,'f',-1,64) 把它以文本发出，Postgres 按精确十进制
+	// 解析，`balance + $1 >= 0` 得到 -0.00000001 → 整条 UPDATE 0 行 → 拒绝。
+	// 管理员点的是系统自己给的值，却被告知余额不足。
+	//
+	// 治本不是加容差（那会把"余额非负"这条不变量改软，而且这 1e-8 是真实差额不是舍入
+	// 伪影），而是不让"余额"这个量经客户端 float64 往返再回来当扣减量：清零的语义是
+	// 精确可表达的，直接由服务端在同一条 UPDATE 里对当前余额取值置 0。
+	BalanceOperationSetZero = "set_zero"
+)
+
+// balanceScale 与 users.balance 列的 numeric(20,8) 标度对齐。
+const balanceScale = 8
+
 func (s *adminServiceImpl) UpdateUserBalance(ctx context.Context, userID int64, balance float64, operation string, notes string) (*User, error) {
 	// 余额调整必须走原子接口：先读后整行写回会把并发的计费扣款覆盖掉。
 	var (
 		change BalanceChange
 		err    error
+		// delta 仅用于拒绝时的错误信息：记录本次真正发给数据库的增量。
+		delta    float64
+		hasDelta bool
 	)
 	switch operation {
-	case "set":
+	case BalanceOperationSet:
 		change, err = s.userRepo.SetBalance(ctx, userID, balance)
-	case "add":
+	case BalanceOperationSetZero:
+		// 客户端送来的 balance 一律忽略，清零的值只能由服务端给。
+		change, err = s.userRepo.SetBalance(ctx, userID, 0)
+	case BalanceOperationAdd:
+		delta, hasDelta = balance, true
 		change, err = s.userRepo.AdjustBalance(ctx, userID, balance)
-	case "subtract":
+	case BalanceOperationSubtract:
+		delta, hasDelta = -balance, true
 		change, err = s.userRepo.AdjustBalance(ctx, userID, -balance)
 	default:
 		return nil, fmt.Errorf("unsupported balance operation: %q", operation)
 	}
 	if errors.Is(err, ErrBalanceNegative) {
-		return nil, fmt.Errorf("balance cannot be negative, current balance: %.2f, requested operation would result in: %.2f", change.Old, change.New)
+		return nil, balanceNegativeError(operation, delta, hasDelta, change)
 	}
 	if err != nil {
 		return nil, err
@@ -581,6 +615,70 @@ func (s *adminServiceImpl) UpdateUserBalance(ctx context.Context, userID int64, 
 	}
 
 	return user, nil
+}
+
+// balanceNegativeError 把仓储层"这次调整会让余额变负"的拒绝翻译成对外可读、可分类的错误。
+//
+// 修的是 2026-09-16 18:38:35.896 / 18:38:37.949 (+08) 生产上两条 audit_logs（id 1709/1710，
+// action=admin.users.balance.create，body {"balance":999999876.7370788,"operation":"subtract"}）
+// 暴露的两个缺陷，两者互相独立：
+//
+//  1. 分类错。旧实现在这里 fmt.Errorf 另造了一个裸 error，把 ErrBalanceNegative
+//     （infraerrors.BadRequest("BALANCE_NEGATIVE")）整个丢掉，于是 errors.ToHTTP 只能回落到
+//     500 → 这两条 audit_logs 的 status_code 都是 500，一个纯管理员输入错误被记成服务端
+//     内部错误，还进了 response.ErrorFrom 的 [ERROR] 日志。现在用 infraerrors.Clone 保留
+//     code/reason，HTTP 落 400。
+//
+//  2. 数值在说谎。旧实现打印的是 `%.2f` 的 change.Old 与 change.New，而 change.New 是
+//     仓储层拒绝后用 **float64** 重算的 current+delta；判据却在 SQL 里由 Postgres 用
+//     **精确十进制** 算的（`balance + $1 >= 0`）。本例真实残差是 -0.00000001，而该量级
+//     float64 的 ulp≈2.4e-7 ≫ 1e-8，差额被抹平成 +0，`%.2f` 打出 "0.00"——既不是"设为 0"
+//     也不是数据库的真实结果，运维看到的是"余额不足，结果 0.00"这种自相矛盾的话。
+//     （指纹：真负数 `%.2f` 会带负号打成 "-0.00"，生产日志里没有负号。）
+//
+// 所以这里不再输出任何由 Go 侧 float64 重算出来的"结果值"：New 在拒绝分支上不可信，
+// 补到 %.8f 也只会把 "0.00" 换成同样虚假的 "0.00000000"。改为输出两个各自可核对的事实：
+//   - current：change.Old 按列标度 %.8f 渲染。注意这只是"我们拿到的那个 float64 的最佳
+//     8 位小数写法"，不等于数据库里的精确值——余额 Scan 进 float64 时精度已经丢了，
+//     要拿到判据用的真实 old/new 必须由仓储层在同一条语句里 RETURNING（不在本次改动范围）。
+//   - requested：strconv 'f' -1，即 lib/pq 真正发给 Postgres 的那串文本，也就是数据库
+//     参与比较的那个精确十进制值。运维把这两个数减一下就能直接看见 1e-8 的差。
+func balanceNegativeError(operation string, delta float64, hasDelta bool, change BalanceChange) error {
+	current := strconv.FormatFloat(change.Old, 'f', balanceScale, 64)
+	metadata := map[string]string{
+		"operation":       operation,
+		"current_balance": current,
+	}
+
+	var message string
+	if hasDelta {
+		// pqParamText 与 lib/pq encode.go 的 float64 编码保持一致。
+		requested := pqParamText(delta)
+		metadata["requested_delta"] = requested
+		message = fmt.Sprintf(
+			"balance cannot be negative: current balance %s, requested change %s (value as sent to the database) would make it negative",
+			current, requested,
+		)
+	} else {
+		requested := pqParamText(change.New)
+		metadata["requested_balance"] = requested
+		message = fmt.Sprintf(
+			"balance cannot be negative: current balance %s, requested balance %s is negative",
+			current, requested,
+		)
+	}
+
+	appErr := infraerrors.Clone(ErrBalanceNegative)
+	appErr.Message = message
+	appErr.Metadata = metadata
+	return appErr.WithCause(ErrBalanceNegative)
+}
+
+// pqParamText 复刻 lib/pq 对 float64 绑定参数的文本编码
+// （encode.go: strconv.AppendFloat(v, 'f', -1, 64)），
+// 这样错误信息里的数字就是 Postgres 实际解析成 numeric 参与比较的那一个。
+func pqParamText(value float64) string {
+	return strconv.FormatFloat(value, 'f', -1, 64)
 }
 
 func (s *adminServiceImpl) tryAccrueAffiliateRebateForAdminRecharge(ctx context.Context, userID int64, operation string, amount float64) {

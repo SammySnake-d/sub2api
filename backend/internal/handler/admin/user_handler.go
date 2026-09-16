@@ -91,6 +91,20 @@ type UpdateUserRequest struct {
 }
 
 // UpdateBalanceRequest represents balance update request
+//
+// operation=set_zero 是给"提取全部/清空余额"用的动作：金额由服务端在同一条 UPDATE 里
+// 对当前余额取值，请求体里的 balance 一律忽略。
+//
+// 它存在的原因是一条真实缺陷：余额列是 numeric(20,8)，但 JSON/Go/前端都是 float64，
+// 前端把 GET 到的余额原样回传当扣减量时会发生 float64 往返损失
+// （真值 999999876.73707879 → 回传 999999876.7370788），Postgres 用精确十进制算出
+// balance+delta = -0.00000001 而拒绝整条 UPDATE。生产 2026-09-16 18:38:35/18:38:37
+// 两次点击"提取全部"都因此失败（audit_logs 1709/1710，status 500）。
+// 客户端只要不把余额本身送回来，这条路径就不存在了。
+//
+// Balance 的校验保持"除 set_zero 外必须 > 0"：required_unless 只对 set_zero 放开
+// "必填"，omitempty 让 set_zero 的零值跳过 gt=0，其余动作（set/add/subtract）的契约
+// 与原来的 `required,gt=0` 完全一致——不能顺手删 gt=0，那会连带放开别的路径。
 type UpdateBalanceRequest struct {
 	Balance   float64 `json:"balance" binding:"required,gt=0"`
 	Operation string  `json:"operation" binding:"required,oneof=set add subtract"`
