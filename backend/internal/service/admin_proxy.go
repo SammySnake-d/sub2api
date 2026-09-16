@@ -590,27 +590,51 @@ func (s *adminServiceImpl) attachProxyLatency(ctx context.Context, proxies []Pro
 	}
 }
 
+// proxyLatencyPersistTimeout 给「落库」这一步单独的预算：探测结果已经拿到了，
+// 写缓存只是本地 Redis 一次 SET，3s 足够；同时保证脱离取消后不会无限期挂住。
+const proxyLatencyPersistTimeout = 3 * time.Second
+
 func (s *adminServiceImpl) saveProxyLatency(ctx context.Context, proxyID int64, info *ProxyLatencyInfo) {
 	if s.proxyLatencyCache == nil || info == nil {
 		return
 	}
 
+	// 生产缺陷（2026-09-16 新机器上复现）：这里原来直接拿调用方的请求 ctx
+	// （TestProxy/CheckProxyQuality 传的是 c.Request.Context()）去读写 Redis。
+	// 一次质量检测后端最坏 ~80s（基础探测 2 个 URL×10s + 4 个目标×15s），
+	// 而前端 axios 全局 timeout 只有 30s 且批量检测 3 并发，所以浏览器必然先断开、
+	// gin 把请求 ctx 取消掉；go-redis v9 在 ctx 已 Done 时于 pool.waitTurn 的
+	// fast path 直接返回 context.Canceled（根本不发命令），于是「已经测完的延迟」
+	// 被静默丢弃，只剩一行
+	//   Warning: store proxy latency cache failed: context canceled
+	// 影响面：SetProxyLatency 的 TTL=0（repository/proxy_latency_cache.go，永不过期），
+	// 全仓又没有任何周期性重测（只有新建代理和导入会触发探测），所以写一次失败，
+	// 面板上那条旧读数就无限期留着——这正是「面板延迟永远是旧值」的机制。
+	// 测量已经完成，持久化不该再挂在正在死掉的请求 ctx 上：脱离取消、但保留 ctx 上的
+	// 请求作用域 value（trace/request_id 等）并自带 deadline。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), proxyLatencyPersistTimeout)
+	defer cancel()
+
 	merged := *info
-	if latencies, err := s.proxyLatencyCache.GetProxyLatencies(ctx, []int64{proxyID}); err == nil {
-		if existing := latencies[proxyID]; existing != nil {
-			if merged.QualityCheckedAt == nil &&
-				merged.QualityScore == nil &&
-				merged.QualityGrade == "" &&
-				merged.QualityStatus == "" &&
-				merged.QualitySummary == "" &&
-				merged.QualityCFRay == "" {
-				merged.QualityStatus = existing.QualityStatus
-				merged.QualityScore = existing.QualityScore
-				merged.QualityGrade = existing.QualityGrade
-				merged.QualitySummary = existing.QualitySummary
-				merged.QualityCheckedAt = existing.QualityCheckedAt
-				merged.QualityCFRay = existing.QualityCFRay
-			}
+	latencies, err := s.proxyLatencyCache.GetProxyLatencies(ctx, []int64{proxyID})
+	if err != nil {
+		// 读失败以前落在一个空的 else 分支里，完全无声：一旦读不到旧值，
+		// 下面这段「本次只测了延迟就沿用上次质量评分」的合并就整段跳过，
+		// 面板上会看到质量列突然空掉却查不到任何线索。
+		logger.LegacyPrintf("service.admin", "Warning: load proxy latency cache for merge failed: %v", err)
+	} else if existing := latencies[proxyID]; existing != nil {
+		if merged.QualityCheckedAt == nil &&
+			merged.QualityScore == nil &&
+			merged.QualityGrade == "" &&
+			merged.QualityStatus == "" &&
+			merged.QualitySummary == "" &&
+			merged.QualityCFRay == "" {
+			merged.QualityStatus = existing.QualityStatus
+			merged.QualityScore = existing.QualityScore
+			merged.QualityGrade = existing.QualityGrade
+			merged.QualitySummary = existing.QualitySummary
+			merged.QualityCheckedAt = existing.QualityCheckedAt
+			merged.QualityCFRay = existing.QualityCFRay
 		}
 	}
 

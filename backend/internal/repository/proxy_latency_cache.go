@@ -70,5 +70,9 @@ func (c *proxyLatencyCache) SetProxyLatency(ctx context.Context, proxyID int64, 
 	if err != nil {
 		return err
 	}
+	// TTL=0（永不过期）是有意的：面板要一直显示上一次探测结果，而系统里没有
+	// 周期性重测（只有新建代理 / 导入 / 管理员手动点检测会触发探测）。
+	// 代价是「写失败 = 旧值永久留在面板上」，所以调用方必须保证写入不会被
+	// 客户端断开带走——见 service.saveProxyLatency 里脱离取消的上下文。
 	return c.rdb.Set(ctx, proxyLatencyKey(proxyID), payload, 0).Err()
 }
