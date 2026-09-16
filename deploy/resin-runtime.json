@@ -1,0 +1,68 @@
+{
+  "_comment": [
+    "resin 出口代理池的运行时配置 —— 这份文件是**真源**，线上值由它 PATCH 上去。",
+    "在它存在之前，这些值只活在 resin 自己的数据库里：改过什么、为什么改，下一个人",
+    "只能去线上 curl 出来猜。几条判决（latency_test_url 该指哪、一个出口 IP 上能压几个",
+    "账号）是踩过坑才定下来的，留在库里等于没留。",
+    "",
+    "应用方式：",
+    "  T=$(sudo grep RESIN_ADMIN_TOKEN /etc/resin.env | cut -d= -f2-)",
+    "  curl -X PATCH -H \"Authorization: Bearer $T\" -H 'content-type: application/json' \\",
+    "       --data @deploy/resin-runtime.json http://127.0.0.1:2260/api/v1/system/config",
+    "（_comment / _rationale 这类下划线开头的键在 PATCH 前需剥掉，见 deploy/apply-resin-runtime.sh）"
+  ],
+  "_rationale": {
+    "latency_test_url": [
+      "必须是一个**能 GET 的轻量 204 探针**。曾经把上游域名 relay.mirasim.ai 填在这里，",
+      "结果是：该域名对裸 GET 不返回可用响应，每个节点的延迟探测全部超时，于是所有节点",
+      "看起来都极慢，P2C 选点退化成随机，实测一次请求从 3s 劣化到 170s。",
+      "上游域名的正确落点是 latency_authorities —— 那是「哪些域名的延迟算权威」，",
+      "由真实流量被动采样，不是主动打靶。"
+    ],
+    "latency_authorities": [
+      "relay.mirasim.ai 在这里，意思是「经过真实请求测到的、到该域名的延迟」参与选点与熔断。",
+      "注意（实测 2026-09-16）：主动探测**只会**打 latency_test_url，从不主动打 authority 域名，",
+      "所以 authority 延迟完全依赖真实流量。这就是「能通 gstatic 但通不了上游」的节点会留在",
+      "可路由集里的原因，也是 resin 侧加了「单次请求内换节点重试 + 每次 dial 限时」的原因。"
+    ],
+    "max_leases_per_ip": [
+      "同一个出口 IP 上最多压 3 个账号。运营者定的口径：2-3 个号一个 IP。",
+      "设 0（不限）时 PREFER_LOW_LATENCY 会把所有账号堆到唯一最快的那个 IP 上，",
+      "上游看到的就是「一个设备在跑 143 个账号」。"
+    ],
+    "max_consecutive_failures": [
+      "1 = 一次失败即熔断。配合 resin 的单次请求内换节点重试：坏节点赔掉的那一次 dial",
+      "被代理层自己吸收，不会冒泡成 502 让上游网关去换账号（换账号是误判，还会丢掉",
+      "那个账号的 prompt cache 前缀）。"
+    ],
+    "max_routable_latency_ms": [
+      "1000ms 天花板。超过即熔断，挂在上面的 sticky 账号自动迁到更快的节点；",
+      "该节点下一次探测回到阈值内会自动重新进池。"
+    ]
+  },
+
+  "request_log_enabled": true,
+  "reverse_proxy_log_detail_enabled": false,
+  "reverse_proxy_log_req_headers_max_bytes": 4096,
+  "reverse_proxy_log_req_body_max_bytes": 1024,
+  "reverse_proxy_log_resp_headers_max_bytes": 1024,
+  "reverse_proxy_log_resp_body_max_bytes": 1024,
+
+  "max_consecutive_failures": 1,
+  "max_routable_latency_ms": 1000,
+  "max_leases_per_ip": 3,
+  "max_latency_test_interval": "10m0s",
+  "max_authority_latency_test_interval": "30m0s",
+  "max_egress_test_interval": "24h0m0s",
+
+  "latency_test_url": "https://www.gstatic.com/generate_204",
+  "latency_authorities": [
+    "gstatic.com",
+    "relay.mirasim.ai"
+  ],
+
+  "p2c_latency_window": "10m0s",
+  "latency_decay_window": "10m0s",
+  "cache_flush_interval": "5m0s",
+  "cache_flush_dirty_threshold": 1000
+}
