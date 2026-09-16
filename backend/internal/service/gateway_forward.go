@@ -120,6 +120,11 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 				passthroughModel = mappedModel
 			}
 		}
+		// mirasim 上游按客户端身份收货：非 Claude Code 形态的 body 会被拒收。
+		// 此前靠分组的 claude_code_only 提前拒绝来回避（生产上一小时 180 条 503），
+		// 这里改成改造。真 CC 请求与非 mirasim 账号在函数内部就原样返回，不付任何代价。
+		// 判据与 OAuth 通道共用一份，见 mirasim_identity_mimicry.go。
+		passthroughBody = s.applyMirasimClaudeCodeIdentity(ctx, c, account, parsed, passthroughBody)
 		return s.forwardAnthropicAPIKeyPassthroughWithInput(ctx, c, account, anthropicPassthroughForwardInput{
 			Body:          passthroughBody,
 			Parsed:        parsed,
@@ -177,21 +182,10 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	// 最低缓存门槛，导致系统级缓存失效）。
 	//
 	// 对于非 Claude Code 的第三方客户端（opencode 等），仍然走完整 mimicry。
-	var clientUserAgent string
-	if c != nil {
-		clientUserAgent = c.GetHeader("User-Agent")
-	}
-	isClaudeCode := IsClaudeCodeClient(ctx) || isClaudeCodeClient(clientUserAgent, parsed.MetadataUserID)
-
-	// 补充判定：上游 API 网关（如 new-api）转发真实 Claude Code 流量时，
-	// UA 会变成 Go-http-client 但 body 保留了完整的 Claude Code 特征
-	// （billing attribution block + metadata.user_id）。此时如果仍走 mimicry
-	// 重写 system prompt，会破坏 Anthropic prompt cache 的前缀匹配——
-	// 导致 messages 级缓存永远 miss、cache_creation 每轮全量重写。
-	// 通过检查 body 中的 billing attribution block 来识别被代理的真实 CC 流量。
-	if !isClaudeCode && parsed.MetadataUserID != "" {
-		isClaudeCode = systemHasBillingAttributionBlock(body)
-	}
+	// 判据抽到 mirasim_identity_mimicry.go：OAuth 通道与 mirasim 直通通道共用同一份。
+	// 两边各写一份会漂移，而两种误判都很贵：误判为 CC → 上游拒收；误判为非 CC →
+	// 真 CC 客户端的 system 被重写，缓存前缀每轮全毁。
+	isClaudeCode := s.requestLooksLikeClaudeCode(ctx, c, parsed, body)
 
 	shouldMimicClaudeCode := account.IsOAuth() && !isClaudeCode
 
