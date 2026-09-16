@@ -22,6 +22,15 @@ import (
 
 const resinRuntimeConfigPath = "../../../deploy/resin-runtime.json"
 
+// resinPlatformConfigPath 是**平台级**配置的真源，与上面那份是两个不同的控制面端点：
+//
+//	resin-runtime.json   → PATCH /api/v1/system/config   （单例：延迟天花板、租约上限…）
+//	resin-platforms.json → PATCH /api/v1/platforms/{id}  （每平台：订阅源白名单、地区过滤）
+//
+// 分两份不是为了整齐：平台是可增删的实体，系统配置是单例。混在一起会让
+// 「加一个平台」变成改一个全局对象。
+const resinPlatformConfigPath = "../../../deploy/resin-platforms.json"
+
 // resinRuntimeConfig 只解出本门要判的那几个键。
 // 不用 map[string]any 全量比较：那会让任何一次无关键的增删都变成红，
 // 门就会因为太吵而被关掉。
@@ -89,11 +98,128 @@ func TestResinCapsAccountsPerEgressIP(t *testing.T) {
 		"0 表示不限：PREFER_LOW_LATENCY 会把所有账号堆到唯一最快的 IP 上")
 
 	// 与之配套的两个健康判据一并钉住 —— 它们仨一起才构成「坏节点不会长期挂着账号」。
-	require.Equal(t, 1000, cfg.MaxRoutableLatencyMs,
-		"延迟天花板；超过即熔断，sticky 账号自动迁走")
+	require.Equal(t, 300, cfg.MaxRoutableLatencyMs,
+		"延迟天花板；超过即熔断。300 是运营口径（每个出口 IP 的节点延迟要在 300ms 内），"+
+			"拓扑换到海外 resin 之后才可行：可路由节点 56→4323，健康出口 IP 71→1888，p50 424ms→185ms")
 	require.Equal(t, 1, cfg.MaxConsecutiveFailures,
 		"一次失败即熔断。配合 resin 的单次请求内换节点重试，坏节点赔掉的那次 dial "+
 			"由代理层自己吸收，不冒泡成 502 让上游网关误判成账号问题")
+}
+
+// TestResinLatencyCeilingDoesNotClaimToEvictExistingLeases 钉住一条**认知边界**，
+// 而不是一个配置值。
+//
+// 上面那条把天花板钉在 300，很容易被读成「所以不会有超过 300ms 的节点挂着账号」。
+// 实测（2026-09-16）恰好相反：143 个 sticky 租约里 18 个的参考延迟在 300 之上，
+// p90=495ms，max=3042ms。原因是天花板只作用于**新选点**，而 resin 的 LeaseCleaner
+// 只按 TTL（168h）回收租约，不看节点是否已熔断或已超天花板。一个 640ms、已熔断的
+// 节点把某个账号钉了一周，那个账号的控制面探测要 97s；手工释放租约后 0.73s。
+//
+// 这条门守的是：部署真源的 rationale 里**必须**写着这个限制。把它删掉的人会让
+// 下一个人相信「配了天花板就够了」，然后在同一个坑里再花一天。
+func TestResinLatencyCeilingDoesNotClaimToEvictExistingLeases(t *testing.T) {
+	raw, err := os.ReadFile(resinRuntimeConfigPath)
+	require.NoError(t, err)
+	text := string(raw)
+
+	require.Contains(t, text, "只管新选点",
+		"部署真源必须写明延迟天花板不回收已有 sticky 租约 —— 少了这句，"+
+			"下一个人会以为配了天花板就不会有超标节点挂着账号")
+	require.Contains(t, text, "sticky",
+		"同上：这个限制的主语是 sticky 租约，真源里要留下这个词才检索得到")
+}
+
+// TestResinPlatformSourceOfTruthPinsTheSubscriptionWhitelist 钉住订阅源白名单。
+//
+// 这是本轮最有效的一刀，也是最容易被「顺手放宽」的一处：名单里少了哪个源，
+// 容量看起来完全够（收紧后仍有 ~2931 个可路由节点），失效是静默的 ——
+// 只有个别账号偶尔慢到 90 秒，而监控面板上一切正常。
+func TestResinPlatformSourceOfTruthPinsTheSubscriptionWhitelist(t *testing.T) {
+	raw, err := os.ReadFile(resinPlatformConfigPath)
+	require.NoError(t, err, "读不到平台级部署真源 %s", resinPlatformConfigPath)
+
+	var cfg struct {
+		Platforms []struct {
+			ID            string   `json:"id"`
+			Name          string   `json:"_name"`
+			RegexFilters  []string `json:"regex_filters"`
+			RegionFilters []string `json:"region_filters"`
+		} `json:"platforms"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &cfg), "%s 不是合法 JSON，apply 脚本会直接失败", resinPlatformConfigPath)
+
+	var paid *struct {
+		ID            string   `json:"id"`
+		Name          string   `json:"_name"`
+		RegexFilters  []string `json:"regex_filters"`
+		RegionFilters []string `json:"region_filters"`
+	}
+	for i := range cfg.Platforms {
+		if cfg.Platforms[i].Name == "Paid" {
+			paid = &cfg.Platforms[i]
+			break
+		}
+	}
+	require.NotNil(t, paid, "平台真源里必须有 Paid —— mirasim 的 143 个账号全走它")
+
+	require.Len(t, paid.RegexFilters, 1,
+		"订阅源白名单应该是一条 ANY 规则。拆成多条也能工作，但那会让「少了哪个源」更难看出来")
+	rule := paid.RegexFilters[0]
+
+	// 逐个点名，而不是断言整条字符串相等：后者会让「调整正则写法」和
+	// 「悄悄去掉一个源」这两件事都变成同一个红，作者只会照着期望值改。
+	for _, sub := range []string{"liangxin-paid", "radikal-fast", "au1rxx", "ldc兑换工艺"} {
+		require.Contains(t, rule, sub,
+			"订阅源白名单里缺了 %s。这是运营者按长期波动挑的四个源；"+
+				"少一个不会让容量不够（收紧后仍有 ~2931 个可路由节点），"+
+				"失效是静默的：个别账号偶尔慢到 90 秒，面板上一切正常", sub)
+	}
+
+	// 差分保护：规则必须锚在开头并以 / 收尾。
+	// 少了锚点，`au1rxx` 会匹配到任何 tag 里含这个串的节点；少了 `/`，
+	// 它会匹配到 `au1rxx-mirror` 这类同名前缀的其他源。
+	require.True(t, strings.HasPrefix(rule, "^("),
+		"订阅源规则必须锚在 ^ —— 否则它会匹配 tag 中间出现的源名，白名单形同虚设。当前：%q", rule)
+	require.True(t, strings.HasSuffix(rule, ")/"),
+		"订阅源规则必须以 )/ 收尾 —— tag 格式是 `<源名>/<节点名>`，"+
+			"少了斜杠会连 `au1rxx-mirror` 这种同前缀的别的源一起放进来。当前：%q", rule)
+
+	// 这条是本文件里唯一一条**跨文件**的不变量：它在别处已经被钉过一遍
+	// （mirasim_egress_region_test 等），这里再钉是因为收紧 regex_filters 时
+	// 最容易发生的事就是「重写整个 filters 块，顺手把 region 也一起重写了」。
+	require.Equal(t, []string{"!cn", "!hk"}, paid.RegionFilters,
+		"!cn/!hk 是**唯一**在阻止 CN/HK 出口被选中的机制。订阅源本身含 42 个 cn + 54 个 hk "+
+			"健康节点，所以「订阅源里没有 CN 节点」是错误认知，不能依赖它")
+}
+
+// TestResinPlatformSourceOfTruthRecordsTheLeaseMigrationGap 是上一条的配套。
+//
+// 改 regex_filters 最危险的地方不是改错，而是**改对了却以为生效了**：实测
+// 2026-09-16，收紧过滤器之后 196 个存量租约仍指向已被过滤掉的节点，一个都没迁移，
+// 而 routable_node_count 从 4193 漂亮地降到 2931 —— 面板显示得非常成功。
+func TestResinPlatformSourceOfTruthRecordsTheLeaseMigrationGap(t *testing.T) {
+	raw, err := os.ReadFile(resinPlatformConfigPath)
+	require.NoError(t, err)
+	text := string(raw)
+
+	// 判据是**语义关键词的组合**，不是某一句话的字面。
+	//
+	// 第一版钉的是短语 "不会自动迁移"，当场被自己的文案打红 —— 文案写的是
+	// 「不会让已有的 sticky 租约迁走」，意思一模一样。钉字面只会逼着作者照着
+	// 期望值改措辞，而那对读者毫无价值。改成要求这几个概念都在场：
+	// 存量租约 / 不迁移 / 按 TTL 回收 / 怎么手工释放。
+	for _, concept := range []struct{ word, why string }{
+		{"sticky", "限制的主语是 sticky 租约，这个词要在，否则检索不到"},
+		{"迁", "必须说明租约「不会迁走 / 不迁移」—— 这是整条限制的动词"},
+		{"168h", "必须写出 TTL 的实际值，读者才知道「不迁移」要持续多久（7 天）"},
+		{"leases", "必须给出手工释放的端点路径，否则读者知道了问题却不知道怎么办"},
+	} {
+		require.Contains(t, text, concept.word,
+			"平台真源缺少关键信息「%s」：%s。\n"+
+				"这份配置最危险的失效形态是**改对了却以为生效了** —— 收紧过滤器后 "+
+				"routable_node_count 会从 4193 漂亮地降到 2931，而 196 个存量租约一个都没迁移。",
+			concept.word, concept.why)
+	}
 }
 
 // TestResinRuntimeConfigDoesNotShipDetailLogging 是上面两条的相邻保护。

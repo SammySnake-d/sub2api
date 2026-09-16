@@ -36,8 +36,36 @@
       "那个账号的 prompt cache 前缀）。"
     ],
     "max_routable_latency_ms": [
-      "1000ms 天花板。超过即熔断，挂在上面的 sticky 账号自动迁到更快的节点；",
-      "该节点下一次探测回到阈值内会自动重新进池。"
+      "300ms 天花板。超过即熔断，挂在上面的 sticky 账号自动迁到更快的节点；",
+      "该节点下一次探测回到阈值内会自动重新进池。",
+      "",
+      "从 1000 收到 300 是运营口径（2026-09-16，用户要求「每个 IP 使用节点延迟在 300ms 内」）。",
+      "拓扑换到海外 resin 之后这个值才可行：可路由节点从 56 涨到 4323，健康出口 IP 从 71",
+      "涨到 1888，p50 从 424ms 降到 185ms —— 收紧天花板不再等于把容量掐死。",
+      "",
+      "**但它只管新选点，不回收已经建立的 sticky 租约**（实测 2026-09-16：143 个租约里",
+      "18 个的参考延迟在 300 之上还挂着账号，p90=495、max=3042）。一个已熔断、640ms 的",
+      "节点把某账号钉了整整一周，那个账号的控制面探测要 97s；手工释放租约让它重新选点后",
+      "同一个探测 0.73s 完成。这是 resin 侧 LeaseCleaner 只按 TTL 回收的缺陷，不是这个值",
+      "配错了 —— 单靠调这个数字修不了它。"
+    ],
+    "max_authority_latency_test_interval": [
+      "3h。线上就是这个值（2026-09-16 核对），真源此前写的 30m 是漂的，现已对齐。",
+      "**为什么是 3h、由谁改的，没有记录** —— 这一条属于「读不到」，不要当成经过论证的判决。",
+      "下一个动它的人需要先搞清：当前版本的主动探测究竟会不会打 authority 域名。",
+      "如果不会（这是 latency_authorities 那条里记的实测结论），那这个 interval 对",
+      "「到上游的真实延迟」就没有影响，authority 延迟完全由真实流量采样决定。"
+    ],
+    "min_routable_throughput_bps": [
+      "**未启用**（线上为 null）。吞吐熔断器的代码在 resin 侧已经建好（internal/node/throughput.go、",
+      "internal/proxy/throughput_conn.go），但这个键不在持久化配置里 → 取 0 → 整个判据关闭。",
+      "",
+      "它要解决的正是延迟天花板管不到的那一类：**建连快、传输极慢**的节点。延迟探测只打",
+      "gstatic 的 204（几百字节），既测不出带宽也不该拿来测，所以一个 TCP 握手 150ms 但",
+      "吞吐只有几 KB/s 的节点在延迟视图里完全健康。首字延迟尾部曾观测到 ~50s，就是这个形态。",
+      "",
+      "没有开启是因为**还没有实测依据来定阈值**：配高了会把正常但偏慢的节点熔断掉，把可用",
+      "容量变成故障。定这个数之前需要先采一批真实请求的吞吐分布。"
     ]
   },
 
@@ -49,10 +77,10 @@
   "reverse_proxy_log_resp_body_max_bytes": 1024,
 
   "max_consecutive_failures": 1,
-  "max_routable_latency_ms": 1000,
+  "max_routable_latency_ms": 300,
   "max_leases_per_ip": 3,
   "max_latency_test_interval": "10m0s",
-  "max_authority_latency_test_interval": "30m0s",
+  "max_authority_latency_test_interval": "3h0m0s",
   "max_egress_test_interval": "24h0m0s",
 
   "latency_test_url": "https://www.gstatic.com/generate_204",
