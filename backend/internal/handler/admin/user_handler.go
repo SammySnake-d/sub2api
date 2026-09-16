@@ -106,8 +106,8 @@ type UpdateUserRequest struct {
 // "必填"，omitempty 让 set_zero 的零值跳过 gt=0，其余动作（set/add/subtract）的契约
 // 与原来的 `required,gt=0` 完全一致——不能顺手删 gt=0，那会连带放开别的路径。
 type UpdateBalanceRequest struct {
-	Balance   float64 `json:"balance" binding:"required,gt=0"`
-	Operation string  `json:"operation" binding:"required,oneof=set add subtract"`
+	Balance   float64 `json:"balance" binding:"required_unless=Operation set_zero,omitempty,gt=0"`
+	Operation string  `json:"operation" binding:"required,oneof=set add subtract set_zero"`
 	Notes     string  `json:"notes"`
 }
 
