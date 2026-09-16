@@ -309,3 +309,53 @@ func TestNormalizeOrigins(t *testing.T) {
 		})
 	}
 }
+
+// TestCORSConfigWarnings locks the predicate for CORS startup warnings.
+// An empty allowed-origins list denies all cross-origin browser requests, which
+// is the correct posture for the default same-origin deployment (embedded
+// frontend) and is irrelevant to non-browser API clients, so it must not warn.
+func TestCORSConfigWarnings(t *testing.T) {
+	t.Run("empty origins is a safe default, not a warning", func(t *testing.T) {
+		assert.Empty(t, corsConfigWarnings(nil, false))
+		assert.Empty(t, corsConfigWarnings([]string{}, true))
+	})
+
+	t.Run("explicit same-origin list does not warn", func(t *testing.T) {
+		assert.Empty(t, corsConfigWarnings([]string{"https://panel.example.com"}, true))
+	})
+
+	// Differential negative: the genuinely risky CORS states must still warn.
+	t.Run("wildcard mixed with specific origins warns", func(t *testing.T) {
+		warnings := corsConfigWarnings([]string{"*", "https://panel.example.com"}, false)
+		assert.Len(t, warnings, 1)
+		assert.Contains(t, warnings[0], "wildcard will take precedence")
+	})
+
+	t.Run("wildcard with credentials warns", func(t *testing.T) {
+		warnings := corsConfigWarnings([]string{"*"}, true)
+		assert.Len(t, warnings, 1)
+		assert.Contains(t, warnings[0], "disabling allow_credentials")
+	})
+
+	t.Run("wildcard mixed with specific origins and credentials warns twice", func(t *testing.T) {
+		assert.Len(t, corsConfigWarnings([]string{"*", "https://panel.example.com"}, true), 2)
+	})
+}
+
+// TestCORSEmptyOriginsStillServesSameOrigin guards the behaviour the warning
+// used to imply was broken: with no allowed origins configured, a same-origin
+// request (no Origin header, as browsers send for same-origin navigation and
+// as every non-browser API client sends) is served normally.
+func TestCORSEmptyOriginsStillServesSameOrigin(t *testing.T) {
+	middleware := CORS(config.CORSConfig{})
+	r := gin.New()
+	r.Use(middleware)
+	r.GET("/t", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/t", nil))
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "ok", w.Body.String())
+	assert.Empty(t, w.Header().Get("Access-Control-Allow-Origin"))
+}

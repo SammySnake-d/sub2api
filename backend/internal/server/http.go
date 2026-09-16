@@ -5,7 +5,9 @@ import (
 	"context"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
@@ -50,6 +52,11 @@ func ProvideRouter(
 	r := gin.New()
 	r.Use(middleware2.Recovery())
 	configureTrustedProxies(r, cfg.Server)
+	// Emitted here rather than inside configureTrustedProxies because the live
+	// forwarded-IP trust value is only known after SettingService has loaded it
+	// from the database (service.ProvideSettingService ->
+	// LoadForwardedClientIPSettings), which happens before the router is built.
+	warnClientIPTrust(cfg)
 
 	// Wire up websearch Manager builder so it initializes on startup and rebuilds on config save.
 	settingService.SetWebSearchManagerBuilder(context.Background(), func(cfg *service.WebSearchEmulationConfig, proxyURLs map[int64]string) {
@@ -96,16 +103,76 @@ func configureTrustedProxies(r *gin.Engine, cfg config.ServerConfig) {
 			log.Printf("Failed to set trusted proxies: %v", err)
 			_ = r.SetTrustedProxies(nil)
 		}
-		if len(cfg.TrustedProxies) == 0 && cfg.Mode == "release" {
-			log.Printf("Warning: server.trusted_proxies is explicitly empty; forwarded client IP trust is disabled")
-		}
 	} else {
 		if err := r.SetTrustedProxies(nil); err != nil {
 			log.Printf("Failed to disable trusted proxies: %v", err)
 		}
-		if cfg.Mode == "release" {
-			log.Printf("Warning: server.trusted_proxies is not configured; disabling the forwarded-IP compatibility switch will use direct peer addresses only")
+	}
+}
+
+// clientIPTrustWarnings returns the startup warnings for client-IP trust
+// settings that make the resolved client IP forgeable.
+//
+// An absent or explicitly empty server.trusted_proxies is NOT such a state: it
+// makes Gin resolve the client IP from the direct peer address only, which is
+// exactly right for a listener that is reached directly with no reverse proxy
+// in front. The previous warning fired on that safe default and pushed
+// operators toward inventing a trusted-proxy value; a wrong non-empty value is
+// strictly worse than none, because every peer matching it may then dictate its
+// own client IP through X-Forwarded-For and walk past IP rate limiting, audit
+// attribution and API key IP allowlists.
+//
+// What does deserve a warning is the legacy compatibility switch: while
+// security.trust_forwarded_ip_for_api_key_acl is enabled, raw forwarding
+// headers take over client-IP resolution regardless of the trusted-proxy chain
+// (internal/pkg/ip/ip.go GetClientIP / GetSecurityClientIP), so any client that
+// can reach the listener can forge its client IP. That is reported for every
+// deployment shape, including one behind a real reverse proxy, because the
+// headers are trusted there without verifying they came from that proxy.
+func clientIPTrustWarnings(srv config.ServerConfig, forwardedTrustEnabled bool) []string {
+	if srv.Mode != "release" {
+		return nil
+	}
+	var warnings []string
+	if forwardedTrustEnabled {
+		warnings = append(warnings,
+			"security.trust_forwarded_ip_for_api_key_acl is enabled; raw X-Forwarded-For/X-Real-IP/CF-Connecting-IP headers override server.trusted_proxies when resolving the client IP for rate limiting, audit logs, session binding and API key IP allowlists, so any client that can reach this listener can forge its client IP. Set security.trust_forwarded_ip_for_api_key_acl=false unless a trusted reverse proxy is the only path to this port.")
+	}
+	if catchAll := catchAllTrustedProxies(srv.TrustedProxies); len(catchAll) > 0 {
+		warnings = append(warnings,
+			"server.trusted_proxies contains catch-all range(s) "+strings.Join(catchAll, ", ")+"; every peer is treated as a trusted proxy, so forwarded client IPs can be forged.")
+	}
+	return warnings
+}
+
+// catchAllTrustedProxies returns the configured entries that match every
+// address (a zero-length prefix such as 0.0.0.0/0 or ::/0).
+func catchAllTrustedProxies(proxies []string) []string {
+	var catchAll []string
+	for _, entry := range proxies {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed == "" {
+			continue
 		}
+		if trimmed == "*" {
+			catchAll = append(catchAll, trimmed)
+			continue
+		}
+		if _, network, err := net.ParseCIDR(trimmed); err == nil {
+			if ones, _ := network.Mask.Size(); ones == 0 {
+				catchAll = append(catchAll, trimmed)
+			}
+		}
+	}
+	return catchAll
+}
+
+func warnClientIPTrust(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	for _, warning := range clientIPTrustWarnings(cfg.Server, cfg.ForwardedClientIPTrustEnabled()) {
+		log.Printf("Warning: %s", warning)
 	}
 }
 

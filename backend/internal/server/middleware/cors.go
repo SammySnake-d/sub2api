@@ -12,9 +12,39 @@ import (
 
 var corsWarningOnce sync.Once
 
+// corsConfigWarnings returns warnings for CORS settings that are genuinely
+// unsafe or self-contradictory.
+//
+// An empty allowed-origins list is deliberately NOT one of them. Empty means
+// "reject every cross-origin browser request", which is the correct and secure
+// posture for the default single-binary deployment: the frontend is embedded in
+// and served by this same binary (internal/web/embed_on.go), so panel traffic is
+// same-origin and never subject to a CORS check. Non-browser API clients (CLI
+// agents, curl, server-side SDKs) do not enforce CORS at all, so they are
+// unaffected too. Warning about it trained operators to "fix" a safe default by
+// widening it, which is the only way to actually create a CORS risk here.
+func corsConfigWarnings(allowedOrigins []string, allowCredentials bool) []string {
+	allowAll := false
+	for _, origin := range allowedOrigins {
+		if origin == "*" {
+			allowAll = true
+			break
+		}
+	}
+	var warnings []string
+	if allowAll && len(allowedOrigins) > 1 {
+		warnings = append(warnings, "CORS allowed_origins includes '*'; wildcard will take precedence over explicit origins.")
+	}
+	if allowAll && allowCredentials {
+		warnings = append(warnings, "CORS allowed_origins set to '*', disabling allow_credentials.")
+	}
+	return warnings
+}
+
 // CORS 跨域中间件
 func CORS(cfg config.CORSConfig) gin.HandlerFunc {
 	allowedOrigins := normalizeOrigins(cfg.AllowedOrigins)
+	warnings := corsConfigWarnings(allowedOrigins, cfg.AllowCredentials)
 	allowAll := false
 	for _, origin := range allowedOrigins {
 		if origin == "*" {
@@ -29,14 +59,8 @@ func CORS(cfg config.CORSConfig) gin.HandlerFunc {
 	allowCredentials := cfg.AllowCredentials
 
 	corsWarningOnce.Do(func() {
-		if len(allowedOrigins) == 0 {
-			log.Println("Warning: CORS allowed_origins not configured; cross-origin requests will be rejected.")
-		}
-		if wildcardWithSpecific {
-			log.Println("Warning: CORS allowed_origins includes '*'; wildcard will take precedence over explicit origins.")
-		}
-		if allowAll && allowCredentials {
-			log.Println("Warning: CORS allowed_origins set to '*', disabling allow_credentials.")
+		for _, warning := range warnings {
+			log.Println("Warning: " + warning)
 		}
 	})
 	if allowAll && allowCredentials {

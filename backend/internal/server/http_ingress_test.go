@@ -174,3 +174,70 @@ func serveIngressTestServer(t *testing.T, srv *http.Server) (string, func()) {
 		_ = srv.Shutdown(ctx)
 	}
 }
+
+// TestClientIPTrustWarnings locks the predicate for the client-IP trust
+// startup warnings: the warning must track "the resolved client IP is
+// forgeable", not "trusted_proxies is unset".
+func TestClientIPTrustWarnings(t *testing.T) {
+	const release = "release"
+
+	t.Run("silent when no proxy is in front and forwarded trust is off", func(t *testing.T) {
+		// Direct-peer deployment: nothing in front of the listener, so Gin
+		// resolves the client IP from the peer address. This is correct and
+		// must not be reported as a missing configuration.
+		require.Empty(t, clientIPTrustWarnings(
+			config.ServerConfig{Mode: release}, false))
+		// Explicitly empty is the same safe state.
+		require.Empty(t, clientIPTrustWarnings(
+			config.ServerConfig{Mode: release, TrustedProxies: []string{}, TrustedProxiesConfigured: true}, false))
+	})
+
+	t.Run("warns when forwarded trust makes the client IP forgeable", func(t *testing.T) {
+		warnings := clientIPTrustWarnings(config.ServerConfig{Mode: release}, true)
+		require.Len(t, warnings, 1)
+		require.Contains(t, warnings[0], "trust_forwarded_ip_for_api_key_acl")
+		require.Contains(t, warnings[0], "forge")
+	})
+
+	// Differential negative: a deployment that really is behind a reverse proxy
+	// must still be warned while raw forwarding headers can override the
+	// trusted-proxy chain.
+	t.Run("still warns behind a configured reverse proxy", func(t *testing.T) {
+		warnings := clientIPTrustWarnings(config.ServerConfig{
+			Mode:                     release,
+			TrustedProxies:           []string{"10.0.0.7/32"},
+			TrustedProxiesConfigured: true,
+		}, true)
+		require.Len(t, warnings, 1)
+		require.Contains(t, warnings[0], "trust_forwarded_ip_for_api_key_acl")
+	})
+
+	t.Run("silent behind a reverse proxy once forwarded trust is off", func(t *testing.T) {
+		require.Empty(t, clientIPTrustWarnings(config.ServerConfig{
+			Mode:                     release,
+			TrustedProxies:           []string{"10.0.0.7/32"},
+			TrustedProxiesConfigured: true,
+		}, false))
+	})
+
+	t.Run("warns on catch-all trusted proxy ranges", func(t *testing.T) {
+		for _, entry := range []string{"0.0.0.0/0", "::/0", "*"} {
+			warnings := clientIPTrustWarnings(config.ServerConfig{
+				Mode:                     release,
+				TrustedProxies:           []string{entry},
+				TrustedProxiesConfigured: true,
+			}, false)
+			require.Len(t, warnings, 1, entry)
+			require.Contains(t, warnings[0], "catch-all", entry)
+			require.Contains(t, warnings[0], entry)
+		}
+	})
+
+	t.Run("specific proxy ranges are not catch-all", func(t *testing.T) {
+		require.Empty(t, catchAllTrustedProxies([]string{"10.0.0.0/8", "127.0.0.1", "192.168.1.0/24", "not-a-cidr", ""}))
+	})
+
+	t.Run("debug mode stays quiet", func(t *testing.T) {
+		require.Empty(t, clientIPTrustWarnings(config.ServerConfig{Mode: "debug"}, true))
+	})
+}
