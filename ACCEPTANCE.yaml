@@ -13,6 +13,13 @@ project:
 
 toolchain:
   language: "go"
+  # 跑法:`cd backend && go test -tags unit ./internal/...`。
+  # 这不是可选项 —— 本义务集里 SC / QU / RG / QW 四组的判据住在带 `//go:build unit`
+  # 的文件里(mirasim_quota_test.go、mirasim_statuscode_test.go、
+  # mirasim_window_evidence_test.go、claude_code_detection_test.go)。
+  # 判决器按源码文本找 [[cov:]] 标签,找得到就算填实;而不带 -tags unit 的
+  # `go test ./...` 根本不编译这些文件。两者的差在机检上看不出来,
+  # 所以把命令写在这里:漏了 tag 的那次「全绿」,绿的是一个更小的集合。
   # 只收本次移植真正新增/触及的测试,不把 sub2api 既有的上千个测试卷进来
   test_glob:
     - "backend/internal/pkg/mirasim/**/*_test.go"
@@ -20,6 +27,13 @@ toolchain:
     - "backend/internal/repository/mirasim_*_test.go"
     - "backend/internal/service/mirasim_*_test.go"
     - "backend/internal/handler/admin/account_mirasim_*_test.go"
+    # 计划探测的测试落在 service/account_mirasim_plan_probe_test.go —— 前缀是 account_,
+    # 上面那条 mirasim_*_test.go 够不着它。不加这一行,已经下沉的三个 [[cov:PL:*]] 标签
+    # 会因为「扫描器看不见那个文件」而被判成空白领土 —— 那是仪器盲区,不是真实缺口。
+    - "backend/internal/service/account_mirasim_*_test.go"
+    # 「仅 CC」校验不是本次移植新写的,但 CC 那两条义务的判据就住在这里。
+    # 收进来是为了让 [[cov:CC:*]] 标签有地方下沉;收进来之后有没有标签,由判决器说了算。
+    - "backend/internal/service/claude_code_*_test.go"
   # SUT 收窄到 mirasim 路径实际被测的文件。
   # 不用 backend/internal/**/*.go 的原因不是为了放宽判据,而是相反:
   # 全量扫描会把 openai_first_output_timeout.go:322 的方法名 close 收进 SUT 符号集,
@@ -33,6 +47,77 @@ toolchain:
     - "backend/internal/service/gateway_anthropic_passthrough.go"
     - "backend/internal/service/model_rate_limit.go"
     - "backend/internal/handler/admin/account_mirasim_import.go"
+    # 下面三条是随 PL / CC 两组义务一起进来的被测源码。加进 SUT 的唯一目的是让
+    # 「断言里出现来自被测源码的真实符号」这条判据对它们的测试也成立 ——
+    # 逐一核过:这三份文件的顶层声明里没有任何 go 内建名(len/cap/close/new/…),
+    # 不会重演注释里 openai_first_output_timeout.go 那个 close 撞名的放宽。
+    - "backend/internal/service/account_mirasim_plan_probe.go"
+    - "backend/internal/handler/admin/account_mirasim_plan.go"
+    - "backend/internal/service/claude_code_validator.go"
+    # ── 下面这一批是「判红倒逼补齐」的结果，不是为了转绿而放宽 ──
+    # TG-3 要求断言里至少出现一个**来自被测源码**的符号（SutIndex，按 symbol_re 抽顶层
+    # func/type/var/const）。BL / CP / SC / QU 四组的测试断的都是这些文件里的东西
+    #（CalculateCost / GetModelPricing / StripEmptyTextBlocks / ParseMetadataUserID /
+    # IsSchedulableForModelWithContext / shouldFailoverUpstreamError / anthropicFableRateLimitKey），
+    # 而它们此前一个都不在 sut_glob 里 —— 于是符号集里找不到，15 条真实断言被判成
+    # 「没碰被测对象」。那是**仪器盲区**：被测对象确实被断言了，只是判决器看不见它。
+    #
+    # 加进来之前逐份跑过内建名反证（_c_sut_symbols 那条判据的同一口径：
+    # 用 symbol_re 抽顶层符号 ∩ Go 内建名集合）：
+    #   billing_service.go 77 符号 / pricing_service.go 51 / gateway_request.go 58 /
+    #   metadata_userid.go 8 / ratelimit_service.go 111 / account.go 213 /
+    #   gateway_upstream_response.go 37 / gateway_scheduling.go 69
+    # 八份全部**零**撞名，不会重演注释里 openai_first_output_timeout.go 那个 close 的放宽。
+    - "backend/internal/service/billing_service.go"
+    - "backend/internal/service/pricing_service.go"
+    - "backend/internal/service/gateway_request.go"
+    - "backend/internal/service/metadata_userid.go"
+    - "backend/internal/service/ratelimit_service.go"
+    - "backend/internal/service/account.go"
+    - "backend/internal/service/gateway_upstream_response.go"
+    - "backend/internal/service/gateway_scheduling.go"
+  # 追加非平凡断言模式。**不是**把判据改松，是补语言预设漏掉的 testify 动词。
+  #
+  # Go 预设的 nontrivial_re 只列了 Equal/NotEqual/EqualValues/JSONEq/Contains/
+  # ErrorIs/ErrorContains/InDelta 八个，且都不带 `f` 后缀。于是
+  #   require.InEpsilonf(t, 期望值, 实际值, eps, "...")
+  #   require.Greaterf(t, 写入费用, 输入费用, "...")
+  #   require.Less(t, 相似度, 阈值)
+  # 这些**确确实实在比值**的断言落进了「未分类」，整条测试被判成「没有非平凡断言」。
+  # 那是预设的覆盖缺口，不是这些测试不够硬。
+  #
+  # 加的全部是**对着一个期望值做比较**的动词。刻意不加的：
+  #   True / False / Nil / NotNil / Empty / NotEmpty / NoError
+  # 它们只断言一个谓词或存在性，没有期望值可比 —— 预设把它们判平凡是对的，
+  # 本项目里几条只有这类断言的测试应当去补断言，而不是在这里把它们抬上来。
+  # （抬上来一次，就等于把「跑通不崩」重新命名成「非平凡」。）
+  #
+  # 反证：RELAX_REGISTRY 给 assertion_extra 挂的是 preset_canary —— 判决时会拿 Go 预设
+  # 自带的一对标定样本重跑，非平凡样本仍判非平凡、平凡样本仍判平凡。下面这些模式
+  # 都要求括号里至少两个实参，`[".*"]` 那种整份放宽过不了这一关。
+  assertion_extra:
+    # 预设那八个动词的 `f` 后缀变体（testify 的格式化版，语义完全相同）
+    - "\\b(require|assert)\\.(Equal|NotEqual|EqualValues|JSONEq|Contains|ErrorIs|ErrorContains|InDelta)f\\s*\\(\\s*\\S+\\s*,\\s*\\S"
+    # 预设漏掉的比较类动词（含 f 变体）
+    - "\\b(require|assert)\\.(InEpsilon|Less|LessOrEqual|Greater|GreaterOrEqual|Len|NotContains|Subset|ElementsMatch)f?\\s*\\(\\s*\\S+\\s*,\\s*\\S"
+  # 平凡断言判据：预设的**超集**，多认一种形态，不减一种。
+  #
+  # 为什么必须在这里写：Go 预设自带的那对标定样本里，"平凡"那一条是
+  #     if err := compute(2); err != nil { t.Fatal(err) }
+  # 而预设的 trivial_re 只写了 `if err != nil {` 这一种形态，认不出带初始化语句的
+  # `if err := …; err != nil`。于是那条样本落进「未分类」而不是「平凡」，
+  # preset_canary 反证判 FAIL（nt=0 tv=0）。实测确认这与本项目加的 assertion_extra
+  # 无关：纯预设下同样是 nt=0 tv=0 —— 是预设自己的覆盖缺口，只是平时没有放宽字段
+  # 去触发那条反证，所以一直没被照出来。
+  #
+  # 补的这一条让判据**更严**而不是更松：它把一种本来逃进「未分类」的
+  # 「跑通不崩」形态明确判成平凡。方向与 assertion_extra 相反，两条一起构成
+  # 一次完整的双侧调整：该算比较的算比较，该算不崩的算不崩。
+  trivial_re:
+    - "\\bif\\s+err\\s*!=\\s*nil\\s*\\{\\s*t\\.(Fatal|Error)"
+    - "\\b(require|assert)\\.(NoError|NotNil|True|False)\\s*\\("
+    # 预设漏掉的：带初始化语句的 err 检查
+    - "\\bif\\s+\\w+\\s*:=[^;\\n]*;\\s*\\w+\\s*!=\\s*nil\\s*\\{\\s*t\\.(Fatal|Error)"
   mutation:
     tool: "manual-injection"
     report: "adequacy/injections.json"
@@ -174,6 +259,121 @@ structure_sources:
       - id: "no-price-fallback"
         expect: "每个已启用模型都有显式定价条目,不 fallback 到默认价"
 
+  # 部署与出口代理池。这一组的被测对象在机器外面(VPS + resin + 出口 IP 池),
+  # 单元测试照不到它 —— 所以它们全部挂在人判通道上,而不是假装有自动化覆盖。
+  - kind: "fault_matrix"
+    id: "DP"
+    rows:
+      - id: "egress-not-cn-hk"
+        expect: "出口 IP 不含中国大陆与香港"
+        external: "egress proxy pool"
+      - id: "egress-not-vps-itself"
+        expect: "出口 IP 不等于 VPS 自身公网 IP(124.221.206.59)—— 相等即说明代理没生效,请求在裸奔"
+        external: "egress proxy pool"
+      - id: "leases-per-ip-max-3"
+        expect: "同一出口 IP 上的账号数 ≤ 3"
+        external: "egress proxy pool"
+      - id: "sticky-per-account"
+        expect: "同一账号连续 10 次请求的出口 IP 不变"
+        external: "egress proxy pool"
+      - id: "latency-probe-target"
+        expect: "resin 的 latency_test_url 是轻量 204 探针(gstatic generate_204),上游域名只出现在 latency_authorities —— 不是把上游域名当测速靶"
+        external: "resin gateway"
+      - id: "latency-eviction"
+        expect: "延迟超阈值的节点被熔断,挂在它上面的 sticky 账号自动迁走;阈值恢复后该节点重新进池"
+        external: "resin gateway"
+      - id: "proxy-auth-header"
+        expect: "代理认证用 Proxy-Authorization 而非 Authorization(用错会拿到 407)"
+        external: "egress proxy pool"
+      - id: "no-domain-plain-http"
+        expect: "对外是 IP:6699 明文 HTTP(腾讯云未备案,上不了域名),这个事实被显式记录下来而不是留给下一个人去撞"
+        external: "deployment"
+
+  # 凭据与合规。sub2api 是开源白盒:仓库里的默认 secret 全世界都读得到,
+  # 「用了默认值」与「没有口令」在攻击者眼里是同一件事。
+  - kind: "fault_matrix"
+    id: "SEC"
+    rows:
+      - id: "no-default-secrets"
+        expect: "JWT、admin 口令、DB 口令、resin token 全部是部署时随机生成的值,没有一个等于仓库默认值"
+        external: "deployment"
+      - id: "secrets-not-in-repo"
+        expect: "任何 secret 都不出现在仓库、日志与测试输出里"
+        external: "deployment"
+      - id: "admin-compliance-ack"
+        expect: "管理员合规确认由运营者本人完成,自动化不得代签"
+        external: "operator"
+
+  # 导入策略。这一组判的不是「导入器写得对不对」(那是 MG),而是
+  # 「导入进来的是不是运营者真正愿意卖的那批号」—— 选择集本身。
+  - kind: "fault_matrix"
+    id: "IMP"
+    rows:
+      - id: "skip-disabled"
+        expect: "来源里标记为 disabled 的账号不导入"
+      - id: "skip-annual-reserved"
+        expect: "2027 年到期的一年期账号不导入(运营者自用)"
+      - id: "honor-explicit-keep"
+        expect: "运营者点名要导的账号,即使命中 skip-disabled / skip-annual-reserved 也要导入"
+      - id: "honor-explicit-skip"
+        expect: "运营者点名不导的账号一定不导入"
+      - id: "import-count-matches"
+        expect: "导入数 + 保留数 == 来源总数(账目守恒:没有账号在中间悄悄蒸发)"
+
+  # 端到端真实性。手拼的 curl body 与真客户端的形态不同(system 分段、
+  # cache_control 断点、metadata.user_id、stainless 头组),拿它验收等于验了个替身。
+  - kind: "fault_matrix"
+    id: "E2E"
+    rows:
+      - id: "real-client-not-curl"
+        expect: "验收用的是真实 Claude Code 客户端指向 sub2 的 URL 发起会话,不是 curl 手拼的 body"
+        external: "Claude Code client"
+      - id: "generated-key"
+        expect: "鉴权用后台生成的 key,不是管理员 token(管理员 token 走的是另一条路径,过了不代表客户过得了)"
+      - id: "real-content-and-usage"
+        expect: "返回真实 content,且 usage 的 input/output token 均非零"
+        external: "mirasim upstream"
+
+  # 客户端识别:放真 Claude Code 进来、把伪造者挡在外面。
+  - kind: "fault_matrix"
+    id: "CC"
+    rows:
+      - id: "real-client-passes"
+        expect: "真实 Claude Code 2.1.272 的请求通过「仅 CC」校验"
+      - id: "impostor-still-fails"
+        expect: "伪造者(UA 或 system prompt 对不上)仍被拒绝 —— 放真客户端进来不能顺手把门拆了"
+
+  # 配额窗口的证据等级:认识的 window token 要落到对的 scope,
+  # 不认识的必须留下可观测信号 —— 静默丢弃会让「没冷却」和「冷却没写成」长得一模一样。
+  - kind: "fault_matrix"
+    id: "QW"
+    rows:
+      - id: "known-window-tokens-map"
+        expect: "5h / 7d 落账号级标量,7d_claude / 7d_fable 各落自己的 scope"
+        external: "mirasim upstream"
+      - id: "unknown-window-is-observable"
+        expect: "上游给出不在四窗口内的 window token 时,留下可观测信号(日志/计数),不静默吞掉"
+        external: "mirasim upstream"
+
+  # 计划探测:账号自己声称的档位不是权威值,权威值要去 mirasim 那边问。
+  - kind: "fault_matrix"
+    id: "PL"
+    rows:
+      - id: "import-carries-plan"
+        expect: "导入后 extra 里有 plan 与 plan_expires_at,取值与来源一致"
+      - id: "probe-updates-plan"
+        expect: "探测拿到权威 current_plan 后正确更新账号档位"
+        external: "mirasim upstream"
+      - id: "claimed-vs-authoritative"
+        expect: "声称 max 而权威 plus 时,两个值都保留且冲突被标记,不静默覆盖成其中一个"
+        external: "mirasim upstream"
+      - id: "probe-uses-account-proxy"
+        expect: "探测请求走该账号自己的代理(否则探测本身就是一次裸奔,还会把出口 IP 和账号解绑)"
+        external: "egress proxy pool"
+      - id: "malformed-referral-is-safe"
+        expect: "响应结构不符时不写入、不污染已有值(保留上一次的好读数)"
+        external: "mirasim upstream"
+
 goals:
   - id: "G1"
     statement: "签名、请求头那些是匹配的"
@@ -208,6 +408,36 @@ goals:
   - id: "G7"
     statement: "更好的售卖方式是去卖 token"
     observable: "运维在对账时,能看到系统记账金额与按 usage 手算的金额一致,差额为零"
+    owner: "relay-operator"
+
+  - id: "G8"
+    statement: "部署出去之后出口要真的走代理,而且不能落回国内"
+    observable: "运维在抽查全部 143 个账号的出口 IP 时,能看到没有一个落在中国大陆或香港,也没有一个等于 VPS 自身公网 IP"
+    owner: "relay-operator"
+
+  - id: "G9"
+    statement: "sub2api 是开源白盒,用仓库默认的 secret 等于没有 secret"
+    observable: "运维在部署后逐项核对时,能看到 JWT / 管理员口令 / DB 口令 / resin token 四个值没有一个等于仓库里的默认值"
+    owner: "relay-operator"
+
+  - id: "G10"
+    statement: "卖出去的号必须是我愿意卖的那批,自用的号一个都不能混进去"
+    observable: "运维在导入结束时,能看到导入数与保留数之和等于来源总数,且被点名保留的账号一个都没有进库"
+    owner: "relay-operator"
+
+  - id: "G11"
+    statement: "验收要用真客户端跑通,不是 curl 手拼一个 body 就算数"
+    observable: "运维在用真实 Claude Code 指向 sub2 的 URL 发起会话时,能看到返回真实 content 且 usage 的 input 与 output token 都不为零"
+    owner: "relay-operator"
+
+  - id: "G12"
+    statement: "只放真 Claude Code 进来,伪造的要挡住"
+    observable: "运维在用真实 Claude Code 2.1.272 请求时能看到通过,在用伪造客户端请求时能看到被拒绝"
+    owner: "relay-operator"
+
+  - id: "G13"
+    statement: "每个号的真实档位要查得到,不能被它自己声称的值糊弄"
+    observable: "运维在探测结束后,能看到声称档位与权威档位不一致的账号被显式标记出来,而不是被静默覆盖成其中一个"
     owner: "relay-operator"
 
 criteria:
@@ -458,3 +688,241 @@ criteria:
     role: "regression"
     release_behavior: "block"
     risk: "high"
+
+  # ── G4 续:配额窗口的证据等级 ──
+  # 判据落在 mirasim_window_evidence_test.go:「认识的 token 写对 scope」与
+  # 「不认识的 token 必须吵」是两件事,后者才是真正花钱的那一件 ——
+  # 静默丢弃会让「上游没限流」和「限流了但我们没认出来」在运维视角下完全同形。
+  - id: "C21"
+    goal: "G4"
+    statement: "四个已知 window token 各自写到对应的 scope:5h/7d 落账号级标量,7d_claude/7d_fable 落各自 scope"
+    oracle: "exact"
+    quadrant: "Q2"
+    check: "backend/internal/service/mirasim_window_evidence_test.go"
+    negative: "某个 window token 被写到别的 scope,或本该落 scope 的家族窗口落到了账号级标量,即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["QW:known-window-tokens-map"]
+
+  - id: "C22"
+    goal: "G4"
+    statement: "未识别的 window token 留下可观测信号,不被静默丢弃"
+    oracle: "exact"
+    quadrant: "Q2"
+    check: "backend/internal/service/mirasim_window_evidence_test.go"
+    negative: "喂一个不在四窗口内的 window token,系统既不写冷却也不留任何日志/计数,即判不通过 —— 那会让「上游没限流」和「限流了但我们没认出来」在运维视角下完全同形"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["QW:unknown-window-is-observable"]
+
+  # ── G8 部署与出口代理池 ──
+  # 这一组的被测对象整个在进程外面(VPS、resin、出口 IP 池)。单元测试照不到,
+  # 就不给它挂自动化 check —— 宁可显示成空白领土,也不拿一条够不着的测试冒充覆盖。
+  - id: "C23"
+    goal: "G8"
+    statement: "出口 IP 既不落在中国大陆/香港,也不等于 VPS 自身公网 IP(后者即代理没生效)"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/egress-geo-and-proxy-effective.md"
+    negative: "任一账号的出口 IP 归属为 CN 或 HK,或等于 VPS 自身公网 IP,即判不通过(第二种更危险:它长得像「代理配好了」但请求在裸奔)"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["DP:egress-not-cn-hk", "DP:egress-not-vps-itself"]
+
+  - id: "C24"
+    goal: "G8"
+    statement: "同一出口 IP 上的账号数 ≤ 3,且同一账号连续 10 次请求的出口 IP 不变"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/egress-lease-and-sticky.md"
+    negative: "某个出口 IP 上挂了 4 个以上账号,或同一账号 10 次请求里出现两个不同出口 IP,任一即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["DP:leases-per-ip-max-3", "DP:sticky-per-account"]
+
+  - id: "C25"
+    goal: "G8"
+    statement: "延迟探针打的是轻量 204 靶标(上游域名只作为 latency_authorities),且超阈值节点熔断后 sticky 账号自动迁走、恢复后回归"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/latency-probe-and-eviction.md"
+    negative: "latency_test_url 指向上游域名(拿上游当测速靶),或节点熔断后 sticky 账号仍被钉在死节点上,任一即判不通过"
+    role: "capability"
+    release_behavior: "track"
+    risk: "medium"
+    covers: ["DP:latency-probe-target", "DP:latency-eviction"]
+
+  - id: "C26"
+    goal: "G8"
+    statement: "代理认证走 Proxy-Authorization,且「对外只有 IP:6699 明文 HTTP」这个事实被显式写下来"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/proxy-auth-and-exposure.md"
+    negative: "凭据被塞进 Authorization 头(症状是 407,容易被误读成密码错),或暴露面没有任何书面记录,任一即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["DP:proxy-auth-header", "DP:no-domain-plain-http"]
+
+  # ── G9 凭据与合规 ──
+  - id: "C27"
+    goal: "G9"
+    statement: "四类 secret 都是部署时随机生成,且不出现在仓库、日志与测试输出里"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/secrets-hygiene.md"
+    negative: "任一 secret 等于仓库默认值,或在仓库/日志/测试输出里能搜到明文,即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["SEC:no-default-secrets", "SEC:secrets-not-in-repo"]
+
+  - id: "C28"
+    goal: "G9"
+    statement: "管理员合规确认由运营者本人完成"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/admin-compliance-ack.md"
+    negative: "确认由自动化/代理代签,即判不通过(这一条的全部意义就是「必须是人」,自动化代签等于把它删掉)"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["SEC:admin-compliance-ack"]
+
+  # ── G10 导入策略 ──
+  - id: "C29"
+    goal: "G10"
+    statement: "导入选择集符合运营者规则:跳过 disabled、跳过 2027 年到期的一年期号,但点名要导的照导、点名不导的一定不导"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/import-selection-policy.md"
+    negative: "运营者点名保留的账号被导入,或点名要导的账号被规则挡掉,任一即判不通过(点名优先于规则,这是运营者的决定权)"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["IMP:skip-disabled", "IMP:skip-annual-reserved", "IMP:honor-explicit-keep", "IMP:honor-explicit-skip"]
+
+  - id: "C30"
+    goal: "G10"
+    statement: "账目守恒:导入数 + 保留数 == 来源总数"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/import-count-ledger.md"
+    negative: "两数之和不等于来源总数,即判不通过(差额本身就是证据:有账号既没导入也没被有意保留,它在中间蒸发了)"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["IMP:import-count-matches"]
+
+  # ── G11 端到端真实性 ──
+  - id: "C31"
+    goal: "G11"
+    statement: "端到端验收用真实 Claude Code 客户端 + 后台生成的 key,拿到真实 content 与非零 usage"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/e2e-real-client.md"
+    negative: "验收证据是 curl 手拼的 body,或鉴权用的是管理员 token,或 usage 全零,任一即判不通过(手拼 body 的形态与真客户端不同,过了不代表客户过得了)"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["E2E:real-client-not-curl", "E2E:generated-key", "E2E:real-content-and-usage"]
+
+  # ── G12 客户端识别 ──
+  - id: "C32"
+    goal: "G12"
+    statement: "真实 Claude Code 2.1.272 的请求通过「仅 CC」校验"
+    oracle: "exact"
+    quadrant: "Q2"
+    check: "backend/internal/service/claude_code_validator_test.go"
+    negative: "真实客户端的请求被判为非 Claude Code 而拒绝,即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["CC:real-client-passes"]
+
+  - id: "C33"
+    goal: "G12"
+    statement: "伪造者仍被拒绝 —— 放真客户端进来不能顺手把门拆了"
+    oracle: "exact"
+    quadrant: "Q4"
+    check: "backend/internal/service/claude_code_validator_test.go"
+    negative: "为了让真客户端过关而放宽校验,导致 UA 或 system prompt 对不上的伪造请求也能过,即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["CC:impostor-still-fails"]
+
+  # ── G13 计划探测 ──
+  - id: "C34"
+    goal: "G13"
+    statement: "导入后 extra 里带着 plan 与 plan_expires_at,取值与来源一致"
+    oracle: "exact"
+    quadrant: "Q2"
+    check: "backend/internal/handler/admin/account_mirasim_plan_import_test.go"
+    negative: "导入后 extra 里没有 plan / plan_expires_at,或取值与来源不同,即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "medium"
+    covers: ["PL:import-carries-plan"]
+
+  - id: "C35"
+    goal: "G13"
+    statement: "探测走该账号自己的代理,并在拿到权威 current_plan 后更新档位"
+    oracle: "exact"
+    quadrant: "Q2"
+    check: "backend/internal/service/account_mirasim_plan_probe_test.go"
+    negative: "探测走了默认出口而非账号代理(等于把出口 IP 和账号解绑,还顺手做了一次裸奔),即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["PL:probe-updates-plan", "PL:probe-uses-account-proxy"]
+
+  - id: "C36"
+    goal: "G13"
+    statement: "声称 max 而权威 plus 时,两个值都保留且冲突被标记"
+    oracle: "exact"
+    quadrant: "Q2"
+    check: "backend/internal/service/account_mirasim_plan_probe_test.go"
+    negative: "任一侧被静默覆盖成另一侧,即判不通过(覆盖掉声称值就再也看不出来源在虚标)"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["PL:claimed-vs-authoritative"]
+
+  - id: "C37"
+    goal: "G13"
+    statement: "运营者确认探测出的权威档位与 mirasim 侧看到的一致"
+    oracle: "human_only"
+    quadrant: "Q3"
+    check: "human"
+    record: "acceptance/records/plan-authority-signoff.md"
+    negative: "探测结果在代码里自洽、但与 mirasim 面板上的真实档位不符,即判不通过(机器只能验我们正确消费了 current_plan,验不了 current_plan 就是权威口径)"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+
+  - id: "C38"
+    goal: "G13"
+    statement: "响应结构不符时既不写入也不污染已有值:换了字段名的 200、根本不是 JSON 的 200,都保留上一次的好读数"
+    oracle: "exact"
+    quadrant: "Q2"
+    check: "backend/internal/service/mirasim_plan_evidence_test.go"
+    negative: "字段名对不上的 200 被当成一次成功读数写进去(它在每一层都不报错,只有空 CurrentPlan 能把它和真读数区分开),或已有档位被覆盖成空,任一即判不通过"
+    role: "regression"
+    release_behavior: "block"
+    risk: "high"
+    covers: ["PL:malformed-referral-is-safe"]
+
