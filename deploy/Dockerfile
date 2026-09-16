@@ -18,7 +18,19 @@ ARG GOSUMDB=sum.golang.google.cn
 FROM ${NODE_IMAGE} AS frontend-builder
 
 WORKDIR /app/frontend
-ENV NODE_OPTIONS=--max-old-space-size=1536
+# Vite 构建的堆上限。
+#
+# **1536 已经不够了**(2026-09-16 实测):810 个 .vue/.ts 源文件、11MB 源码,
+# `pnpm run build` 在 1536MB 下以 exit 134(SIGABRT,V8 堆溢出)挂掉 ——
+# 在 Apple Silicon 交叉构建时挂,在原生 amd64 的目标机上**同样**挂,
+# 所以这不是模拟层的问题,是前端规模长过了这个值。
+#
+# 做成 ARG 而不是写死:CI runner 与个人机的内存差别很大,而这个值配得比宿主机
+# 可用内存还高时,OOM killer 会直接杀进程 —— 那比 V8 自己抛堆溢出更难查
+# (没有 JS 堆栈,只有一个 137)。构建机内存紧张时用
+# `--build-arg NODE_HEAP_MB=2048` 往下调。
+ARG NODE_HEAP_MB=4096
+ENV NODE_OPTIONS=--max-old-space-size=${NODE_HEAP_MB}
 
 # Install pnpm. Keep this pinned to the lockfile-compatible major version so
 # Docker builds remain reproducible when pnpm changes config validation rules.

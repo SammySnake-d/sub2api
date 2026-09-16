@@ -38,7 +38,7 @@ SRC="$(find "$WORK" -maxdepth 1 -type d -name 'migrate-bundle-*' | head -1)"
 [ -r "$SRC/MANIFEST.txt" ] || { echo "包里没有 MANIFEST.txt,拒绝导入未经校验的数据" >&2; exit 1; }
 
 # shellcheck disable=SC1090
-eval "$(grep -E '^[a-z_]+=' "$SRC/MANIFEST.txt")"
+eval "$(grep -E '^[a-z0-9_]+=' "$SRC/MANIFEST.txt")"
 
 GOT_SHA=$(sha256sum "$SRC/postgres.sql.gz" | cut -d' ' -f1)
 [ "$GOT_SHA" = "$postgres_sha256" ] || {
@@ -124,13 +124,81 @@ AFTER=$(docker compose exec -T postgres psql -U "${POSTGRES_USER:-sub2api}" -d "
 echo "      改写后: $AFTER"
 
 # ---------------------------------------------------------------------------
-echo "[6/7] 恢复 resin 状态并改写 sub2api 配置 ..."
-# resin 数据目录整体灌进 volume。停掉再灌,避免它一边写 SQLite 一边被覆盖。
-docker compose stop resin >/dev/null
-docker run --rm -v "$(docker volume ls -q -f name=resin_state | head -1)":/dst \
-  -v "$SRC/resin-data":/src:ro alpine:3.21 \
-  sh -c 'cd /src && cp -a "$(ls -d */ | head -1)". /dst/ 2>/dev/null || cp -a /src/. /dst/'
-docker compose start resin >/dev/null
+echo "[6/7] 恢复 resin 配置并改写 sub2api 配置 ..."
+# resin 的配置走 API 灌回去，不是拷 SQLite —— 理由见 export.sh 第 3 步的注释：
+# 热拷贝拿不到一致快照，而且旧机测出来的节点延迟数据在新机是**有害**的
+# （新机位置不同，搬过去会让 P2C 按错误的数字选点）。
+# 节点与延迟让新环境自己重新探测；这里只灌人的决策。
+RESIN_TOKEN=$(grep -oE '^RESIN_ADMIN_TOKEN=.*' .env | cut -d= -f2-)
+resin_api() { docker compose exec -T resin wget -qO- --header="Authorization: Bearer $RESIN_TOKEN" "$@" 2>/dev/null; }
+
+for i in $(seq 1 45); do
+  docker compose exec -T resin wget -qO- http://127.0.0.1:2260/healthz >/dev/null 2>&1 && break
+  [ "$i" = 45 ] && { echo "resin 起不来" >&2; docker compose logs --tail=30 resin >&2; exit 1; }
+  sleep 2
+done
+
+# 订阅源必须**先于**平台恢复:平台的 regex_filters 匹配的是 `<订阅源名>/<节点名>`，
+# 源还没建时那条规则会匹配到零个节点，而 routable_node_count 会显示 0 —— 看起来像
+# 过滤器写错了，实际是顺序错了。
+#
+# 只 POST **可写**字段。id / created_at / node_count / healthy_node_count 这些是
+# 服务端派生的，带上去要么被拒，要么更糟：把一个旧的 healthy_node_count 写进新环境，
+# 让面板显示一个从未在这台机器上测到过的数字。
+if [ -s "$SRC/resin-config/subscriptions.json" ]; then
+  echo "      恢复订阅源 ..."
+  python3 - "$SRC/resin-config/subscriptions.json" > "$WORK/subs.ndjson" <<'PY'
+import json, sys
+WRITABLE = {"name", "url", "source_type", "enabled", "update_interval",
+            "ephemeral", "ephemeral_node_evict_delay", "incremental_alive_nodes", "content"}
+d = json.load(open(sys.argv[1]))
+items = d.get("items") if isinstance(d, dict) else d
+for s in (items or []):
+    print(json.dumps({k: v for k, v in s.items() if k in WRITABLE and v not in (None, "")}))
+PY
+  SUB_OK=0; SUB_SKIP=0; SUB_FAIL=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name=$(printf '%s' "$line" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("name",""))')
+    # 幂等:已存在同名源就跳过,不重复创建(重复创建会让同一批节点被计两次)
+    if docker compose exec -T resin wget -qO- --header="Authorization: Bearer $RESIN_TOKEN" \
+         http://127.0.0.1:2260/api/v1/subscriptions 2>/dev/null \
+       | grep -qF "\"name\":\"$name\""; then
+      SUB_SKIP=$((SUB_SKIP+1)); continue
+    fi
+    if printf '%s' "$line" | docker compose exec -T resin sh -c \
+        "wget -qO- --post-data=\"\$(cat)\" \
+         --header='Authorization: Bearer $RESIN_TOKEN' \
+         --header='content-type: application/json' \
+         http://127.0.0.1:2260/api/v1/subscriptions" >/dev/null 2>&1; then
+      SUB_OK=$((SUB_OK+1))
+    else
+      SUB_FAIL=$((SUB_FAIL+1)); echo "        失败: $name" >&2
+    fi
+  done < "$WORK/subs.ndjson"
+  echo "      订阅源: 新建 $SUB_OK / 已存在跳过 $SUB_SKIP / 失败 $SUB_FAIL"
+  [ "$SUB_FAIL" -eq 0 ] || echo "      警告: 有订阅源没恢复，出口容量会不足" >&2
+fi
+
+# 系统配置与平台配置直接 PATCH（它们是更新而非创建）
+if [ -s "$SRC/resin-config/system-config.json" ]; then
+  python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+# 只保留可写键，剔除只读/派生字段
+print(json.dumps({k:v for k,v in d.items() if not k.startswith("_")}))' \
+    "$SRC/resin-config/system-config.json" > /tmp/resin-sys.json
+  docker compose exec -T resin sh -c "wget -qO- --method=PATCH \
+    --header='Authorization: Bearer $RESIN_TOKEN' \
+    --header='content-type: application/json' \
+    --body-data=\"\$(cat)\" http://127.0.0.1:2260/api/v1/system/config" < /tmp/resin-sys.json >/dev/null 2>&1 \
+    && echo "      系统配置已灌入" || echo "      警告: 系统配置灌入失败，需手工用 deploy/apply-resin-runtime.sh" >&2
+  rm -f /tmp/resin-sys.json
+fi
+
+echo "      提醒: 平台配置(订阅源白名单 regex_filters / region_filters)请用"
+echo "            deploy/apply-resin-runtime.sh 应用并回读校验 —— 它是那份配置的真源，"
+echo "            比从旧环境导出的快照更可信。"
 
 # sub2api 的 config.yaml:把数据库/redis 指向容器网络里的服务名。
 python3 - "$SRC/config.yaml" "$HERE/config.rendered.yaml" <<'PY'
