@@ -76,22 +76,41 @@ type MirasimAccountImportRequest struct {
 	// the proxy record it names. Off by default: creating proxy rows is a side
 	// effect an operator should opt into.
 	CreateMissingProxy *bool `json:"create_missing_proxy"`
+	// Selection 是运营者的导入筛选规则。nil 表示不筛选:来源里有几条就导几条,
+	// 与筛选层加入之前逐字节相同的行为。用指针而不是值,正是为了让「没传」和
+	// 「传了一份全零策略」区分得开 —— 后者是一次明确的「我要筛,但这批不设
+	// 上界」,前者是老调用方,两者不该塌成同一个判断。
+	Selection *MirasimImportSelectionPolicy `json:"selection,omitempty"`
 }
 
 // MirasimAccountImportResult mirrors the codex importer's counters and adds
 // Verified: how many imported accounts passed the per-account signature check.
 // Verified MUST equal Created+Updated — anything else means an account was
 // written without its identity being proven.
+//
+// Total 始终是「来源总数」,不是「尝试导入数」。加入筛选层之后账目守恒式变成:
+//
+//	Selected + Reserved == Total
+//	Created + Updated + Skipped + Failed + Reserved == Total
+//
+// 两条都必须成立。差额不是四舍五入,而是有账号既没被导入也没被有意保留 ——
+// 它在中间蒸发了,而蒸发的账号没人会去找,因为没有任何一栏显示它少了。
 type MirasimAccountImportResult struct {
-	Total    int                           `json:"total"`
-	Created  int                           `json:"created"`
-	Updated  int                           `json:"updated"`
-	Skipped  int                           `json:"skipped"`
-	Failed   int                           `json:"failed"`
-	Verified int                           `json:"verified"`
-	Items    []MirasimAccountImportItem    `json:"items,omitempty"`
-	Warnings []MirasimAccountImportMessage `json:"warnings,omitempty"`
-	Errors   []MirasimAccountImportMessage `json:"errors,omitempty"`
+	Total int `json:"total"`
+	// Selected / Reserved 在没传 selection 时也如实填(Selected==Total、
+	// Reserved==0),不加 omitempty:让 "0" 在两种含义间摇摆,恰好会毁掉上面
+	// 那条守恒式的可读性。
+	Selected  int                           `json:"selected"`
+	Reserved  int                           `json:"reserved"`
+	Created   int                           `json:"created"`
+	Updated   int                           `json:"updated"`
+	Skipped   int                           `json:"skipped"`
+	Failed    int                           `json:"failed"`
+	Verified  int                           `json:"verified"`
+	Items     []MirasimAccountImportItem    `json:"items,omitempty"`
+	Decisions []mirasimImportDecision       `json:"decisions,omitempty"`
+	Warnings  []MirasimAccountImportMessage `json:"warnings,omitempty"`
+	Errors    []MirasimAccountImportMessage `json:"errors,omitempty"`
 }
 
 // MirasimAccountImportItem is the per-entry outcome. DeviceID is the public
@@ -175,6 +194,12 @@ func (h *AccountHandler) ImportMirasimAccounts(c *gin.Context) {
 		response.BadRequest(c, "load_factor must be <= 10000")
 		return
 	}
+	if req.Selection != nil {
+		if err := req.Selection.validate(); err != nil {
+			response.BadRequest(c, err.Error())
+			return
+		}
+	}
 
 	entries, err := parseMirasimImportEntries(req)
 	if err != nil {
@@ -195,8 +220,22 @@ func (h *AccountHandler) ImportMirasimAccounts(c *gin.Context) {
 // account whose device seed failed verification.
 func (h *AccountHandler) importMirasimAccounts(ctx context.Context, req MirasimAccountImportRequest, entries []mirasimImportEntry) (MirasimAccountImportResult, error) {
 	result := MirasimAccountImportResult{
-		Total: len(entries),
-		Items: make([]MirasimAccountImportItem, 0, len(entries)),
+		Total:    len(entries),
+		Selected: len(entries),
+		Items:    make([]MirasimAccountImportItem, 0, len(entries)),
+	}
+
+	// 筛选先于一切写操作,也先于读库:被保留的账号不该在日志、缓存或任何一次
+	// 查询里留下「差点被导入」的痕迹。
+	//
+	// req.Selection == nil 时整层不介入,entries 原样往下走 —— 这是老调用方的
+	// 行为保证,不是优化。
+	if req.Selection != nil {
+		selected, reserved, decisions := selectMirasimImportCandidates(entries, *req.Selection)
+		entries = selected
+		result.Selected = len(selected)
+		result.Reserved = len(reserved)
+		result.Decisions = decisions
 	}
 
 	existingAccounts, err := h.listAccountsFiltered(ctx, service.PlatformAnthropic, service.AccountTypeAPIKey, "", "", 0, "", "created_at", "desc")
@@ -385,6 +424,359 @@ func (r *MirasimAccountImportResult) recordFailure(index int, name, message stri
 		Message: message,
 	})
 	r.Errors = append(r.Errors, MirasimAccountImportMessage{Index: index, Name: name, Message: message})
+}
+
+// ─────────────────────────── 导入筛选层 ───────────────────────────
+//
+// 143 个 mirasim 账号最初是用一段一次性 shell 脚本从来源清单里筛出来的。规则
+// 只活在那段脚本里:它不在这个仓库,没有测试,也没人能在事后证明「再跑一次选
+// 中的还是同一批」。下面这一层就是把那段脚本固化成可测的纯函数 —— 筛选是运营
+// 决定,不是脚本的私人知识。
+//
+// 四条规则分两级,优先级不是风格问题而是权责问题:
+//
+//	ForceSkip > ForceKeep > SkipDisabled / SkipExpiringAfter
+//
+// 后两条是「默认值」:它们对来源数据做一般性判断。前两条是运营者对具体账号下
+// 的决定。让默认值压过决定,等于把运营者的决定权交还给一条启发式规则 —— 那条
+// 规则恰恰是因为会误判才需要被点名覆盖的。
+//
+// ForceSkip 又必须压过 ForceKeep:两份名单同时命中时,「别动这个号」是安全侧
+// 的意思。把冲突解释成「导入」会造成不可回退的后果(号被投入生产、被用掉);
+// 解释成「保留」最坏只是少导一个,运营者在 decisions 里一眼能看到并改名单。
+
+const (
+	// mirasimImportReasonDefault:没有任何规则命中,按默认导入。
+	mirasimImportReasonDefault = "default"
+	// mirasimImportReasonForceKeep:运营者点名要导。
+	mirasimImportReasonForceKeep = "force_keep"
+	// mirasimImportReasonForceSkip:运营者点名不导,压过其余一切。
+	mirasimImportReasonForceSkip = "force_skip"
+	// mirasimImportReasonDisabled:来源里标记为 disabled。
+	mirasimImportReasonDisabled = "source_disabled"
+	// mirasimImportReasonExpiryReserved:订阅到期晚于上界(运营者自用的一年期号)。
+	mirasimImportReasonExpiryReserved = "reserved_expiry"
+	// mirasimImportReasonExpiryUnreadable:来源确实带了订阅到期字段,但读不出时间。
+	mirasimImportReasonExpiryUnreadable = "reserved_expiry_unreadable"
+	// mirasimImportReasonPolicyUnreadable:策略自身的 cutoff 解析不了。
+	mirasimImportReasonPolicyUnreadable = "policy_cutoff_unreadable"
+)
+
+// MirasimImportSelectionPolicy 是运营者的导入筛选规则。
+type MirasimImportSelectionPolicy struct {
+	// SkipDisabled:来源里标记为 disabled 的账号不导入。
+	SkipDisabled bool `json:"skip_disabled"`
+	// SkipExpiringAfter 是订阅到期时间的上界(RFC3339)。到期晚于它的一律保留,
+	// 运营者自用的一年期号(2027 到期)靠这条挡住。
+	//
+	// 它读的是 plan_expires_at(订阅到期),不是 credentials.expires_at(access
+	// token 到期)。两者差着几个数量级:token 几小时后就死,永远早于任何合理的
+	// cutoff。拿 token 到期做判据,这条规则一个号都拦不住,而且是静默失效 ——
+	// 计数看起来很正常,只是运营者的自用号全被导进了生产池。
+	SkipExpiringAfter string `json:"skip_expiring_after,omitempty"`
+	// ForceKeep / ForceSkip 按邮箱或账号标识匹配(大小写不敏感)。
+	ForceKeep []string `json:"force_keep,omitempty"`
+	ForceSkip []string `json:"force_skip,omitempty"`
+}
+
+// validate 在 HTTP 边界上拦下写坏的策略。放在这里而不是纯函数里,是因为纯函数
+// 的签名不返回 error:一个解析不了的 cutoff 在纯函数里只能选择「静默失效」或
+// 「全部保留」,两者都不如当场 400 告诉运营者他打错了。
+func (p MirasimImportSelectionPolicy) validate() error {
+	if strings.TrimSpace(p.SkipExpiringAfter) == "" {
+		return nil
+	}
+	if _, err := time.Parse(time.RFC3339, strings.TrimSpace(p.SkipExpiringAfter)); err != nil {
+		return fmt.Errorf("selection.skip_expiring_after 必须是 RFC3339 时间（例如 2026-12-31T23:59:59Z）")
+	}
+	return nil
+}
+
+// mirasimImportDecision 记录一条来源记录的去向以及「因为哪条规则」。
+// 没有 Reason 的筛选结果等于没有筛选结果:运营者要复核的恰恰是「哪几个命中规则
+// 又被点名覆盖了」,只给两个计数无法复核。
+type mirasimImportDecision struct {
+	Index    int    `json:"index"`
+	Name     string `json:"name,omitempty"`
+	Selected bool   `json:"selected"`
+	Reason   string `json:"reason"`
+	Detail   string `json:"detail,omitempty"`
+}
+
+// mirasimImportEntryFacts 是筛选层需要、且只有筛选层需要的来源事实。
+type mirasimImportEntryFacts struct {
+	// Label 是给人看的标识,只从 name/label/email/account_name 取,不碰任何凭据。
+	Label string
+	// Identifiers 是这条记录可以被点名的全部写法。
+	Identifiers []string
+	Disabled    bool
+	// PlanExpiresAt 仅在 PlanExpiryKnown 时有意义。
+	PlanExpiresAt   time.Time
+	PlanExpiryState int
+}
+
+const (
+	// mirasimPlanExpiryAbsent:来源根本没提订阅到期。「没说」不是「说了读不懂」,
+	// 两者必须分开:大量来源记录本来就不带这个字段,把它们全按不可读保留,等于
+	// 这条规则从「挡住 2027 的号」变成「挡住绝大多数号」。
+	mirasimPlanExpiryAbsent = iota
+	mirasimPlanExpiryKnown
+	// mirasimPlanExpiryUnreadable:字段在,但解析不出时间。
+	mirasimPlanExpiryUnreadable
+)
+
+// mirasimImportSelector 是编译好的策略。把名单预先折叠成集合,是为了让每条
+// entry 的判定与 entry 的顺序、与名单长度都无关。
+type mirasimImportSelector struct {
+	skipDisabled bool
+	forceKeep    map[string]struct{}
+	forceSkip    map[string]struct{}
+	cutoff       time.Time
+	cutoffSet    bool
+	cutoffBroken bool
+}
+
+func newMirasimImportSelector(policy MirasimImportSelectionPolicy) mirasimImportSelector {
+	selector := mirasimImportSelector{
+		skipDisabled: policy.SkipDisabled,
+		forceKeep:    mirasimImportNameSet(policy.ForceKeep),
+		forceSkip:    mirasimImportNameSet(policy.ForceSkip),
+	}
+	raw := strings.TrimSpace(policy.SkipExpiringAfter)
+	if raw == "" {
+		return selector
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		// 防御性 fail-closed。validate() 让这条在 HTTP 路径上不可达,但纯函数还
+		// 有别的调用方;真走到这里就整批保留(点名的除外),因为「一个号都没导」
+		// 是运营者立刻会发现的现象,而「规则悄悄失效、自用号进了生产池」不是。
+		selector.cutoffBroken = true
+		return selector
+	}
+	selector.cutoff = parsed
+	selector.cutoffSet = true
+	return selector
+}
+
+// selectMirasimImportCandidates 是筛选层的全部入口:纯函数,不读时钟、不碰
+// 网络、不改 entries。
+//
+// 每条 entry 恰好落进 selected 或 reserved 之一 —— 这一点是结构保证的,不是靠
+// 自觉:classify 返回唯一一个 decision,循环里只有一处 append 到 selected /
+// reserved 的分支。想让一条 entry 蒸发,必须先把这个循环改成多出口。
+func selectMirasimImportCandidates(entries []mirasimImportEntry, policy MirasimImportSelectionPolicy) (selected, reserved []mirasimImportEntry, decisions []mirasimImportDecision) {
+	selector := newMirasimImportSelector(policy)
+	decisions = make([]mirasimImportDecision, 0, len(entries))
+	for _, entry := range entries {
+		facts := mirasimImportFactsOf(entry)
+		decision := selector.classify(facts)
+		decision.Index = entry.Index
+		decision.Name = facts.Label
+		decisions = append(decisions, decision)
+		if decision.Selected {
+			selected = append(selected, entry)
+		} else {
+			reserved = append(reserved, entry)
+		}
+	}
+	return selected, reserved, decisions
+}
+
+// classify 实现优先级 ForceSkip > ForceKeep > SkipDisabled/SkipExpiringAfter。
+// 顺序即语义:调换任意两个 if 都会改变运营者的决定权归属。
+func (s mirasimImportSelector) classify(facts mirasimImportEntryFacts) mirasimImportDecision {
+	if hit, matched := mirasimImportNamed(s.forceSkip, facts.Identifiers); hit {
+		return mirasimImportDecision{Selected: false, Reason: mirasimImportReasonForceSkip, Detail: matched}
+	}
+	if hit, matched := mirasimImportNamed(s.forceKeep, facts.Identifiers); hit {
+		return mirasimImportDecision{Selected: true, Reason: mirasimImportReasonForceKeep, Detail: matched}
+	}
+	if s.cutoffBroken {
+		return mirasimImportDecision{Selected: false, Reason: mirasimImportReasonPolicyUnreadable}
+	}
+	if s.skipDisabled && facts.Disabled {
+		return mirasimImportDecision{Selected: false, Reason: mirasimImportReasonDisabled}
+	}
+	if s.cutoffSet {
+		switch facts.PlanExpiryState {
+		case mirasimPlanExpiryKnown:
+			if facts.PlanExpiresAt.After(s.cutoff) {
+				return mirasimImportDecision{
+					Selected: false,
+					Reason:   mirasimImportReasonExpiryReserved,
+					Detail:   facts.PlanExpiresAt.UTC().Format(time.RFC3339),
+				}
+			}
+		case mirasimPlanExpiryUnreadable:
+			// 来源确实声明了一个订阅到期,只是这一份读不出来。读不出的声明不能
+			// 当成「没有声明」:它有可能正是那个 2027 的自用号。
+			return mirasimImportDecision{Selected: false, Reason: mirasimImportReasonExpiryUnreadable}
+		}
+	}
+	return mirasimImportDecision{Selected: true, Reason: mirasimImportReasonDefault}
+}
+
+// mirasimImportFactsOf 从原始来源记录里读出筛选所需的事实。它复用
+// mirasimImportEntryScopes,与 normalizeMirasimImportEntry 看的是同一批位置 ——
+// 否则会出现「筛选按顶层字段判、导入按 credentials 里的字段判」这种两套真相。
+func mirasimImportFactsOf(entry mirasimImportEntry) mirasimImportEntryFacts {
+	scopes := mirasimImportEntryScopes(entry.Value)
+	facts := mirasimImportEntryFacts{
+		Label:       mirasimLookupString(scopes, "name", "label", "email", "account_name"),
+		Identifiers: mirasimImportIdentifiers(scopes),
+		Disabled:    mirasimImportDisabled(scopes),
+	}
+	planKeys := []string{mirasim.ExtraPlanExpiresAt, "plan_expires_at", "planExpiresAt", "subscription_expires_at"}
+	if expires, found := mirasimLookupTime(scopes, planKeys...); found {
+		facts.PlanExpiresAt = expires
+		facts.PlanExpiryState = mirasimPlanExpiryKnown
+	} else if raw := mirasimLookupString(scopes, planKeys...); raw != "" {
+		facts.PlanExpiryState = mirasimPlanExpiryUnreadable
+	}
+	return facts
+}
+
+// mirasimImportIdentifiers 收集这条记录可以被点名的全部写法。
+//
+// 注意它与 mirasimLookupString 的区别:后者取第一个命中就停,那是「这条记录叫
+// 什么」;这里要的是「运营者可能用哪个串点它」—— 名单里写的是邮箱,而记录的
+// name 可能是别的东西,只取第一个会让点名静默失配。
+func mirasimImportIdentifiers(scopes []map[string]any) []string {
+	keys := []string{"email", "name", "label", "account_name", "account", "username", "id", "account_id", "uuid"}
+	seen := make(map[string]struct{})
+	var out []string
+	for _, scope := range scopes {
+		for _, key := range keys {
+			value, ok := scope[key]
+			if !ok || value == nil {
+				continue
+			}
+			text := mirasimImportIdentifierText(value)
+			if text == "" {
+				continue
+			}
+			folded := strings.ToLower(text)
+			if _, dup := seen[folded]; dup {
+				continue
+			}
+			seen[folded] = struct{}{}
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func mirasimImportIdentifierText(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case float64:
+		// 账号 id 走 JSON 后是 float64;整数形态的 id 必须还原成 "42" 而不是
+		// "42.000000",否则名单里写 42 永远配不上。
+		if typed == float64(int64(typed)) {
+			return strconv.FormatInt(int64(typed), 10)
+		}
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	case json.Number:
+		return strings.TrimSpace(typed.String())
+	default:
+		return ""
+	}
+}
+
+// mirasimImportDisabled 只认肯定式的禁用标记。
+//
+// 「读不出状态」绝不等于「被禁用」:把未知当禁用,运营者会在毫无提示的情况下
+// 少导一批号,而少导的号不会报错 —— 它只是不在那里。
+func mirasimImportDisabled(scopes []map[string]any) bool {
+	for _, scope := range scopes {
+		for _, key := range []string{"disabled", "is_disabled", "banned", "deleted"} {
+			if value, ok := scope[key]; ok && mirasimImportBool(value) == 1 {
+				return true
+			}
+		}
+		for _, key := range []string{"enabled", "active", "is_active"} {
+			if value, ok := scope[key]; ok && mirasimImportBool(value) == -1 {
+				return true
+			}
+		}
+		for _, key := range []string{"status", "state"} {
+			text, ok := scope[key].(string)
+			if !ok {
+				continue
+			}
+			switch strings.ToLower(strings.TrimSpace(text)) {
+			case "disabled", "inactive", "banned", "suspended":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// mirasimImportBool 返回 1(真)/ -1(假)/ 0(读不出来)。三态是必要的:把
+// 「读不出来」折叠成 false,`enabled` 字段写成一个陌生形态时就会被当成
+// enabled=false,从而静默禁用一个正常账号。
+func mirasimImportBool(value any) int {
+	switch typed := value.(type) {
+	case bool:
+		if typed {
+			return 1
+		}
+		return -1
+	case float64:
+		if typed != 0 {
+			return 1
+		}
+		return -1
+	case json.Number:
+		if parsed, err := typed.Int64(); err == nil {
+			if parsed != 0 {
+				return 1
+			}
+			return -1
+		}
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "true", "1", "yes", "y", "on":
+			return 1
+		case "false", "0", "no", "n", "off":
+			return -1
+		}
+	}
+	return 0
+}
+
+func mirasimImportNameSet(names []string) map[string]struct{} {
+	if len(names) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		trimmed := strings.ToLower(strings.TrimSpace(name))
+		if trimmed == "" {
+			// 空串会匹配上「没有任何标识」的记录,把一次手滑的空行变成一条静默
+			// 生效的全局规则。
+			continue
+		}
+		set[trimmed] = struct{}{}
+	}
+	return set
+}
+
+// mirasimImportNamed 返回是否命中,以及命中的是哪个标识 —— 运营者复核名单时需要
+// 知道是邮箱配上的还是 id 配上的。
+func mirasimImportNamed(set map[string]struct{}, identifiers []string) (bool, string) {
+	if len(set) == 0 {
+		return false, ""
+	}
+	for _, identifier := range identifiers {
+		if _, ok := set[strings.ToLower(strings.TrimSpace(identifier))]; ok {
+			return true, identifier
+		}
+	}
+	return false, ""
 }
 
 // verifyMirasimDeviceIdentity proves that THIS seed yields a usable, stable
@@ -712,23 +1104,35 @@ func flattenMirasimImportValue(value any) []any {
 	}
 }
 
-// normalizeMirasimImportEntry turns one source record into the account shape
-// sub2api stores. Every map it returns is newly allocated: the source record is
-// read, never written.
-func normalizeMirasimImportEntry(entry mirasimImportEntry, req MirasimAccountImportRequest) (*mirasimImportAccount, error) {
-	object, ok := entry.Value.(map[string]any)
+// mirasimImportEntryScopes lists the maps a lookup may read, outermost first.
+//
+// Sources differ on nesting: some export flat, some wrap secrets in
+// "credentials" and the session id in "extra". Nothing here is mutated, and the
+// SELECTION layer deliberately shares this helper with the normalizer — two
+// different scope lists would mean the filter judged an account on one set of
+// fields while the import wrote another.
+func mirasimImportEntryScopes(value any) []map[string]any {
+	object, ok := value.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("第 %d 条不是 JSON 对象；mirasim 账号至少需要 device seed 与 token", entry.Index)
+		return nil
 	}
-	// Sources differ on nesting: some export flat, some wrap secrets in
-	// "credentials" and the session id in "extra". Look in all three, outermost
-	// first, without mutating any of them.
 	scopes := []map[string]any{object}
 	for _, key := range []string{"credentials", "credential", "extra", "metadata"} {
 		if nested, nestedOK := object[key].(map[string]any); nestedOK {
 			scopes = append(scopes, nested)
 		}
 	}
+	return scopes
+}
+
+// normalizeMirasimImportEntry turns one source record into the account shape
+// sub2api stores. Every map it returns is newly allocated: the source record is
+// read, never written.
+func normalizeMirasimImportEntry(entry mirasimImportEntry, req MirasimAccountImportRequest) (*mirasimImportAccount, error) {
+	if _, ok := entry.Value.(map[string]any); !ok {
+		return nil, fmt.Errorf("第 %d 条不是 JSON 对象；mirasim 账号至少需要 device seed 与 token", entry.Index)
+	}
+	scopes := mirasimImportEntryScopes(entry.Value)
 
 	item := &mirasimImportAccount{
 		DeviceSeed:   mirasimLookupString(scopes, mirasim.CredDeviceSeed, "device_seed", "deviceSeed", "seed"),
