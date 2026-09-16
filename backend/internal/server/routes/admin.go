@@ -385,6 +385,11 @@ func registerAccountRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAu
 		accounts.POST("/:id/upstream-billing-probe", h.Admin.Account.ProbeUpstreamBilling)
 		accounts.PUT("/:id/mirasim-plan-probe", h.Admin.Account.SetMirasimPlanProbeEnabled)
 		accounts.POST("/:id/mirasim-plan-probe", h.Admin.Account.ProbeMirasimPlan)
+		// mirasim quota windows (5h / 7d / ...). POST rather than GET: it is the
+		// console's 「查询」 action, and it is the call that goes upstream once
+		// the quota probe is wired. Auth/limiting/audit come from the /admin
+		// group, same as the two lines above.
+		accounts.POST("/:id/mirasim-quota", h.Admin.Account.ProbeMirasimQuota)
 		accounts.GET("/:id/ollama-cloud-usage", h.Admin.Account.GetOllamaCloudUsage)
 		accounts.PUT("/:id/ollama-cloud-usage/session", h.Admin.Account.SaveOllamaCloudUsageSession)
 		accounts.DELETE("/:id/ollama-cloud-usage/session", h.Admin.Account.DeleteOllamaCloudUsageSession)

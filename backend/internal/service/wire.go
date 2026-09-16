@@ -270,6 +270,12 @@ func ProvideAccountTestService(
 	service.SetOpenAIGatewayService(openAIGatewayService)
 	service.SetSettingService(settingService)
 	service.SetPluginManager(pluginManager)
+	// 账号测试按账号挑健康检查型号时要比价，价卡查询面从网关已持有的同一个
+	// BillingService 单例取（agentIdentityWS 同款的包内直取装配）——本函数的形参表由
+	// 生成的 cmd/server/wire_gen.go 按位置调用，不能为此新增一个入参。
+	if openAIGatewayService != nil {
+		service.SetBillingService(openAIGatewayService.billingService)
+	}
 	return service
 }
 
@@ -634,6 +640,12 @@ func ProvideScheduledTestRunnerService(
 	rateLimitSvc *RateLimitService,
 	cfg *config.Config,
 ) *ScheduledTestRunnerService {
+	// 账号测试要把自己烧掉的上游额度记回账号，落账口就是转发主干用的
+	// RateLimitService.UpdateSessionWindow。这里是全图唯一同时持有 AccountTestService 和
+	// RateLimitService 的装配点（ProvideAccountTestService 的形参表由生成的
+	// cmd/server/wire_gen.go 按位置调用，不能加参），而本 provider 必被构造：
+	// wire_gen.go 的 provideCleanup 依赖 scheduledTestRunnerService。
+	accountTestSvc.SetRateLimitService(rateLimitSvc)
 	svc := NewScheduledTestRunnerService(planRepo, scheduledSvc, accountTestSvc, rateLimitSvc, cfg)
 	svc.Start()
 	return svc
@@ -880,6 +892,7 @@ var ProviderSet = wire.NewSet(
 	ProvideAccountTestService,
 	ProvideUpstreamBillingProbeService,
 	ProvideMirasimPlanProbeService,
+	ProvideMirasimQuotaProbeService,
 	ProvideOllamaCloudUsageService,
 	ProvideSettingService,
 	NewDataManagementService,
