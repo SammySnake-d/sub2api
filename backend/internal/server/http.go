@@ -111,32 +111,37 @@ func configureTrustedProxies(r *gin.Engine, cfg config.ServerConfig) {
 }
 
 // clientIPTrustWarnings returns the startup warnings for client-IP trust
-// settings that make the resolved client IP forgeable.
+// settings that make the resolved client IP wrong or forgeable.
 //
-// An absent or explicitly empty server.trusted_proxies is NOT such a state: it
-// makes Gin resolve the client IP from the direct peer address only, which is
-// exactly right for a listener that is reached directly with no reverse proxy
-// in front. The previous warning fired on that safe default and pushed
-// operators toward inventing a trusted-proxy value; a wrong non-empty value is
-// strictly worse than none, because every peer matching it may then dictate its
-// own client IP through X-Forwarded-For and walk past IP rate limiting, audit
-// attribution and API key IP allowlists.
+// An absent or explicitly empty server.trusted_proxies is NOT forgeable: Gin and
+// internal/pkg/ip both resolve the client IP from the direct peer address only,
+// which is exactly right for a listener reached with no reverse proxy in front.
+// A wrong non-empty value is strictly worse than none, because every peer
+// matching it may then dictate its own client IP through X-Forwarded-For and
+// walk past IP rate limiting, audit attribution and API key IP allowlists.
 //
-// What does deserve a warning is the legacy compatibility switch: while
-// security.trust_forwarded_ip_for_api_key_acl is enabled, raw forwarding
-// headers take over client-IP resolution regardless of the trusted-proxy chain
-// (internal/pkg/ip/ip.go GetClientIP / GetSecurityClientIP), so any client that
-// can reach the listener can forge its client IP. That is reported for every
-// deployment shape, including one behind a real reverse proxy, because the
-// headers are trusted there without verifying they came from that proxy.
+// 这里的判据在 2026-09-17 换过一次，旧文案现在是**错的**，不要照抄回来。
+// 旧实现把「读不读转发头」挂在 security.trust_forwarded_ip_for_api_key_acl 这个
+// peer 无关的全局布尔上，于是那条 WARN 说「开了它，任何能连上监听口的客户端都能
+// 伪造自己的 IP，请设成 false」。判据改成按直连 peer 判定之后：
+//   - 「任何客户端都能伪造」不再成立 —— 不可信 peer 的头没有任何出路；
+//   - 「请设成 false」成了**有害处方**：照做只会把可信代理送来的自定义 CDN 头
+//     也一并关掉，换不来任何安全提升。
+//
+// 现在真正值得出声的是相反那个状态：**前面有反代、却没配 server.trusted_proxies**。
+// 那时 PeerIsTrustedProxy 恒为假，每个请求都被记成反代的落点地址（例如 172.21.0.1），
+// 后果是 API Key 的 IP 白名单全员 403、限流桶全站塌进一个、会话绑定全绑到同一个 IP。
+// 它不可能被完全自动识别（我们无从得知前面有没有反代），所以在「开关开着但可信代理
+// 列表为空」这个明确自相矛盾的组合上提示：开关声明了要读代理送来的头，却没有任何
+// peer 被认定为代理。
 func clientIPTrustWarnings(srv config.ServerConfig, forwardedTrustEnabled bool) []string {
 	if srv.Mode != "release" {
 		return nil
 	}
 	var warnings []string
-	if forwardedTrustEnabled {
+	if forwardedTrustEnabled && len(srv.TrustedProxies) == 0 {
 		warnings = append(warnings,
-			"security.trust_forwarded_ip_for_api_key_acl is enabled; raw X-Forwarded-For/X-Real-IP/CF-Connecting-IP headers override server.trusted_proxies when resolving the client IP for rate limiting, audit logs, session binding and API key IP allowlists, so any client that can reach this listener can forge its client IP. Set security.trust_forwarded_ip_for_api_key_acl=false unless a trusted reverse proxy is the only path to this port.")
+			"security.trust_forwarded_ip_for_api_key_acl is enabled but server.trusted_proxies is empty, so no peer is treated as a proxy and forwarded client-IP headers are ignored. If a reverse proxy fronts this listener, every request is attributed to the proxy's own address, which breaks API key IP allowlists, per-IP rate limiting and session binding: set server.trusted_proxies to the proxy's address. If nothing fronts this listener, turn the switch off instead.")
 	}
 	if catchAll := catchAllTrustedProxies(srv.TrustedProxies); len(catchAll) > 0 {
 		warnings = append(warnings,

@@ -692,10 +692,17 @@ func TestSettingService_LoadForwardedClientIPSettingsMigration(t *testing.T) {
 			wantMigrationMarkerSet: true,
 		},
 		{
-			name:                   "legacy false without proxy config migrates to compatibility",
+			// 迁移绝不改写运维显式存下的 false。
+			//
+			// 旧行为是「没配 trusted_proxies 时把 false 回填成 true」，为的是兼容
+			// 老版本「新装持久化 false」那个默认。2026-09-17 删掉了：它要兼容的语义
+			// 已不存在（老语义下 enabled=true + 无 trusted_proxies = 读裸转发头，
+			// 正是被修掉的伪造面；新语义下这个组合什么都不读），回填只是往库里埋一个
+			// 与运维选择相反的值，等他们配上 trusted_proxies 那天再生效。
+			name:                   "legacy false without proxy config is preserved",
 			values:                 map[string]string{SettingKeyAPIKeyACLTrustForwardedIP: "false"},
-			wantEnabled:            true,
-			wantForwardedIPUpdate:  "true",
+			wantEnabled:            false,
+			wantForwardedIPUpdate:  "", // 不得回写这个 key
 			wantMigrationMarkerSet: true,
 		},
 		{
@@ -804,7 +811,10 @@ func TestSettingService_LoadForwardedClientIPSettingsWriteFailureUsesComputedMod
 		trustedProxiesSet bool
 		wantEnabled       bool
 	}{
-		{name: "compatibility migration remains effective", wantEnabled: true},
+		// 落库失败时，内存里生效的值必须仍然是运维存下来的那个 false ——
+		// 无论配没配 trusted_proxies。迁移不再有「回填成 true」这条分支，
+		// 所以两种拓扑下的期望是同一个。
+		{name: "stored false survives a write failure", wantEnabled: false},
 		{name: "explicit proxy policy remains secure", trustedProxiesSet: true, wantEnabled: false},
 	}
 

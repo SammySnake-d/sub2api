@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/spf13/viper"
 	"golang.org/x/net/http/httpguts"
 )
@@ -782,8 +783,10 @@ type SecurityConfig struct {
 	CSP             CSPConfig            `mapstructure:"csp"`
 	ProxyFallback   ProxyFallbackConfig  `mapstructure:"proxy_fallback"`
 	ProxyProbe      ProxyProbeConfig     `mapstructure:"proxy_probe"`
-	// TrustForwardedIPForAPIKeyACL enables legacy raw forwarded-header takeover.
-	// When disabled, server.trusted_proxies is authoritative for all client-IP consumers.
+	// TrustForwardedIPForAPIKeyACL 只控制是否读取 forwarded_client_ip_headers 列出的
+	// 自定义 CDN 头，且这些头只有在直连 peer 落在 server.trusted_proxies 里时才会被读。
+	// 它曾经是「无条件采信 CF-Connecting-IP / X-Real-IP / X-Forwarded-For」的总开关，
+	// 那条 peer 无关的路径已在 internal/pkg/ip 退役（2026-09-16 生产可伪造客户端 IP）。
 	TrustForwardedIPForAPIKeyACL  bool                                       `mapstructure:"trust_forwarded_ip_for_api_key_acl"`
 	ForwardedClientIPHeaders      []string                                   `mapstructure:"forwarded_client_ip_headers" json:"forwarded_client_ip_headers" yaml:"forwarded_client_ip_headers"`
 	forwardedClientIPSettingsLive *atomic.Pointer[ForwardedClientIPSettings] `mapstructure:"-" json:"-" yaml:"-"`
@@ -841,10 +844,37 @@ func (c *Config) TrustForwardedIPForAPIKeyACL() bool {
 	return c.ForwardedClientIPSettings().TrustForwardedIP
 }
 
-// ForwardedClientIPTrustEnabled reports whether the legacy forwarded-header
-// compatibility mode currently overrides server.trusted_proxies.
+// ForwardedClientIPTrustEnabled 报告是否开启了「读取自定义 CDN 客户端 IP 头」。
+//
+// 语义已收窄：开关不再能让任何客户端自报 IP。自 internal/pkg/ip 改为按 peer 判定后，
+// 只有直连 peer 落在 server.trusted_proxies 里时才会去读 security.forwarded_client_ip_headers
+// 列出的头；开关关闭则连这些头也不读。
 func (c *Config) ForwardedClientIPTrustEnabled() bool {
 	return c != nil && c.TrustForwardedIPForAPIKeyACL()
+}
+
+// ApplyTrustedProxyPolicy 把 server.trusted_proxies 的生效值推给 internal/pkg/ip，
+// 让「谁的转发头可以被读」与 gin 用同一份列表判定。
+//
+// 生效规则必须与 internal/server/http.go configureTrustedProxies 完全一致：
+// 未显式配置 → 谁都不信；解析失败 → 谁都不信（http.go 在 gin 报错时也退回 nil）。
+// 之所以要单独推一份而不是问 gin：gin v1.9.1 的 isTrustedProxy/trustedCIDRs 都是
+// 私有的，没有任何公开入口能在请求里问「这个 peer 可信吗」。
+func (c *Config) ApplyTrustedProxyPolicy() error {
+	if c == nil {
+		return nil
+	}
+	if !c.Server.TrustedProxiesConfigured {
+		return ip.SetTrustedProxies(nil)
+	}
+	if err := ip.SetTrustedProxies(c.Server.TrustedProxies); err != nil {
+		// 不阻断启动：ip.SetTrustedProxies 已经 fail-closed 成「谁都不信」，
+		// 与 gin 侧的降级一致，真实客户端 IP 退化成 peer 而不是变成可伪造。
+		slog.Warn("server.trusted_proxies is invalid; no proxy will be trusted for forwarded client IP headers",
+			"error", err, "trusted_proxies", c.Server.TrustedProxies)
+		return err
+	}
+	return nil
 }
 
 func (c *Config) SetForwardedClientIPSettings(enabled bool, headers []string) {
@@ -1944,6 +1974,8 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	}
 	cfg.Security.ForwardedClientIPHeaders = forwardedClientIPHeaders
 	cfg.SetForwardedClientIPSettings(cfg.Security.TrustForwardedIPForAPIKeyACL, forwardedClientIPHeaders)
+	// 可信代理列表一并推给 internal/pkg/ip：它决定「谁的转发头可以被读」。
+	_ = cfg.ApplyTrustedProxyPolicy()
 	cfg.Log.Level = strings.ToLower(strings.TrimSpace(cfg.Log.Level))
 	cfg.Log.Format = strings.ToLower(strings.TrimSpace(cfg.Log.Format))
 	cfg.Log.ServiceName = strings.TrimSpace(cfg.Log.ServiceName)
@@ -2726,6 +2758,9 @@ func (c *Config) Validate() error {
 	}
 	c.Security.ForwardedClientIPHeaders = forwardedClientIPHeaders
 	c.SetForwardedClientIPSettings(c.Security.TrustForwardedIPForAPIKeyACL, forwardedClientIPHeaders)
+	// 同 Load()：程序化构造 / 校验配置的路径也要刷新可信代理快照，否则 ip 包会保持
+	// fail-closed（谁都不信），自定义 CDN 头永远读不到。
+	_ = c.ApplyTrustedProxyPolicy()
 	proxyProbeURLs, err := normalizeProxyProbeURLs(c.Security.ProxyProbe.URLs)
 	if err != nil {
 		return fmt.Errorf("security.proxy_probe.urls: %w", err)

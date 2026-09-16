@@ -1,9 +1,38 @@
 // Package ip 提供客户端 IP 地址提取工具。
+//
+// 唯一的信任判据是「直连 peer 是否落在 server.trusted_proxies 里」。转发头
+// （X-Forwarded-For / X-Real-IP / CF-Connecting-IP / 自定义 CDN 头）一律不再被
+// 无条件采信。
+//
+// 为什么这么写 —— 2026-09-16 生产事故：
+// 库里 api_key_acl_trust_forwarded_ip=true（updated_at 17:35:32，是那次整批
+// settings 导入带进来的；容器内 /app/data/config.yaml 写的是 false，但 DB 值优先
+// 且启动零提示），于是本文件的 legacy 分支接管解析，对*任何*能连上监听口的客户端
+// 直接采信它自报的头。生产只读探针（404）实测：
+//   - 直连 0.0.0.0:6699（公网裸奔，iptables DOCKER-USER 对 6699 一条规则都没有），
+//     带 X-Real-IP: 198.51.100.9 → 日志 client_ip=198.51.100.9（真实 peer 是
+//     203.10.99.42）。
+//   - 经 Caddy 带 CF-Connecting-IP: 198.51.100.21 → 日志 client_ip=198.51.100.21。
+//     Caddy 2.10.2 只重写 X-Forwarded-For，不碰 X-Real-IP / CF-Connecting-IP，而
+//     legacy 优先级恰好是 CF-Connecting-IP > X-Real-IP > XFF —— 所以「前面有反代」
+//     并不能挡住伪造。
+//
+// 影响面：限流(internal/middleware/rate_limiter.go:117)、审计与会话绑定
+// (internal/server/middleware/session_binding.go)、API Key IP 白名单
+// (internal/server/middleware/api_key_auth.go:135) 共用这一套解析，全部可被调用方
+// 自报 IP 绕过。
+//
+// 缺陷本体是「按一个全局布尔决定信不信转发头」：它与 peer 无关，要么信所有人的头，
+// 要么谁的头都不信。这里改成按 peer 判定 —— gin 的 trusted_proxies 链（从右往左
+// 走 XFF，遇到第一个非可信 IP 就停）是权威；自定义 CDN 头只有在 peer 本身可信时
+// 才读。
 package ip
 
 import (
+	"fmt"
 	"net"
 	"strings"
+	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
 )
@@ -27,12 +56,6 @@ func SetForwardedIPSettings(c *gin.Context, enabled bool, headers []string) {
 	})
 }
 
-// SetLegacyForwardedIPTrust records whether raw forwarding headers override
-// Gin's server.trusted_proxies chain for this request.
-func SetLegacyForwardedIPTrust(c *gin.Context, enabled bool) {
-	SetForwardedIPSettings(c, enabled, nil)
-}
-
 func requestForwardedIPSettings(c *gin.Context) (forwardedIPSettings, bool) {
 	if c == nil {
 		return forwardedIPSettings{}, false
@@ -45,44 +68,140 @@ func requestForwardedIPSettings(c *gin.Context) (forwardedIPSettings, bool) {
 	return settings, ok
 }
 
-func requestUsesLegacyForwardedIPTrust(c *gin.Context) bool {
-	settings, ok := requestForwardedIPSettings(c)
-	return !ok || settings.trustForwarded
+// trustedProxyMatcher 是 server.trusted_proxies 的编译结果。空实例 = 谁都不信。
+type trustedProxyMatcher struct {
+	cidrs []*net.IPNet
 }
 
-// GetClientIP resolves the client address using the legacy forwarding-header
-// precedence used before the trusted-proxy hardening. It remains the
-// compatibility path for request metadata and usage/error logs; security-
-// sensitive callers must use GetTrustedClientIP or GetSecurityClientIP.
+// trustedProxyPolicy 是进程级的可信代理快照，由 config 在加载/校验配置时推入
+// （config.Config.ApplyTrustedProxyPolicy）。未推入 = 谁都不信（fail-closed）：
+// 没有这一条，任何新挂在 SessionBindingContext 之前的中间件、或忘了走 config 的
+// 调用方，都会退回「无条件信头」的老毛病。
+var trustedProxyPolicy atomic.Pointer[trustedProxyMatcher]
+
+// SetTrustedProxies 记录本进程的可信代理列表，必须与交给 gin 的那一份同源
+// （internal/server/http.go configureTrustedProxies：未显式配置时传 nil，
+// SetTrustedProxies 失败时退回 nil）。
+//
+// 任何一条非法规则都会让整份列表作废（与 gin 一致：gin 的 SetTrustedProxies 返回
+// error 后，http.go 会 SetTrustedProxies(nil)），保证这里永远不会比 gin 更宽松。
+func SetTrustedProxies(patterns []string) error {
+	matcher, err := compileTrustedProxies(patterns)
+	if err != nil {
+		trustedProxyPolicy.Store(&trustedProxyMatcher{})
+		return err
+	}
+	trustedProxyPolicy.Store(matcher)
+	return nil
+}
+
+// compileTrustedProxies 复刻 gin v1.9.1 gin.go:390 prepareTrustedCIDRs 的接受面：
+// 裸 IP 按 /32（IPv4）或 /128（IPv6）处理，其余按 CIDR 解析。
+func compileTrustedProxies(patterns []string) (*trustedProxyMatcher, error) {
+	matcher := &trustedProxyMatcher{cidrs: make([]*net.IPNet, 0, len(patterns))}
+	for _, pattern := range patterns {
+		// 刻意**不** TrimSpace：gin v1.9.1 prepareTrustedCIDRs 也不 trim。
+		// 多 trim 一次会让本包比 gin 宽 —— " 10.0.0.0/8" 这种带空白的模式在 gin 侧
+		// 解析失败 → configureTrustedProxies 退回 SetTrustedProxies(nil) → gin 谁都不信，
+		// 而本包若照单全收就会认为该 peer 可信，两半对「谁是代理」的判定出现裂缝。
+		// 本包的不变量是「永远不比 gin 更宽松」，对齐接受面是它的前提。
+		trimmed := pattern
+		if !strings.Contains(trimmed, "/") {
+			parsed := net.ParseIP(trimmed)
+			if parsed == nil {
+				return nil, fmt.Errorf("invalid trusted proxy %q", pattern)
+			}
+			if parsed.To4() != nil {
+				trimmed += "/32"
+			} else {
+				trimmed += "/128"
+			}
+		}
+		_, cidr, err := net.ParseCIDR(trimmed)
+		if err != nil {
+			return nil, fmt.Errorf("invalid trusted proxy %q: %w", pattern, err)
+		}
+		matcher.cidrs = append(matcher.cidrs, cidr)
+	}
+	return matcher, nil
+}
+
+// IsTrustedProxyAddr 报告某个地址是否是已配置的可信代理。
+func IsTrustedProxyAddr(addr string) bool {
+	matcher := trustedProxyPolicy.Load()
+	if matcher == nil || len(matcher.cidrs) == 0 {
+		return false
+	}
+	parsed := net.ParseIP(normalizeIP(addr))
+	if parsed == nil {
+		return false
+	}
+	for _, cidr := range matcher.cidrs {
+		if cidr.Contains(parsed) {
+			return true
+		}
+	}
+	return false
+}
+
+// PeerIsTrustedProxy 报告本请求的直连 peer 是否可信。注意判据是 peer（RemoteAddr），
+// 不是任何请求头 —— 公网直连的包不经过 docker 的 MASQUERADE，源地址保留，永远不会
+// 等于反代落点（生产是 172.21.0.1）。
+func PeerIsTrustedProxy(c *gin.Context) bool {
+	if c == nil || c.Request == nil {
+		return false
+	}
+	return IsTrustedProxyAddr(c.RemoteIP())
+}
+
+// GetClientIP 解析请求的客户端地址，用于请求元数据与用量/错误日志。
+// 现在与 GetSecurityClientIP 同一套解析：以 gin 的可信代理链为权威。
 func GetClientIP(c *gin.Context) string {
+	return resolveClientIP(c)
+}
+
+// resolveClientIP 是本包唯一的解析实现。
+//
+// 顺序：
+//  1. peer 可信 + 本次请求快照开启转发信任 + 配置了自定义 CDN 头 → 读自定义头；
+//  2. 否则/或自定义头没给出公网地址 → gin 的可信代理链（peer 不可信时就是 peer 本身）；
+//  3. gin 只给出私网地址（典型：反代落点）时，才退到自定义头里的私网候选值。
+//
+// 第 3 步保留的是老实现里「公网优先于私网」那条经验：反代把自己的网桥地址写进头里
+// 是常见配置事故，不能因此把所有用户塌进同一个桶。
+func resolveClientIP(c *gin.Context) string {
 	if c == nil {
 		return ""
 	}
-	if !requestUsesLegacyForwardedIPTrust(c) {
-		return GetTrustedClientIP(c)
-	}
+	trusted := normalizeIP(c.ClientIP())
 
-	settings, _ := requestForwardedIPSettings(c)
-	customIP, customFallback := resolveCustomForwardedClientIP(c, settings.headers)
+	// PeerIsTrustedProxy 这道闸是缺陷本体的收口点，不能省：
+	// 老实现把「读不读转发头」挂在 security.trust_forwarded_ip_for_api_key_acl 这个
+	// peer 无关的全局布尔上 —— 开了就信所有人的头。2026-09-16 生产上它因迁移导入被
+	// 置成 true，于是公网直连 6699 的探针带 X-Real-IP: 198.51.100.9 就让日志写下
+	// client_ip=198.51.100.9。把自定义 CDN 头的消费搬到 peer 判定之后，这个开关退化
+	// 成「可信代理送来的头要不要读」，任何不可信 peer 的头都不再有出路。
+	//
+	// 若哪天把这个 if 拿掉：只要运营在 forwarded_client_ip_headers 里填上
+	// X-Real-IP / CF-Connecting-IP（生产当时是 []，但它是后台可改的），伪造面立刻整条
+	// 回来 —— 且这次连 gin 的可信链都绕过了。
+	var customIP, customFallback string
+	if PeerIsTrustedProxy(c) {
+		if settings, ok := requestForwardedIPSettings(c); ok && settings.trustForwarded &&
+			len(settings.headers) > 0 {
+			customIP, customFallback = resolveCustomForwardedClientIP(c, settings.headers)
+		}
+	}
 	if customIP != "" {
 		return customIP
 	}
-
-	// Preserve the historical precedence used by existing reverse-proxy
-	// deployments, while skipping an internal proxy address when a public XFF
-	// value is available. This covers Docker/Nginx setups that accidentally
-	// write the bridge address into X-Real-IP.
-	legacyIP, legacyFallback := resolveLegacyForwardedHeaderIP(c)
-	if legacyIP != "" {
-		return legacyIP
+	if trusted != "" && !isPrivateIP(trusted) {
+		return trusted
 	}
 	if customFallback != "" {
 		return customFallback
 	}
-	if legacyFallback != "" {
-		return legacyFallback
-	}
-	return normalizeIP(c.ClientIP())
+	return trusted
 }
 
 func resolveCustomForwardedClientIP(c *gin.Context, headers []string) (string, string) {
@@ -111,45 +230,8 @@ func resolveCustomForwardedClientIP(c *gin.Context, headers []string) (string, s
 	return "", fallback
 }
 
-func resolveLegacyForwardedHeaderIP(c *gin.Context) (string, string) {
-	var fallback string
-	if forwarded := normalizeValidIP(c.GetHeader("CF-Connecting-IP")); forwarded != "" {
-		fallback = forwarded
-		if !isPrivateIP(forwarded) {
-			return forwarded, fallback
-		}
-	}
-	if realIP := normalizeValidIP(c.GetHeader("X-Real-IP")); realIP != "" {
-		if fallback == "" {
-			fallback = realIP
-		}
-		if !isPrivateIP(realIP) {
-			return realIP, fallback
-		}
-	}
-	if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
-		ips := strings.Split(xff, ",")
-		for _, candidate := range ips {
-			candidate = normalizeValidIP(candidate)
-			if candidate != "" && !isPrivateIP(candidate) {
-				return candidate, fallback
-			}
-		}
-		if fallback == "" {
-			for _, candidate := range ips {
-				if candidate = normalizeValidIP(candidate); candidate != "" {
-					fallback = candidate
-					break
-				}
-			}
-		}
-	}
-	return "", fallback
-}
-
 // GetTrustedClientIP 从 Gin 的可信代理解析链提取客户端 IP。
-// 该方法依赖 gin.Engine.SetTrustedProxies 配置，不会优先直接信任原始转发头值。
-// 适用于 ACL / 风控等安全敏感场景。
+// 该方法依赖 gin.Engine.SetTrustedProxies 配置，不读任何原始转发头。
 func GetTrustedClientIP(c *gin.Context) string {
 	if c == nil {
 		return ""
@@ -157,18 +239,16 @@ func GetTrustedClientIP(c *gin.Context) string {
 	return normalizeIP(c.ClientIP())
 }
 
-// GetSecurityClientIP returns the address used by security-sensitive paths.
-// When legacy forwarded-IP trust is enabled, raw forwarding headers take over
-// client-IP resolution. When disabled, Gin's server.trusted_proxies chain is
-// authoritative.
-func GetSecurityClientIP(c *gin.Context, trustForwarded bool) string {
-	if requestSettings, ok := requestForwardedIPSettings(c); ok {
-		trustForwarded = requestSettings.trustForwarded
-	}
-	if trustForwarded {
-		return GetClientIP(c)
-	}
-	return GetTrustedClientIP(c)
+// GetSecurityClientIP 返回安全敏感路径（API Key IP 白名单、限流、审计、会话绑定）
+// 使用的客户端 IP。
+//
+// 第二个参数是老开关 security.trust_forwarded_ip_for_api_key_acl 的取值，现在不再
+// 参与判定：开关是 peer 无关的，正是 2026-09-16 那条「任何客户端都能自报 IP」的
+// 缺陷本体。信任只由 peer 决定（见 resolveClientIP）。参数保留是因为调用点
+// （api_key_auth.go:135、api_key_auth_google.go:94、rate_limiter.go:117）不在本次
+// 改动范围内；清理调用点后应连同参数一起删除。
+func GetSecurityClientIP(c *gin.Context, _ bool) string {
+	return resolveClientIP(c)
 }
 
 // normalizeIP 规范化 IP 地址，去除端口号和空格。
@@ -179,16 +259,6 @@ func normalizeIP(ip string) string {
 		return host
 	}
 	return ip
-}
-
-// normalizeValidIP 规范化并验证代理头中的候选值，避免把 unknown、主机名等非法值传给安全服务。
-func normalizeValidIP(value string) string {
-	normalized := normalizeIP(value)
-	parsed := net.ParseIP(normalized)
-	if parsed == nil {
-		return ""
-	}
-	return parsed.String()
 }
 
 // privateNets contains the private/loopback ranges skipped while selecting a

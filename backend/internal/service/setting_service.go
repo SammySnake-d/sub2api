@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -304,6 +306,27 @@ func (s *SettingService) SetProxyRepository(repo ProxyRepository) {
 	s.proxyRepo = repo
 }
 
+// warnForwardedClientIPConfigDivergence 在 DB 值覆盖配置文件值时打一条 WARN。
+//
+// 为什么需要它：2026-09-16 生产上迁移时把旧环境的 settings 整批导入了新库，
+// api_key_acl_trust_forwarded_ip 被写成 true（settings.updated_at 17:35:32，与
+// forwarded_client_ip_headers 同一时间戳），而容器内 /app/data/config.yaml 写的是
+// security.trust_forwarded_ip_for_api_key_acl: false。DB 值优先（见下面的
+// storedValue 覆盖），启动日志里没有任何提示 —— 于是「文件说 false、线上跑 true」
+// 这条分叉活了很久，直到有人拿探针打出伪造的 client_ip 才被发现。
+// 这条 WARN 就是让那次导入当场可见。
+func warnForwardedClientIPConfigDivergence(settingKey, configKey, configValue, dbValue string) {
+	if configValue == dbValue {
+		return
+	}
+	slog.Warn("forwarded client IP setting: config file and database disagree, database wins",
+		"setting_key", settingKey,
+		"config_key", configKey,
+		"config_says", configValue,
+		"db_says", dbValue,
+	)
+}
+
 func (s *SettingService) LoadForwardedClientIPSettings(ctx context.Context) error {
 	if s == nil || s.cfg == nil || s.settingRepo == nil {
 		return nil
@@ -319,11 +342,19 @@ func (s *SettingService) LoadForwardedClientIPSettings(ctx context.Context) erro
 		return fmt.Errorf("get forwarded client ip settings: %w", err)
 	}
 
-	enabled := s.cfg.Security.TrustForwardedIPForAPIKeyACL
-	headers := s.cfg.ForwardedClientIPSettings().Headers
+	configEnabled := s.cfg.Security.TrustForwardedIPForAPIKeyACL
+	configHeaders := s.cfg.ForwardedClientIPSettings().Headers
+	enabled := configEnabled
+	headers := configHeaders
 	storedValue, hasStoredValue := values[SettingKeyAPIKeyACLTrustForwardedIP]
 	if hasStoredValue {
 		enabled = storedValue == "true"
+		warnForwardedClientIPConfigDivergence(
+			SettingKeyAPIKeyACLTrustForwardedIP,
+			"security.trust_forwarded_ip_for_api_key_acl",
+			strconv.FormatBool(configEnabled),
+			strconv.FormatBool(enabled),
+		)
 	}
 
 	var headersErr error
@@ -333,6 +364,13 @@ func (s *SettingService) LoadForwardedClientIPSettings(ctx context.Context) erro
 			enabled = false
 			headers = []string{}
 			headersErr = fmt.Errorf("load forwarded client ip headers: %w", headersErr)
+		} else {
+			warnForwardedClientIPConfigDivergence(
+				SettingKeyForwardedClientIPHeaders,
+				"security.forwarded_client_ip_headers",
+				strings.Join(configHeaders, ","),
+				strings.Join(headers, ","),
+			)
 		}
 	}
 
@@ -348,12 +386,18 @@ func (s *SettingService) LoadForwardedClientIPSettings(ctx context.Context) erro
 	}
 	if values[settingKeyForwardedClientIPModeV2] != "true" {
 		updates[settingKeyForwardedClientIPModeV2] = "true"
-		// Before this migration, new installations persisted false by default.
-		// Restore compatibility only when no trusted-proxy policy was configured.
-		if headersErr == nil && hasStoredValue && !enabled && !s.cfg.Server.TrustedProxiesConfigured {
-			enabled = true
-			updates[SettingKeyAPIKeyACLTrustForwardedIP] = "true"
-		}
+		// 这里原本还有一段「兼容回填」：运维显式存了 false、且没配 trusted_proxies 时，
+		// 把它改写成 true 并落库，理由是老版本新装默认持久化 false。
+		//
+		// 2026-09-17 删掉了，因为它要兼容的那个语义已经不存在。老语义下
+		// 「enabled=true + 没有 trusted_proxies」= 读裸转发头，正是被修掉的伪造面；
+		// 新语义下这个组合什么都不读。于是那段回填不再「恢复」任何行为，只是往库里
+		// 埋一个与运维记录在案的选择相反的值 —— 而本次修复恰恰在推运维去配
+		// trusted_proxies，配上的那一刻这个埋下去的 true 就会生效，让可信代理送来的
+		// 自定义头违背他们的选择被读取。
+		//
+		// 迁移由 settingKeyForwardedClientIPModeV2 一次性守门，所以已经跑过的机器上
+		// 值可能已经是 true 了；那是既成事实，交由运维在后台改回，代码不再继续制造。
 	}
 	if len(updates) > 0 {
 		if err := s.settingRepo.SetMultiple(ctx, updates); err != nil {

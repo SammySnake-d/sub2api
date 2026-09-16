@@ -192,24 +192,28 @@ func TestClientIPTrustWarnings(t *testing.T) {
 			config.ServerConfig{Mode: release, TrustedProxies: []string{}, TrustedProxiesConfigured: true}, false))
 	})
 
-	t.Run("warns when forwarded trust makes the client IP forgeable", func(t *testing.T) {
+	// 2026-09-17：判据换过一次。信任改为按直连 peer 判定之后，
+	// 「开关开着 ⇒ 任何人都能伪造 IP」不再成立，旧文案与旧处方都是错的
+	// （照它把开关设 false 只会关掉可信代理的自定义头）。
+	// 现在报的是那个明确自相矛盾的组合：开关声明要读代理送来的头，
+	// 却没有任何 peer 被认定为代理。
+	t.Run("warns when the switch is on but no peer is trusted", func(t *testing.T) {
 		warnings := clientIPTrustWarnings(config.ServerConfig{Mode: release}, true)
 		require.Len(t, warnings, 1)
 		require.Contains(t, warnings[0], "trust_forwarded_ip_for_api_key_acl")
-		require.Contains(t, warnings[0], "forge")
+		require.Contains(t, warnings[0], "server.trusted_proxies is empty")
+		// 旧处方绝不能再出现：它现在是有害建议。
+		require.NotContains(t, warnings[0], "can forge its client IP")
 	})
 
-	// Differential negative: a deployment that really is behind a reverse proxy
-	// must still be warned while raw forwarding headers can override the
-	// trusted-proxy chain.
-	t.Run("still warns behind a configured reverse proxy", func(t *testing.T) {
-		warnings := clientIPTrustWarnings(config.ServerConfig{
+	// 差分阴性：开关 + 已配置的可信代理是一个**自洽**配置，必须安静。
+	// 旧实现在这里照样告警，并建议把开关关掉 —— 那正是这条要防的回归。
+	t.Run("silent behind a configured reverse proxy with the switch on", func(t *testing.T) {
+		require.Empty(t, clientIPTrustWarnings(config.ServerConfig{
 			Mode:                     release,
 			TrustedProxies:           []string{"10.0.0.7/32"},
 			TrustedProxiesConfigured: true,
-		}, true)
-		require.Len(t, warnings, 1)
-		require.Contains(t, warnings[0], "trust_forwarded_ip_for_api_key_acl")
+		}, true))
 	})
 
 	t.Run("silent behind a reverse proxy once forwarded trust is off", func(t *testing.T) {

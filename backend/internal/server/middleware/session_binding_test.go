@@ -19,21 +19,50 @@ func TestSessionBindingContextFollowsForwardedIPSwitch(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	for _, tc := range []struct {
-		name           string
-		trustForwarded bool
-		trustedProxies []string
-		wantIP         string
+		name string
+		// trustForwarded 是后台那个开关；forwardedHeaders 是它生效时才会被读的
+		// 自定义头列表。两者分开写，是因为缺陷本体恰恰在「开关为真时头怎么被读」，
+		// 只给开关不给头，resolveClientIP 的 len(headers) > 0 会提前短路，
+		// peer 闸根本不会被穿过，断言就锁不住任何东西。
+		trustForwarded   bool
+		forwardedHeaders []string
+		// ipTrustedProxies 喂 ip 包自己的可信链（peer 闸），ginTrustedProxies 喂 gin 的。
+		// 两条必须分开验：gin 那条早就存在，本次改动新增的是 ip 这条。
+		ipTrustedProxies  []string
+		ginTrustedProxies []string
+		wantIP            string
 	}{
-		{name: "enabled switch takes over raw headers", trustForwarded: true, wantIP: "1.2.3.4"},
+		// 这一条锁的是缺陷本体：开关**单独**不再构成信任。老语义下它是 1.2.3.4
+		// —— 只要开关为 true 就读裸 X-Real-IP，与 peer 是谁无关，于是任何能连上
+		// 监听口的客户端都能自报 IP。现在读不读转发头由 peer 是否落在
+		// trusted_proxies 决定，开关退化成「可信 peer 送来的头要不要读」。
+		{
+			name:             "switch alone no longer trusts an untrusted peer",
+			trustForwarded:   true,
+			forwardedHeaders: []string{"X-Real-IP"},
+			wantIP:           "127.0.0.1",
+		},
+		// 正面对照：同样的开关与同样的头，只把 peer 挪进可信链，结果立刻变成 1.2.3.4。
+		// 有它在，上面那条红才能被读成「peer 不可信」而不是「转发头被整个关掉了」。
+		{
+			name:             "switch honours headers from a trusted peer",
+			trustForwarded:   true,
+			forwardedHeaders: []string{"X-Real-IP"},
+			ipTrustedProxies: []string{"127.0.0.1"},
+			wantIP:           "1.2.3.4",
+		},
 		{name: "disabled switch ignores untrusted headers", trustForwarded: false, wantIP: "127.0.0.1"},
-		{name: "disabled switch uses configured Gin proxy", trustForwarded: false, trustedProxies: []string{"127.0.0.1"}, wantIP: "1.2.3.4"},
+		{name: "disabled switch uses configured Gin proxy", trustForwarded: false, ginTrustedProxies: []string{"127.0.0.1"}, wantIP: "1.2.3.4"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := &config.Config{}
-			cfg.SetTrustForwardedIPForAPIKeyACL(tc.trustForwarded)
+			cfg.SetForwardedClientIPSettings(tc.trustForwarded, tc.forwardedHeaders)
+
+			require.NoError(t, ip.SetTrustedProxies(tc.ipTrustedProxies))
+			t.Cleanup(func() { require.NoError(t, ip.SetTrustedProxies(nil)) })
 
 			r := gin.New()
-			require.NoError(t, r.SetTrustedProxies(tc.trustedProxies))
+			require.NoError(t, r.SetTrustedProxies(tc.ginTrustedProxies))
 			r.Use(SessionBindingContext(cfg))
 			r.GET("/t", func(c *gin.Context) {
 				binding := service.SessionBindingFromContext(c.Request.Context())
@@ -61,6 +90,12 @@ func TestSessionBindingContextSnapshotsForwardedModeAndHeaders(t *testing.T) {
 
 	cfg := &config.Config{}
 	cfg.SetForwardedClientIPSettings(true, []string{"X-Initial-IP"})
+
+	// 这条测的是「请求内快照不被中途改配置影响」，自定义头那条分支必须真的走到，
+	// 否则断言会在「peer 不可信 → 直接回落 peer」上凑绿，变成空转。
+	// gin 的可信链保持 nil：要验的是 ip 包自己的 peer 闸，不是 gin 的。
+	require.NoError(t, ip.SetTrustedProxies([]string{"9.9.9.9"}))
+	t.Cleanup(func() { require.NoError(t, ip.SetTrustedProxies(nil)) })
 
 	r := gin.New()
 	require.NoError(t, r.SetTrustedProxies(nil))

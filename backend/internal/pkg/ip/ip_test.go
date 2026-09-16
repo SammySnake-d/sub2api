@@ -32,24 +32,42 @@ func TestGetTrustedClientIPUsesGinClientIP(t *testing.T) {
 	require.Equal(t, "9.9.9.9", w.Body.String())
 }
 
-func TestGetClientIPPreservesLegacyDockerForwardedHeaders(t *testing.T) {
+// Docker/Nginx 部署形态：网桥网关是直连 peer，真实客户端在 XFF 里。
+// 修复前不看 peer 就读头，所以未配置 trusted_proxies 也能解析出 203.0.113.42；
+// 现在这要求运维显式把网桥网关配成可信代理 —— 这正是修复的意图。
+func TestGetClientIPDockerBridgeRequiresTrustedProxy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	r := gin.New()
-	require.NoError(t, r.SetTrustedProxies(nil))
-	r.GET("/t", func(c *gin.Context) {
-		c.String(200, GetClientIP(c))
-	})
+	for _, tc := range []struct {
+		name           string
+		trustedProxies []string
+		want           string
+	}{
+		{name: "bridge gateway not trusted", trustedProxies: nil, want: "192.168.32.1"},
+		{name: "bridge gateway trusted", trustedProxies: []string{"192.168.32.1/32"}, want: "203.0.113.42"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, SetTrustedProxies(tc.trustedProxies))
+			t.Cleanup(func() { require.NoError(t, SetTrustedProxies(nil)) })
 
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/t", nil)
-	req.RemoteAddr = "192.168.32.1:12345"
-	req.Header.Set("X-Forwarded-For", "10.0.0.2, 203.0.113.42")
-	req.Header.Set("X-Real-IP", "192.168.32.1")
-	r.ServeHTTP(w, req)
+			r := gin.New()
+			require.NoError(t, r.SetTrustedProxies(tc.trustedProxies))
+			r.GET("/t", func(c *gin.Context) {
+				SetForwardedIPSettings(c, true, nil)
+				c.String(200, GetClientIP(c))
+			})
 
-	require.Equal(t, 200, w.Code)
-	require.Equal(t, "203.0.113.42", w.Body.String())
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/t", nil)
+			req.RemoteAddr = "192.168.32.1:12345"
+			req.Header.Set("X-Forwarded-For", "10.0.0.2, 203.0.113.42")
+			req.Header.Set("X-Real-IP", "192.168.32.1")
+			r.ServeHTTP(w, req)
+
+			require.Equal(t, 200, w.Code)
+			require.Equal(t, tc.want, w.Body.String())
+		})
+	}
 }
 
 func TestCheckIPRestrictionWithCompiledRules(t *testing.T) {
@@ -73,12 +91,14 @@ func TestCheckIPRestrictionWithCompiledRules_InvalidWhitelistStillDenies(t *test
 	require.Equal(t, "access denied", reason)
 }
 
-func TestGetSecurityClientIPSwitchEnabledUsesLegacyHeaders(t *testing.T) {
+// 老开关打开也不再等于「谁的头都信」。
+func TestGetSecurityClientIPSwitchEnabledNoLongerTrustsRawHeaders(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	r := gin.New()
 	require.NoError(t, r.SetTrustedProxies(nil))
 	r.GET("/t", func(c *gin.Context) {
+		SetForwardedIPSettings(c, true, nil)
 		c.String(200, GetSecurityClientIP(c, true))
 	})
 
@@ -89,9 +109,12 @@ func TestGetSecurityClientIPSwitchEnabledUsesLegacyHeaders(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	require.Equal(t, 200, w.Code)
-	require.Equal(t, "1.2.3.4", w.Body.String())
+	require.Equal(t, "9.9.9.9", w.Body.String())
 }
 
+// 自定义 CDN 头的取值规则（peer 可信时才走到这里）：按配置顺序取第一个公网地址；
+// 全是私网候选时才让位给 gin 的解析结果，避免反代把自己的网桥地址写进头里、
+// 把所有用户塌进同一个桶。
 func TestGetSecurityClientIPCustomHeaderPrecedenceAndFallback(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -103,7 +126,7 @@ func TestGetSecurityClientIPCustomHeaderPrecedenceAndFallback(t *testing.T) {
 		want           string
 	}{
 		{
-			name:         "configured order precedes built-ins",
+			name:         "configured order decides",
 			trustForward: true,
 			headers:      []string{"X-CDN-First", "X-CDN-Second"},
 			requestHeaders: map[string]string{
@@ -124,71 +147,66 @@ func TestGetSecurityClientIPCustomHeaderPrecedenceAndFallback(t *testing.T) {
 			want: "203.0.113.9",
 		},
 		{
-			name:         "legacy public header wins over custom private fallback",
+			name:         "trusted-chain public address wins over custom private fallback",
 			trustForward: true,
 			headers:      []string{"X-CDN-IP"},
 			requestHeaders: map[string]string{
-				"X-CDN-IP":  "10.0.0.8",
-				"X-Real-IP": "1.2.3.4",
+				"X-CDN-IP":        "10.0.0.8",
+				"X-Forwarded-For": "1.2.3.4",
 			},
 			want: "1.2.3.4",
 		},
 		{
-			name:         "custom private fallback retains configured precedence",
+			name:         "custom private fallback used when the chain only yields a private address",
 			trustForward: true,
 			headers:      []string{"X-CDN-IP"},
 			requestHeaders: map[string]string{
-				"X-CDN-IP":  "10.0.0.8",
-				"X-Real-IP": "192.168.1.4",
+				"X-CDN-IP":        "10.0.0.8",
+				"X-Forwarded-For": "192.168.1.4",
 			},
 			want: "10.0.0.8",
 		},
 		{
-			name:         "invalid custom value continues to built-ins",
+			name:         "invalid custom value falls through to the trusted chain",
 			trustForward: true,
 			headers:      []string{"X-CDN-IP"},
 			requestHeaders: map[string]string{
-				"X-CDN-IP":         "1.2.3.4:443",
-				"CF-Connecting-IP": "4.4.4.4",
+				"X-CDN-IP":        "1.2.3.4:443",
+				"X-Forwarded-For": "4.4.4.4",
 			},
 			want: "4.4.4.4",
 		},
 		{
-			name:         "invalid legacy values continue to a valid forwarded address",
+			// gin 的 RemoteIPHeaders 默认是 X-Forwarded-For + X-Real-IP，可信 peer 的
+			// X-Real-IP 由 gin 自己决定要不要读；CF-Connecting-IP 不在其中，本包也不再读它。
+			name:         "cf-connecting-ip is no longer consulted",
 			trustForward: true,
 			requestHeaders: map[string]string{
-				"CF-Connecting-IP": "unknown",
-				"X-Real-IP":        "proxy.internal",
-				"X-Forwarded-For":  "also-invalid, 203.0.113.50",
+				"CF-Connecting-IP": "8.8.8.8",
+				"X-Real-IP":        "4.4.4.4",
 			},
-			want: "203.0.113.50",
+			want: "4.4.4.4",
 		},
 		{
-			name:         "all invalid legacy values fall back to the connection address",
-			trustForward: true,
-			requestHeaders: map[string]string{
-				"CF-Connecting-IP": "unknown",
-				"X-Real-IP":        "proxy.internal",
-				"X-Forwarded-For":  "also-invalid",
-			},
-			want: "9.9.9.9",
-		},
-		{
-			name:         "disabled mode ignores custom and legacy headers",
+			name:         "disabled mode ignores custom headers",
 			trustForward: false,
 			headers:      []string{"X-CDN-IP"},
 			requestHeaders: map[string]string{
 				"X-CDN-IP":  "1.2.3.4",
 				"X-Real-IP": "4.4.4.4",
 			},
-			want: "9.9.9.9",
+			want: "4.4.4.4",
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			// peer 9.9.9.9 是本次部署里显式配置的可信代理
+			require.NoError(t, SetTrustedProxies([]string{"9.9.9.9"}))
+			t.Cleanup(func() { require.NoError(t, SetTrustedProxies(nil)) })
+
 			r := gin.New()
-			require.NoError(t, r.SetTrustedProxies(nil))
+			require.NoError(t, r.SetTrustedProxies([]string{"9.9.9.9"}))
 			r.GET("/t", func(c *gin.Context) {
 				SetForwardedIPSettings(c, test.trustForward, test.headers)
 				c.String(200, GetSecurityClientIP(c, !test.trustForward))
@@ -227,7 +245,7 @@ func TestGetClientIPSwitchDisabledUsesTrustedProxyChain(t *testing.T) {
 	r := gin.New()
 	require.NoError(t, r.SetTrustedProxies(nil))
 	r.GET("/t", func(c *gin.Context) {
-		SetLegacyForwardedIPTrust(c, false)
+		SetForwardedIPSettings(c, false, nil)
 		c.String(200, GetClientIP(c))
 	})
 
@@ -243,8 +261,11 @@ func TestGetClientIPSwitchDisabledUsesTrustedProxyChain(t *testing.T) {
 func TestGetSecurityClientIPRequestSnapshotCopiesCustomHeaders(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
+	require.NoError(t, SetTrustedProxies([]string{"9.9.9.9"}))
+	t.Cleanup(func() { require.NoError(t, SetTrustedProxies(nil)) })
+
 	r := gin.New()
-	require.NoError(t, r.SetTrustedProxies(nil))
+	require.NoError(t, r.SetTrustedProxies([]string{"9.9.9.9"}))
 	r.GET("/t", func(c *gin.Context) {
 		headers := []string{"X-Original-IP"}
 		SetForwardedIPSettings(c, true, headers)
@@ -262,35 +283,25 @@ func TestGetSecurityClientIPRequestSnapshotCopiesCustomHeaders(t *testing.T) {
 	require.Equal(t, "1.2.3.4", w.Body.String())
 }
 
-func TestGetSecurityClientIPRequestSnapshotOverridesLiveFallback(t *testing.T) {
+// GetSecurityClientIP 的第二个参数已经不参与判定（老开关是 peer 无关的，正是缺陷本体）。
+// 两种取值必须给出同一个结果，否则说明还有路径在按全局布尔决定信任。
+func TestGetSecurityClientIPIgnoresLiveFallbackArgument(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	tests := []struct {
-		name          string
-		requestTrust  bool
-		fallbackTrust bool
-		want          string
-	}{
-		{name: "captured secure mode wins", requestTrust: false, fallbackTrust: true, want: "9.9.9.9"},
-		{name: "captured compatibility mode wins", requestTrust: true, fallbackTrust: false, want: "1.2.3.4"},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			r := gin.New()
-			require.NoError(t, r.SetTrustedProxies(nil))
-			r.GET("/t", func(c *gin.Context) {
-				SetLegacyForwardedIPTrust(c, test.requestTrust)
-				c.String(200, GetSecurityClientIP(c, test.fallbackTrust))
-			})
-
-			w := httptest.NewRecorder()
-			req := httptest.NewRequest("GET", "/t", nil)
-			req.RemoteAddr = "9.9.9.9:12345"
-			req.Header.Set("X-Real-IP", "1.2.3.4")
-			r.ServeHTTP(w, req)
-
-			require.Equal(t, test.want, w.Body.String())
+	for _, fallbackTrust := range []bool{true, false} {
+		r := gin.New()
+		require.NoError(t, r.SetTrustedProxies(nil))
+		r.GET("/t", func(c *gin.Context) {
+			SetForwardedIPSettings(c, true, nil)
+			c.String(200, GetSecurityClientIP(c, fallbackTrust))
 		})
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/t", nil)
+		req.RemoteAddr = "9.9.9.9:12345"
+		req.Header.Set("X-Real-IP", "1.2.3.4")
+		r.ServeHTTP(w, req)
+
+		require.Equal(t, "9.9.9.9", w.Body.String())
 	}
 }
