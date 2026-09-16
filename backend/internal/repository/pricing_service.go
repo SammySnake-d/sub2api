@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -35,23 +34,23 @@ func (c *pricingRemoteClientError) FetchHashText(_ context.Context, _ string) (s
 // proxyURL 为空时直连，支持 http/https/socks5/socks5h 协议
 // 代理配置失败时行为由 allowDirectOnProxyError 控制：
 //   - false（默认）：返回错误占位客户端，禁止回退到直连
-//   - true：回退到直连（仅限管理员显式开启）
+//   - true：回退到直连，并打 warn 留痕（httpclient 侧统一处理）
+//
+// 客户端构造统一走 httpclient.NewControlPlaneClient：这里和 github_release_service.go
+// 以前各自维护一份逐行相同的 GetClient + 兜底逻辑，其中的回退分支一条日志都不打，
+// 代理坏了只表现为「又直连超时了」。控制面代理的来源见 config.ControlPlaneConfig。
 func NewPricingRemoteClient(proxyURL string, allowDirectOnProxyError bool) service.PricingRemoteClient {
-	// 安全说明：httpclient.GetClient 的错误链（url.Parse / proxyutil）不含明文代理凭据，
-	// 但仍通过 slog 仅在服务端日志记录，不会暴露给 HTTP 响应。
-	sharedClient, err := httpclient.GetClient(httpclient.Options{
-		Timeout:  30 * time.Second,
-		ProxyURL: proxyURL,
+	client, err := httpclient.NewControlPlaneClient(httpclient.ControlPlaneOptions{
+		Service:                 "pricing",
+		ProxyURL:                proxyURL,
+		Timeout:                 30 * time.Second,
+		AllowDirectOnProxyError: allowDirectOnProxyError,
 	})
 	if err != nil {
-		if strings.TrimSpace(proxyURL) != "" && !allowDirectOnProxyError {
-			slog.Warn("proxy client init failed, all requests will fail", "service", "pricing", "error", err)
-			return &pricingRemoteClientError{err: fmt.Errorf("proxy client init failed and direct fallback is disabled; set security.proxy_fallback.allow_direct_on_error=true to allow fallback: %w", err)}
-		}
-		sharedClient = &http.Client{Timeout: 30 * time.Second}
+		return &pricingRemoteClientError{err: err}
 	}
 	return &pricingRemoteClient{
-		httpClient: sharedClient,
+		httpClient: client,
 	}
 }
 

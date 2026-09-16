@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,35 +29,33 @@ type githubReleaseClientError struct {
 // proxyURL 为空时直连 GitHub，支持 http/https/socks5/socks5h 协议
 // 代理配置失败时行为由 allowDirectOnProxyError 控制：
 //   - false（默认）：返回错误占位客户端，禁止回退到直连
-//   - true：回退到直连（仅限管理员显式开启）
+//   - true：回退到直连，并打 warn 留痕（httpclient 侧统一处理）
+//
+// 客户端构造统一走 httpclient.NewControlPlaneClient，与定价同步共用同一个落点；
+// 控制面代理为什么需要存在见 config.ControlPlaneConfig（国内 VPS 直连 api.github.com
+// 会 i/o timeout，导致 Codex 版本跟随静默停更）。
 func NewGitHubReleaseClient(proxyURL string, allowDirectOnProxyError bool) service.GitHubReleaseClient {
-	// 安全说明：httpclient.GetClient 的错误链（url.Parse / proxyutil）不含明文代理凭据，
-	// 但仍通过 slog 仅在服务端日志记录，不会暴露给 HTTP 响应。
-	sharedClient, err := httpclient.GetClient(httpclient.Options{
-		Timeout:  30 * time.Second,
-		ProxyURL: proxyURL,
+	apiClient, err := httpclient.NewControlPlaneClient(httpclient.ControlPlaneOptions{
+		Service:                 "github_release",
+		ProxyURL:                proxyURL,
+		Timeout:                 30 * time.Second,
+		AllowDirectOnProxyError: allowDirectOnProxyError,
 	})
 	if err != nil {
-		if strings.TrimSpace(proxyURL) != "" && !allowDirectOnProxyError {
-			slog.Warn("proxy client init failed, all requests will fail", "service", "github_release", "error", err)
-			return &githubReleaseClientError{err: fmt.Errorf("proxy client init failed and direct fallback is disabled; set security.proxy_fallback.allow_direct_on_error=true to allow fallback: %w", err)}
-		}
-		sharedClient = &http.Client{Timeout: 30 * time.Second}
+		return &githubReleaseClientError{err: err}
 	}
-	apiClient := cloneHTTPClient(sharedClient)
+	apiClient = cloneHTTPClient(apiClient)
 	apiClient.CheckRedirect = githubAPICheckRedirect(apiClient.CheckRedirect)
 
 	// 下载客户端需要更长的超时时间
-	downloadClient, err := httpclient.GetClient(httpclient.Options{
-		Timeout:  10 * time.Minute,
-		ProxyURL: proxyURL,
+	downloadClient, err := httpclient.NewControlPlaneClient(httpclient.ControlPlaneOptions{
+		Service:                 "github_release_download",
+		ProxyURL:                proxyURL,
+		Timeout:                 10 * time.Minute,
+		AllowDirectOnProxyError: allowDirectOnProxyError,
 	})
 	if err != nil {
-		if strings.TrimSpace(proxyURL) != "" && !allowDirectOnProxyError {
-			slog.Warn("proxy download client init failed, all requests will fail", "service", "github_release", "error", err)
-			return &githubReleaseClientError{err: fmt.Errorf("proxy client init failed and direct fallback is disabled; set security.proxy_fallback.allow_direct_on_error=true to allow fallback: %w", err)}
-		}
-		downloadClient = &http.Client{Timeout: 10 * time.Minute}
+		return &githubReleaseClientError{err: err}
 	}
 	downloadClient = cloneHTTPClient(downloadClient)
 

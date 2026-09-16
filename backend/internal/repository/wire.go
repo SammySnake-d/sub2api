@@ -27,15 +27,16 @@ func ProvideConcurrencyCache(rdb *redis.Client, cfg *config.Config) service.Conc
 }
 
 // ProvideGitHubReleaseClient 创建 GitHub Release 客户端
-// 从配置中读取代理设置，支持国内服务器通过代理访问 GitHub
+// 代理地址走 cfg.ControlPlaneProxyURL()：与定价同步同一个来源，避免两条控制面链路
+// 各读一个配置项而漂成「一个走代理一个直连」。留空即直连，见 config.ControlPlaneConfig。
 func ProvideGitHubReleaseClient(cfg *config.Config) service.GitHubReleaseClient {
-	return NewGitHubReleaseClient(cfg.Update.ProxyURL, cfg.Security.ProxyFallback.AllowDirectOnError)
+	return NewGitHubReleaseClient(cfg.ControlPlaneProxyURL(), cfg.Security.ProxyFallback.AllowDirectOnError)
 }
 
 // ProvidePricingRemoteClient 创建定价数据远程客户端
-// 从配置中读取代理设置，支持国内服务器通过代理访问 GitHub 上的定价数据
+// 代理地址与 GitHub Release 客户端同源，见 ProvideGitHubReleaseClient。
 func ProvidePricingRemoteClient(cfg *config.Config) service.PricingRemoteClient {
-	return NewPricingRemoteClient(cfg.Update.ProxyURL, cfg.Security.ProxyFallback.AllowDirectOnError)
+	return NewPricingRemoteClient(cfg.ControlPlaneProxyURL(), cfg.Security.ProxyFallback.AllowDirectOnError)
 }
 
 // ProvideSessionLimitCache 创建会话限制缓存

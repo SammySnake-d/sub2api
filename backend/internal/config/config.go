@@ -100,6 +100,7 @@ type Config struct {
 	Timezone                string                        `mapstructure:"timezone"` // e.g. "Asia/Shanghai", "UTC"
 	Gemini                  GeminiConfig                  `mapstructure:"gemini"`
 	Update                  UpdateConfig                  `mapstructure:"update"`
+	ControlPlane            ControlPlaneConfig            `mapstructure:"control_plane"`
 	Idempotency             IdempotencyConfig             `mapstructure:"idempotency"`
 	BatchImage              BatchImageConfig              `mapstructure:"batch_image"`
 	ImageStorage            ImageStorageConfig            `mapstructure:"image_storage"`
@@ -175,7 +176,60 @@ type UpdateConfig struct {
 	// ProxyURL 用于访问 GitHub 的代理地址
 	// 支持 http/https/socks5/socks5h 协议
 	// 例如: "http://127.0.0.1:7890", "socks5://127.0.0.1:1080"
+	//
+	// 历史配置项：名字只说「更新」，实际同时被定价数据同步复用。新部署请配
+	// control_plane.proxy_url（语义相同、名字不再误导），这里保留是为了不让已经
+	// 配好的部署改配置文件。取值逻辑见 Config.ControlPlaneProxyURL。
 	ProxyURL string `mapstructure:"proxy_url"`
+}
+
+// ControlPlaneConfig 控制面出站（与 AI 账号无关的自运维流量）的网络设置。
+//
+// 为什么存在这个配置项（别当成多余的抽象删掉）：控制面出站目标全在境外 ——
+// api.github.com 的 Release 列表与 Codex 客户端版本跟随、ghfast.top 上的定价数据
+// 与哈希文件 —— 而生产部署在腾讯云国内 VPS，直连是稳定失败而不是偶发抖动，
+// 生产日志实录 `net/http: TLS handshake timeout` 与
+// `dial tcp 20.205.243.168:443: i/o timeout`，结果是定价停更、版本号静默停在旧值。
+//
+// 根因不是网络不通：同一套部署里已经有一个在用的海外出口 —— resin
+// （45.205.28.160:2260，HTTP CONNECT，AI 账号流量已经在走它，实测经它到境外
+// p50 185ms、到 api 域名 2.2s）。控制面之前没复用它，只是因为压根没有地方填。
+// 把下面这一项指向 resin 就够了，不需要再为控制面单独搭出网设施。
+type ControlPlaneConfig struct {
+	// ProxyURL 控制面出站代理地址，支持 http/https/socks5/socks5h。
+	// 例如: "http://user:pass@45.205.28.160:2260"
+	//
+	// 留空 = 保持现状直连。这是兼容底线：海外部署本来直连就通，不能因为引入这个
+	// 配置项而变坏，所以空值不做任何额外处理、也不打日志。
+	// 留空时回落到 update.proxy_url（见上），两者都空才直连。
+	//
+	// 这个值会带代理凭据：任何日志/错误输出都必须先过 httpclient.RedactProxyURL
+	// 或 httpclient 的错误脱敏，不能直接打印。
+	ProxyURL string `mapstructure:"proxy_url"`
+}
+
+// envKeyReplacer 环境变量名到配置键的映射规则：config 键里的 "." 对应环境变量里的 "_"
+// （control_plane.proxy_url → CONTROL_PLANE_PROXY_URL）。
+//
+// 抽成函数是为了让测试能用与生产完全相同的规则验证「某个环境变量真的读得到」，
+// 而不是在测试里复制一份 NewReplacer —— 复制品不会跟着生产一起改。
+func envKeyReplacer() *strings.Replacer {
+	return strings.NewReplacer(".", "_")
+}
+
+// ControlPlaneProxyURL 返回控制面出站应当使用的代理地址，留空表示直连。
+//
+// 两个来源、一个落点：control_plane.proxy_url 优先，未配时回落到老配置项
+// update.proxy_url。这样已经在用 update.proxy_url 的部署不改配置就继续生效，
+// 而新部署不必再从「更新」这个名字里猜出它也管定价同步。
+func (c *Config) ControlPlaneProxyURL() string {
+	if c == nil {
+		return ""
+	}
+	if proxyURL := strings.TrimSpace(c.ControlPlane.ProxyURL); proxyURL != "" {
+		return proxyURL
+	}
+	return strings.TrimSpace(c.Update.ProxyURL)
 }
 
 type IdempotencyConfig struct {
@@ -1792,7 +1846,7 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 
 	// 环境变量支持
 	viper.AutomaticEnv()
-	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	viper.SetEnvKeyReplacer(envKeyReplacer())
 	if tz, ok := os.LookupEnv("TZ"); ok && strings.TrimSpace(tz) != "" {
 		// AutomaticEnv 会先把 timezone 映射到 TIMEZONE；显式 Set 保证标准 TZ 变量优先。
 		viper.Set("timezone", strings.TrimSpace(tz))
@@ -2601,6 +2655,11 @@ func setEnvReachableDefaults() {
 	viper.SetDefault("gateway.session_idle_timeout_minutes", 0)
 	viper.SetDefault("gateway.user_message_queue.mode", "")
 	viper.SetDefault("update.proxy_url", "")
+	// control_plane.proxy_url 同理：国内 VPS 上的部署几乎都是纯 env 驱动
+	// （deploy/docker-compose.yml 就是），不注册默认值的话 CONTROL_PLANE_PROXY_URL
+	// 会被 viper 读到又静默丢掉 —— 对一个「配了代理还是在超时」的故障来说是最难查的形态。
+	// 默认空串 = 直连，与不写这一项完全等价。
+	viper.SetDefault("control_plane.proxy_url", "")
 
 	// sticky_escape_enabled is the one exception to the zero-value rule: its
 	// effective default is true, applied post-unmarshal via a viper.IsSet guard.
@@ -3782,7 +3841,7 @@ func GetServerAddress() string {
 
 	// Support SERVER_HOST and SERVER_PORT environment variables
 	v.AutomaticEnv()
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.SetEnvKeyReplacer(envKeyReplacer())
 	v.SetDefault("server.host", "0.0.0.0")
 	v.SetDefault("server.port", 8080)
 
