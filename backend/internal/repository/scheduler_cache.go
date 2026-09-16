@@ -956,7 +956,23 @@ func filterSchedulerCredentials(credentials map[string]any) map[string]any {
 	}
 	// Candidate-list admission evaluates the account override before hydrating
 	// the full account. Dropping it silently falls back to the platform threshold.
-	keys := []string{"model_mapping", "compact_model_mapping", "api_key", "project_id", "oauth_type", "plan_type", "account_scheduling_threshold"}
+	//
+	// "provider" 是身份标记值(如 "mirasim"),不是凭据 —— 与已在白名单里的
+	// oauth_type / plan_type 同一类:它只说明这个账号"属于哪一路上游",不含任何
+	// 可用于认证的秘密。把它放进投影不改变 access_token / refresh_token 的脱敏
+	// 语义:它们不在白名单里,依旧被裁掉。
+	//
+	// 它为什么必须留在这里(生产故障,勿删):写路径按 ID 水化 sched:acc:<id> 的
+	// 完整账号,IsMirasimAccount 为真,429 后能正确写入家族级冷却
+	// extra.model_rate_limits["mirasim:7d_claude"];但读路径(候选列表)读的是本
+	// 投影 sched:meta:<id>。provider 一旦被裁掉,投影账号上 IsMirasimAccount 恒
+	// false → mirasimModelRateLimitKeys 返回 nil → "mirasim:7d_claude" 这个 key
+	// 根本不会被生成去查 —— 冷却数据明明已经在投影里("model_rate_limits" 本就
+	// 在 extra 白名单),却查不到。实录:账号 132 在 16:55:58Z 写入 5 天后才重置
+	// 的冷却,16:56:28 → 16:59:41 仍被选中 12 次并反复吃 429;全池 14 个号、23
+	// 条家族冷却同在这个盲区。回归锁见
+	// TestSchedulerMetadataAccountKeepsMirasimCooldownVisible。
+	keys := []string{"model_mapping", "compact_model_mapping", "api_key", "project_id", "oauth_type", "plan_type", "account_scheduling_threshold", "provider"}
 	filtered := make(map[string]any)
 	for _, key := range keys {
 		if value, ok := credentials[key]; ok && value != nil {
