@@ -1965,10 +1965,31 @@ func (s *RateLimitService) handle529(ctx context.Context, account *Account) {
 
 // UpdateSessionWindow 从成功响应更新5h窗口状态
 func (s *RateLimitService) UpdateSessionWindow(ctx context.Context, account *Account, headers http.Header) {
+	// 观测口（默认关闭）：把上游实际回来的额度窗口头记一条。必须在下面的早退之前，
+	// 否则"上游一个额度头都没回"这种最需要被看见的情况会被早退吃掉。
+	logObservedRateLimitHeaders(account, headers)
+
 	status := headers.Get("anthropic-ratelimit-unified-5h-status")
-	if status == "" {
+	if status == "" && !hasAnyUnifiedRateLimitHeader(headers) {
 		return
 	}
+	// status 为空但仍有窗口头时**不能**早退。
+	//
+	// 实测（2026-09-16，真实 Claude Code → sub2api → mirasim 的 200 响应）：
+	// mirasim 只回四个头 ——
+	//	anthropic-ratelimit-unified-5h-reset / -5h-utilization
+	//	anthropic-ratelimit-unified-7d-reset / -7d-utilization
+	// 没有 -status、没有 -surpassed-threshold、没有 7d_oi。
+	//
+	// 原先这里见 status 为空就 return，等于把这四个头连同它们承载的全部额度信息
+	// 一起丢掉：账号的 5h 窗口边界永远建不起来，被动用量永远不落盘（实测线上
+	// accounts.extra 里确实一个 passive_usage_* 都没有）。后果不是报错而是**静默降级**
+	// —— 调度器眼里每个账号都"额度未知"，只能等 429 才发现耗尽，而 429 本身就是
+	// 一次已经失败的请求。
+	//
+	// status 保持上游的字面值（可能是空串）写回：它在 account_usage_service.go:1735
+	// 只是 utilization 缺失时的兜底估算，而 mirasim 给了 utilization，兜底不会触发。
+	// 不在这里合成一个 "allowed" —— 上游没说过的话不替它说。
 
 	// 检查是否需要初始化时间窗口
 	// 对于 Setup Token 账号，首次成功请求时需要预测时间窗口
