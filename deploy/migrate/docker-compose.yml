@@ -1,0 +1,186 @@
+# =============================================================================
+# 一键迁移编排:sub2api + postgres + redis + resin(出口代理池)
+# =============================================================================
+#
+# 这份 compose 的存在理由不是「用 docker 跑起来」——两个仓库本来各自都有 Dockerfile。
+# 它要解决的是**迁移**:把散在两台机器上的四个组件、两份持久化数据、以及它们之间
+# 那条曾经跨境的连接,变成一次 `docker compose up`。
+#
+# ## 迁移带来的拓扑变化（这才是重点）
+#
+#   迁移前:  客户端(国内) → sub2api(腾讯云) →跨境 ~150ms→ resin(海外) → 节点 → 上游
+#   迁移后:  客户端(国内) →跨境→ sub2api(法国) →容器网络 <1ms→ resin → 节点 → 上游
+#
+# **跨境那一跳没有消失,它移动了位置。** 这个取舍要清楚:
+#
+#   - 移走的代价:sub2api→resin 的 CONNECT 建连不再跨境。这一跳原本在**每次**上游
+#     请求的关键路径上,而且 resin 每换一个节点就要重付一次(最坏 3 次)。
+#   - 新增的代价:客户端到 sub2api 变成跨境。国内到法国通常 200~300ms,而到腾讯云
+#     只要 ~20ms,所以**流式响应的首字延迟会增加约 200ms**。
+#   - 净收益:法国到欧美出口节点的距离大幅缩短,resin→节点→上游这一段会明显变快,
+#     而那一段原本是长尾的主要来源(实测慢账号 97s 的那种)。
+#
+# 一句话:**交互式首字会略慢,长请求与稳定性会明显变好。** 如果首字延迟是你的
+# 主要指标,考虑把 sub2api 留在国内、只把 resin 放法国 —— 那是另一种拓扑,
+# 见 README 的「只迁 resin」小节。
+#
+# ## 资源配额的依据（实测,不是拍的）
+#
+#   resin      RSS 543 MB   —— 现在跑在 2核1G 上且 available=0,管着 4430 个节点
+#   sub2api    RSS 215 MB
+#   postgres   23 MB 数据   —— accounts 1.7MB 是最大的表
+#   redis      极小
+#
+# 合计 ~4.5G,4v8g 有富余。配额刻意留了倍数余量而不是贴着实测值:resin 的内存随
+# 订阅源节点数增长,而节点数是会变的。
+# =============================================================================
+
+name: sub2api-stack
+
+services:
+  # ---------------------------------------------------------------------------
+  # 出口代理池。**先于 sub2api 声明**,因为 sub2api 的账号全部依赖它。
+  # ---------------------------------------------------------------------------
+  resin:
+    image: ${RESIN_IMAGE:-sub2api-stack/resin:local}
+    container_name: resin
+    restart: unless-stopped
+    environment:
+      # 所有 resin 环境变量都必须带 RESIN_ 前缀。
+      # 踩过的坑:写 LISTEN_ADDRESS(无前缀)不会报错,会被**静默忽略**,
+      # 于是它退回默认监听地址,而你以为自己改了。
+      RESIN_ADMIN_TOKEN: ${RESIN_ADMIN_TOKEN:?RESIN_ADMIN_TOKEN 必须设置}
+      RESIN_PROXY_TOKEN: ${RESIN_PROXY_TOKEN:?RESIN_PROXY_TOKEN 必须设置}
+      RESIN_LISTEN_ADDRESS: 0.0.0.0
+      RESIN_PORT: "2260"
+      RESIN_STATE_DIR: /var/lib/resin
+      RESIN_CACHE_DIR: /var/cache/resin
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - resin_state:/var/lib/resin
+      - resin_cache:/var/cache/resin
+      - resin_log:/var/log/resin
+    # 端口**只绑在回环上**。resin 的管理面能读写整个出口池配置,
+    # 而 admin token 是一个静态字符串 —— 它不该暴露在公网上。
+    # 要从外面访问管理界面,用 SSH 隧道:
+    #   ssh -L 2260:127.0.0.1:2260 <新机>
+    ports:
+      - "127.0.0.1:2260:2260"
+    networks: [stack]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2260/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  postgres:
+    image: postgres:18-alpine
+    container_name: sub2api-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sub2api}
+      POSTGRES_USER: ${POSTGRES_USER:-sub2api}
+      # 没有默认值是刻意的。上游曾经把 database.password 的默认值设成 "postgres",
+      # 那是一条躺在开源代码里的可用凭据。这里用 :? 让它在缺失时**直接启动失败**。
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须设置}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # 不映射端口。数据库只被同一个 compose 网络里的 sub2api 访问,
+    # 映射出去只会多一个攻击面。调试时临时加 "127.0.0.1:5433:5432"。
+    networks: [stack]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sub2api} -d ${POSTGRES_DB:-sub2api}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    logging: *default-logging
+
+  redis:
+    image: redis:8-alpine
+    container_name: sub2api-redis
+    restart: unless-stopped
+    # maxmemory 配在 limits 之下,让 redis 自己按 LRU 淘汰,
+    # 而不是让内核 OOM killer 来决定 —— 后者会直接杀进程。
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 384mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks: [stack]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging: *default-logging
+
+  sub2api:
+    image: ${SUB2API_IMAGE:-sub2api-stack/sub2api:local}
+    container_name: sub2api
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      # resin 只要起来就行,不等 healthy:出口池不可用时 sub2api 应该正常启动
+      # 并把账号标成不健康,而不是自己也起不来。
+      resin: {condition: service_started}
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      # DATA_DIR 决定 viper 从哪里找 config.yaml。
+      # **踩过的坑**:viper 的搜索顺序是 DATA_DIR → /app/data → . → ./config → /etc/sub2api,
+      # 所以 /app/data/config.yaml 会盖掉 /etc/sub2api/config.yaml,而两份不一致时
+      # 完全没有任何提示。容器里只挂一份,从根上消除这个歧义。
+      DATA_DIR: /app/data
+    volumes:
+      - sub2api_data:/app/data
+    ports:
+      # 这是唯一对外暴露的端口。默认绑 0.0.0.0 因为客户端要从公网连进来。
+      - "${SUB2API_BIND:-0.0.0.0}:${SUB2API_PORT:-6699}:6699"
+    networks: [stack]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:6699/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    logging: *default-logging
+
+networks:
+  stack:
+    name: sub2api-stack
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  sub2api_data:
+  resin_state:
+  resin_cache:
+  resin_log:
