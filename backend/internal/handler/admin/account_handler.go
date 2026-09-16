@@ -65,6 +65,7 @@ type AccountHandler struct {
 	grokImportProber        grokImportProber
 	upstreamBillingProbe    *service.UpstreamBillingProbeService
 	mirasimPlanProbe        *service.MirasimPlanProbeService
+	mirasimQuotaProbe       *service.MirasimQuotaProbeService
 	ollamaCloudUsage        *service.OllamaCloudUsageService
 	cfg                     *config.Config
 }
@@ -77,6 +78,16 @@ func (h *AccountHandler) SetUpstreamBillingProbeService(probe *service.UpstreamB
 // SetMirasimPlanProbeService attaches the optional mirasim subscription-plan probe.
 func (h *AccountHandler) SetMirasimPlanProbeService(probe *service.MirasimPlanProbeService) {
 	h.mirasimPlanProbe = probe
+}
+
+// SetMirasimQuotaProbeService attaches the optional mirasim quota-window probe.
+//
+// 「可选」在这里是真的可选，不是遗留：后台周期探测器与这个按钮共用同一个 service，
+// 而某些部署（比如只跑迁移、或没有 leader 锁的实例）不会构造它。没有它的时候
+// 端点退化成「回显上次存下来的读数」，而不是假装探了一次 —— 见
+// account_mirasim_quota.go 里 Probed 字段的说明。
+func (h *AccountHandler) SetMirasimQuotaProbeService(probe *service.MirasimQuotaProbeService) {
+	h.mirasimQuotaProbe = probe
 }
 
 func (h *AccountHandler) SetOllamaCloudUsageService(usage *service.OllamaCloudUsageService) {

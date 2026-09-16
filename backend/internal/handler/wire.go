@@ -49,10 +49,12 @@ func ProvideAdminHandlers(
 	auditLogHandler *admin.AuditLogHandler,
 	upstreamBillingProbe *service.UpstreamBillingProbeService,
 	mirasimPlanProbe *service.MirasimPlanProbeService,
+	mirasimQuotaProbe *service.MirasimQuotaProbeService,
 	ollamaCloudUsage *service.OllamaCloudUsageService,
 ) *AdminHandlers {
 	accountHandler.SetUpstreamBillingProbeService(upstreamBillingProbe)
 	accountHandler.SetMirasimPlanProbeService(mirasimPlanProbe)
+	accountHandler.SetMirasimQuotaProbeService(mirasimQuotaProbe)
 	accountHandler.SetOllamaCloudUsageService(ollamaCloudUsage)
 	return &AdminHandlers{
 		Dashboard:              dashboardHandler,
