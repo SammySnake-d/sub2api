@@ -70,12 +70,21 @@ services:
       - resin_state:/var/lib/resin
       - resin_cache:/var/cache/resin
       - resin_log:/var/log/resin
-    # 端口**只绑在回环上**。resin 的管理面能读写整个出口池配置,
-    # 而 admin token 是一个静态字符串 —— 它不该暴露在公网上。
-    # 要从外面访问管理界面,用 SSH 隧道:
+    # resin 管理面的暴露范围。
+    #
+    # 默认 0.0.0.0 是因为运维要能从浏览器直接打开它。**但这台机器上 ufw 管不住
+    # docker**:docker 自己往 nat 表写 DNAT 并在 FORWARD 链放行,流量根本不经过
+    # ufw 所在的 INPUT 链 —— 实测该机 `INPUT policy DROP`、SSH 只放通 12 个白名单
+    # IP,而三个 0.0.0.0 的 docker 端口对全世界可达。
+    #
+    # 所以绑 0.0.0.0 **必须**配合 deploy/migrate/ufw-docker-allowlist.sh 在
+    # DOCKER-USER 链上加 IP 白名单。resin 的管理面没有登录、只有一个静态 token,
+    # 拿到它就能改订阅源、改平台过滤、读出全部租约与出口 IP。
+    #
+    # 只想自己用 SSH 隧道看的话,把 RESIN_BIND 设成 127.0.0.1:
     #   ssh -L 2260:127.0.0.1:2260 <新机>
     ports:
-      - "127.0.0.1:2260:2260"
+      - "${RESIN_BIND:-0.0.0.0}:${RESIN_PORT_PUBLISHED:-2260}:2260"
     networks: [stack]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2260/healthz >/dev/null || exit 1"]
