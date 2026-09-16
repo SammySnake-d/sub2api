@@ -72,8 +72,20 @@ const (
 	ExtraPlanProbeEnabled = "mirasim_plan_probe_enabled"
 )
 
-// referralTimeout bounds one /auth/referral call. Matches ma-relay's.
-const referralTimeout = 15 * time.Second
+// referralTimeout bounds one /auth/referral call.//
+// **这个值必须大于出口代理的换节点预算，否则每一次节点轮换都会被误判成超时。**
+// 实测教训（2026-09-16）：它原本照抄 ma-relay 的 10s，而 ma-relay 与它的出口池同机、
+// 走干净网络、且当时代理层**没有**单次请求内换节点重试。本仓的拓扑是
+//
+//	sub2api(国内) →跨境~150ms→ resin(海外) →最多换 3 个节点，每次 8s→ 节点 → 上游
+//
+// 代理层光是建连就可能花掉 24s。10s 的预算下，只要第一个节点不好用就必然超时：
+// 143 个账号里 43 个（30%）报 timeout，与节点故障率同量级 —— 那不是上游慢，
+// 是**我们自己在代理还没换完节点的时候就放弃了**。
+//
+// 40s = 代理最坏 24s + 上游真实处理时间 + 余量。改小它之前先看 resin 的
+// connectDialMaxAttempts × connectDialAttemptTimeout 是多少；两个数是绑在一起的。
+const referralTimeout = 40 * time.Second
 
 // ReferralInfo is the account's referral / upgrade state from
 // GET <auth base>/auth/referral.
