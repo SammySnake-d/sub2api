@@ -395,8 +395,19 @@ func TestMirasimSignedRequestReachesTheWireUnchanged(t *testing.T) {
 	if got := echo.header.Get("anthropic-beta"); got != "interleaved-thinking-2025-05-14,context-1m-2025-08-07" {
 		t.Errorf("anthropic-beta was rewritten to %q — this batch must not touch it", got)
 	}
-	if got := echo.header.Get("user-agent"); got != "claude-cli/2.1.250 (external, sdk-cli)" {
-		t.Errorf("user-agent was rewritten to %q — client-identity normalisation is out of scope", got)
+	// 身份头**是**这一层的职责，而且必须是覆盖式的。
+	//
+	// 这条断言原先反过来写（"client-identity normalisation is out of scope"），
+	// 编码的是"传输层只签名、归一放在网关"那套设计。那套设计在生产上漏了：
+	// 网关只覆盖客户流量，账号健康检查/计划探测/额度探测都不走网关，于是它们
+	// 带着 service.defaultFingerprint 的陈旧画像（Linux / 0.94.0 / v24.3.0）出门，
+	// 同一个账号在上游看来是两台设备（2026-09-16 线上 usage_logs 实录）。
+	// 现在唯一落点收到了 mirasimUpstream.sign，所以调用方自报的 2.1.250 必须被覆盖。
+	// 收口本身的正/反对照见 mirasim_identity_chokepoint_test.go。
+	for k, want := range mirasim.CanonicalIdentityHeaders() {
+		if got := echo.header.Get(k); got != want {
+			t.Errorf("%s on the wire = %q, want canonical %q", k, got, want)
+		}
 	}
 	if echo.url != "/v1/messages?beta=true" {
 		t.Errorf("url on the wire = %q, want the signed path plus the unsigned query", echo.url)

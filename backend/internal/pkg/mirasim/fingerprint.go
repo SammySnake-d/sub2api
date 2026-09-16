@@ -2,6 +2,7 @@ package mirasim
 
 import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
+	"net/http"
 )
 
 // ClientVersion is the mirasim client version stamped into x-mirasim-client AND
@@ -80,6 +81,35 @@ const (
 //
 // Keys are in the casing sub2api's own claude.DefaultHeaders uses, so callers
 // can pass them straight through resolveWireCasing.
+// ApplyCanonicalIdentityHeaders 把版本相关的身份头写进 h，覆盖调用方带来的任何值。
+//
+// **它必须是这套画像的唯一落点。** 在它存在之前，canonical 头只挂在两条**网关**路径上
+// （gateway_upstream_request.go 与 gateway_anthropic_passthrough.go），于是任何不走网关的
+// mirasim 请求都会拿到 service.defaultFingerprint 那份陈旧值。实测后果（2026-09-16 线上
+// usage_logs）：同一批账号的请求里，客户流量是
+//
+//	claude-cli/2.1.272 (external, sdk-cli) + MacOS + 0.112.1 + v26.3.0
+//
+// 而 sub2api 自己发的账号健康检查是
+//
+//	claude-cli/2.1.272 (external, cli)     + Linux + 0.94.0  + v24.3.0
+//
+// —— 上游看到的是**一台 Mac 和一台 Linux 交替在用同一个账号**，SDK 版本还差了一大截。
+// 这正是整套「一号一指纹、同号对上游表现为同设备」要防的事，而它是静默的：
+// 健康检查照样 200，没有任何信号。
+//
+// 所以这个函数的调用点被刻意收到了传输层的签名收口（repository.mirasimUpstream.sign），
+// 那是每一个 mirasim 请求的必经之路。**不要在别处再调它一次** —— 多一个调用点，
+// 就多一条将来会被漏掉的路径，而漏掉的代价是静默的。
+func ApplyCanonicalIdentityHeaders(h http.Header) {
+	if h == nil {
+		return
+	}
+	for k, v := range CanonicalIdentityHeaders() {
+		h.Set(k, v)
+	}
+}
+
 func CanonicalIdentityHeaders() map[string]string {
 	return map[string]string{
 		// claude.CLIVersion() is the process-wide pin (env-overridable upwards

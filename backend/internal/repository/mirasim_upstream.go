@@ -23,10 +23,12 @@ package repository
 // rather than replaying a signed one.
 //
 // This decorator writes ONLY: the Authorization header, the x-mirasim-*
-// namespace, and (on the /v1/limits probe) accept-encoding. It never touches the
-// body — anything that round-tripped the body through map[string]any would
-// reorder keys and HTML-escape < > &, destroying the upstream prompt-cache
-// prefix.
+// namespace, the canonical client-identity headers, and (on the /v1/limits
+// probe) accept-encoding — plus exactly ONE body field: metadata.user_id, via a
+// surgical sjson edit (see mirasim_identity_body.go for why that one field has
+// to be converged here and nowhere else). Nothing here ever round-trips the body
+// through map[string]any: that would reorder keys and HTML-escape < > &,
+// destroying the upstream prompt-cache prefix.
 
 import (
 	"bytes"
@@ -135,16 +137,31 @@ func (m *mirasimUpstream) sign(req *http.Request, proxyURL string, accountID int
 		return false, nil
 	}
 	ctx := req.Context()
+
+	// 账号归属先查：它同时决定「要不要签名」和「要不要统一身份头」，而后者对
+	// **不签名**的控制面调用也必须生效。binding 带 TTL 缓存（见 binding()），
+	// 把它提到前面不会给控制面调用多加一次存储访问。
+	binding, ok := m.binding(ctx, accountID)
+	if !ok || !binding.enabled {
+		return false, nil
+	}
+
+	// 画像一致性的**唯一**落点。放在这里而不是放在网关，是因为网关只覆盖客户流量：
+	// 账号健康检查、计划探测、额度探测都不走网关，此前它们拿的是
+	// service.defaultFingerprint 那份陈旧值（Linux / 0.94.0 / v24.3.0 / "(external, cli)"），
+	// 与客户流量的 MacOS / 0.112.1 / v26.3.0 / "(external, sdk-cli)" 不是同一台设备。
+	// 上游看到的就是一个账号在两台机器之间跳。详见 mirasim.ApplyCanonicalIdentityHeaders。
+	//
+	// 刻意放在 MirasimSigningDisabled 检查**之前**：/auth/refresh 与 /auth/referral
+	// 不签名，但它们同样是这个账号发出去的请求，身份不该在那里露出第二张脸。
+	mirasim.ApplyCanonicalIdentityHeaders(req.Header)
+
 	// An explicitly marked control-plane call (auth server: /auth/refresh,
 	// /auth/referral) authenticates with the plain access-token bearer its caller
 	// set. Signing would overwrite that bearer with the relay-issued device
 	// ticket, which the auth server never issued. The caller still picks the
 	// proxy and TLS profile, so the egress is unchanged.
 	if service.MirasimSigningDisabled(ctx) {
-		return false, nil
-	}
-	binding, ok := m.binding(ctx, accountID)
-	if !ok || !binding.enabled {
 		return false, nil
 	}
 
@@ -172,6 +189,15 @@ func (m *mirasimUpstream) sign(req *http.Request, proxyURL string, accountID int
 	if err != nil {
 		return false, err
 	}
+
+	// body 层身份收敛（metadata.user_id）。**必须在 SignAndSeal 之前**：签名覆盖 body
+	// （ccore.Sign 把 body 一起哈希），签完再改就是签名与上线字节不一致 → 403。
+	// 与上面的 ApplyCanonicalIdentityHeaders 同在一个函数体，所以"头和 body 说的是
+	// 同一台设备"是结构上成立的，不是两处各自维护。改写后的字节同时装回了 req
+	// （Body/ContentLength/GetBody），下面签的就是这一份。
+	// 为什么不复用网关里已有的那套 user_id 重写、以及它为什么对 mirasim 从未执行过：
+	// 见 mirasim_identity_body.go 顶部。
+	body = applyMirasimCanonicalUserID(req, body, prepared)
 
 	// Upstream auth is the device ticket (or the access token when no ticket
 	// could be minted) — and it MUST be the same string that goes into the

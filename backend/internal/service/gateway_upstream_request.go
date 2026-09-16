@@ -11,7 +11,6 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
-	"github.com/Wei-Shaw/sub2api/internal/pkg/mirasim"
 	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
@@ -205,11 +204,12 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 	// account's version jump between customers, and go backwards when the next
 	// customer is on an older build. Last in the chain so an account-level
 	// header override cannot reintroduce a divergent version.
-	if IsMirasimAccount(account) {
-		for k, v := range mirasim.CanonicalIdentityHeaders() {
-			setHeaderRaw(req.Header, resolveWireCasing(k), v)
-		}
-	}
+	// mirasim 的身份头**不在这里写**。它的唯一落点是传输层的签名收口
+	// （repository.mirasimUpstream.sign → mirasim.ApplyCanonicalIdentityHeaders），
+	// 因为网关只覆盖客户流量：账号健康检查、计划探测、额度探测都不走这里。
+	// 曾经两条网关路径各挂一份，于是那些不走网关的请求拿到了 defaultFingerprint
+	// 的陈旧值（Linux / 0.94.0 / v24.3.0），同一个账号在上游看来是两台设备。
+	// 多一个调用点就多一条将来会被漏掉的路径，所以这里刻意不留。
 
 	// === DEBUG: 打印上游转发请求（headers + body 摘要），与 CLIENT_ORIGINAL 对比 ===
 	s.debugLogGatewaySnapshot("UPSTREAM_FORWARD", req.Header, body, map[string]string{

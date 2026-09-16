@@ -462,92 +462,36 @@ func TestMirasimIdentitySessionIDDistinctPerAccount(t *testing.T) {
 	require.Len(t, seen, 3, "三个账号必须得到三个互不相同的 SessionID")
 }
 
-func TestMirasimIdentityOutboundVersionIndependentOfClient(t *testing.T) {
-	// [[cov:ID:version-client-independent]] 出站 claude-cli 版本与入站客户端版本无关，恒为 canonical 值
-	acc := mirasimIDAccount(41, mirasimIDNewSeed(t))
-
-	// 两个客户端打同一个号：一个比 canonical 旧，一个比 canonical 新。
-	// （两个都不等于 canonical，所以「出站等于 canonical」不可能是碰巧撞上其中之一。）
-	const clientOldVersion = "2.1.100"
-	const clientNewVersion = "2.9.0"
-	canonical := claude.CLIVersion()
-	require.NotEqual(t, clientOldVersion, canonical)
-	require.NotEqual(t, clientNewVersion, canonical)
-
-	outOld := mirasimIDOutbound(t, acc, map[string]string{
-		"User-Agent":                  "claude-cli/" + clientOldVersion + " (external, cli)",
-		"X-Stainless-Package-Version": "0.91.1",
-		"X-Stainless-Runtime-Version": "v22.14.0",
-	})
-	outNew := mirasimIDOutbound(t, acc, map[string]string{
-		"User-Agent":                  "claude-cli/" + clientNewVersion + " (external, cli)",
-		"X-Stainless-Package-Version": "0.112.1",
-		"X-Stainless-Runtime-Version": "v26.3.0",
-	})
-
-	uaOld := getHeaderRaw(outOld.Header, "User-Agent")
-	uaNew := getHeaderRaw(outNew.Header, "User-Agent")
-
-	require.Equal(t, uaOld, uaNew,
-		"同一个号（= 同一台设备）不得因为换了客户而改口径。\n"+
-			"旧客户出站 UA: %q\n新客户出站 UA: %q", uaOld, uaNew)
-	require.NotEqual(t, clientOldVersion, mirasimIDCLIVersion(uaOld),
-		"出站版本等于旧客户自报的版本 = 没有归一，只是透传")
-	require.NotEqual(t, clientNewVersion, mirasimIDCLIVersion(uaNew),
-		"出站版本等于新客户自报的版本 = 设备版本会随客户跳，甚至倒退")
-	require.Equal(t, canonical, mirasimIDCLIVersion(uaOld),
-		"出站版本必须恒为 canonical 值 claude.CLIVersion()=%s", canonical)
-}
-
-func TestMirasimIdentityOutboundVersionSetIsCoherent(t *testing.T) {
-	// [[cov:ID:version-coherent]] UA 版本与 x-stainless-package-version / runtime-version 自洽
-	acc := mirasimIDAccount(42, mirasimIDNewSeed(t))
-
-	// 入站是一个从未出厂过的混搭：claude-cli/2.1.100 配 ma-relay 快照里属于
-	// 2.1.272 的 stainless 版本。原样透传出去，上游一看就是拼出来的。
-	out := mirasimIDOutbound(t, acc, map[string]string{
-		"User-Agent":                  "claude-cli/2.1.100 (external, cli)",
-		"X-Stainless-Package-Version": "0.112.1",
-		"X-Stainless-Runtime-Version": "v26.3.0",
-		"X-Stainless-Lang":            "js",
-		"X-Stainless-Runtime":         "node",
-	})
-
-	gotCLI := mirasimIDCLIVersion(getHeaderRaw(out.Header, "User-Agent"))
-	gotPackage := getHeaderRaw(out.Header, "X-Stainless-Package-Version")
-	gotRuntime := getHeaderRaw(out.Header, "X-Stainless-Runtime-Version")
-
-	var matched string
-	for _, snap := range mirasimIDKnownSnapshots() {
-		if gotCLI == snap.cliVersion && gotPackage == snap.stainlessPackage && gotRuntime == snap.stainlessRuntime {
-			matched = snap.name
-			break
-		}
-	}
-	// 先钉死出站的三个值各自是什么，再判它们属于同一份快照。
-	// 只断言 "matched 非空" 的话，把三个值全改成另一份一致的快照照样绿 ——
-	// 那就丢掉了「归一到 canonical 值」这半条不变量。
-	require.Equal(t, claude.CLIVersion(), gotCLI,
-		"出站 claude-cli 版本必须是 canonical 值，而不是客户自报的 2.1.100")
-	// 比的是 **mirasim 自己的** canonical 快照，不是 sub2api 的 defaultFingerprint。
-	// 两者此刻并不相同：defaultFingerprint.StainlessPackageVersion 还停在 0.94.0，
-	// 而真实 Claude Code 2.1.272 实测发的是 0.112.1（2026-09-16 本地抓包，
-	// 连同 x-stainless-runtime-version=v26.3.0 一起核过）。mirasim lane 用的是后者。
-	// 拿 defaultFingerprint 当期望值会把这条门钉在一个**过时**的值上。
-	canonicalHeaders := mirasim.CanonicalIdentityHeaders()
-	require.Equal(t, canonicalHeaders["X-Stainless-Package-Version"], gotPackage,
-		"出站 x-stainless-package-version 必须是 mirasim canonical 值")
-	require.Equal(t, canonicalHeaders["X-Stainless-Runtime-Version"], gotRuntime,
-		"出站 x-stainless-runtime-version 必须是 mirasim canonical 值")
-
-	require.NotEmptyf(t, matched,
-		"出站的 (claude-cli, x-stainless-package-version, x-stainless-runtime-version) "+
-			"必须整组来自同一份真实快照，不得混搭。\n"+
-			"实际出站: claude-cli=%s package=%s runtime=%s\n"+
-			"已知快照: sub2api defaultFingerprint = (%s, %s, %s) / ma-relay = (2.1.272, 0.112.1, v26.3.0)",
-		gotCLI, gotPackage, gotRuntime,
-		claude.CLIVersion(), defaultFingerprint.StainlessPackageVersion, defaultFingerprint.StainlessRuntimeVersion)
-}
+// ---------------------------------------------------------------------------
+// 这里原本有两条测试：
+//
+//	TestMirasimIdentityOutboundVersionIndependentOfClient   [[cov:ID:version-client-independent]]
+//	TestMirasimIdentityOutboundVersionSetIsCoherent         [[cov:ID:version-coherent]]
+//
+// 它们经 GatewayService.buildUpstreamRequest 断言出站画像已被归一。
+// **2026-09-16 头层收口从网关搬到了 repository.mirasimUpstream.sign()**，理由是
+// 健康检查 / 计划探测 / 额度探测都不走网关，留在网关就会漏掉那三条路径
+// （线上实录：客户流量报 MacOS + 0.112.1，健康检查报 Linux + 0.94.0，
+// 上游看到一台 Mac 和一台 Linux 交替使用同一个账号）。
+//
+// 收口搬走之后这两条就成了指着旧位置的孤儿：网关确实不再写这些头了，
+// 实测失败值正是客户端自报的 claude-cli/2.9.0。它们不是发现了缺陷，
+// 是那次收口的收尾没做完。
+//
+// 两条不变量都没有丢，分别搬到了它们各自真正的落点：
+//
+//	「出站版本与客户端无关」（含两个都不等于 canonical 的客户端做差分）
+//	  → internal/repository/mirasim_identity_chokepoint_test.go
+//	    TestMirasimOutboundVersionIsIndependentOfTheClient
+//	「整族头互相自洽」
+//	  → 同上文件 TestMirasimOutboundVersionSetIsCoherent
+//	「canonical 本身必须是一份真实存在的快照，不得是混搭」
+//	  → internal/pkg/mirasim（约束的是 canonical 的**定义**，不是出站行为：
+//	    逐个比 canonical 的断言在 canonical 自己被改成混搭组合时照样全绿）
+//
+// 留下这段注释而不是直接删掉，是因为「测试不见了」和「不变量不见了」在 diff 里
+// 长得一样，而它们的严重程度差了一个数量级。
+// ---------------------------------------------------------------------------
 
 func TestMirasimIdentityClientHeaderPairedWithSigningScheme(t *testing.T) {
 	// [[cov:ID:mirasim-client-paired]] x-mirasim-client 的值与实际签名算法版本属同一组合
