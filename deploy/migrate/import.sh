@@ -120,7 +120,7 @@ update proxies
 SQL
 
 AFTER=$(docker compose exec -T postgres psql -U "${POSTGRES_USER:-sub2api}" -d "${POSTGRES_DB:-sub2api}" -t -A -c \
-  "select host||':'||port::text||' x'||count(*) from proxies group by 1,2" | tr '\n' ' ')
+  "select host||':'||port::text||' x'||count(*) from proxies group by host, port" | tr '\n' ' ')
 echo "      改写后: $AFTER"
 
 # ---------------------------------------------------------------------------
@@ -147,35 +147,52 @@ done
 # 让面板显示一个从未在这台机器上测到过的数字。
 if [ -s "$SRC/resin-config/subscriptions.json" ]; then
   echo "      恢复订阅源 ..."
-  python3 - "$SRC/resin-config/subscriptions.json" > "$WORK/subs.ndjson" <<'PY'
+  # 输出 `<name>\t<json>`：name 单独一列，循环里就不必再起一个 python 去解析。
+  # 第一版在循环里用 `python3 -c '...'` 取 name，在 setsid+nohup+ssh 的多层嵌套下
+  # 引号被吃掉，python 把 `-c` 当成了文件名（FileNotFoundError: .../-c）。
+  # 少一层解析就少一层引号地狱。
+  python3 - "$SRC/resin-config/subscriptions.json" > "$WORK/subs.tsv" <<'PY'
 import json, sys
 WRITABLE = {"name", "url", "source_type", "enabled", "update_interval",
             "ephemeral", "ephemeral_node_evict_delay", "incremental_alive_nodes", "content"}
 d = json.load(open(sys.argv[1]))
 items = d.get("items") if isinstance(d, dict) else d
 for s in (items or []):
-    print(json.dumps({k: v for k, v in s.items() if k in WRITABLE and v not in (None, "")}))
+    body = {k: v for k, v in s.items() if k in WRITABLE and v not in (None, "")}
+    name = body.get("name", "")
+    if not name:
+        continue
+    # name 里有 tab 或换行会破坏这个格式；resin 的源名不允许这些字符，
+    # 但真遇到就跳过并让计数对不上，而不是产出一行错位的数据。
+    if "\t" in name or "\n" in name:
+        print(f"跳过名字含制表符/换行的订阅源: {name!r}", file=sys.stderr)
+        continue
+    print(name + "\t" + json.dumps(body, ensure_ascii=False))
 PY
   SUB_OK=0; SUB_SKIP=0; SUB_FAIL=0
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    name=$(printf '%s' "$line" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("name",""))')
-    # 幂等:已存在同名源就跳过,不重复创建(重复创建会让同一批节点被计两次)
-    if docker compose exec -T resin wget -qO- --header="Authorization: Bearer $RESIN_TOKEN" \
-         http://127.0.0.1:2260/api/v1/subscriptions 2>/dev/null \
-       | grep -qF "\"name\":\"$name\""; then
+  # 已存在的源名只查一次。第一版在循环里每条都重新拉一遍全量列表，
+  # 20 个源就是 20 次全量请求（而列表有 1.2MB）。
+  EXISTING_NAMES=$(docker compose exec -T resin wget -qO- \
+      --header="Authorization: Bearer $RESIN_TOKEN" \
+      http://127.0.0.1:2260/api/v1/subscriptions 2>/dev/null \
+    | tr ',' '\n' | grep -oE '"name":"[^"]*"' | cut -d'"' -f4 || true)
+
+  while IFS=$'\t' read -r name body; do
+    [ -n "$name" ] && [ -n "$body" ] || continue
+    if printf '%s\n' "$EXISTING_NAMES" | grep -qxF "$name"; then
       SUB_SKIP=$((SUB_SKIP+1)); continue
     fi
-    if printf '%s' "$line" | docker compose exec -T resin sh -c \
-        "wget -qO- --post-data=\"\$(cat)\" \
-         --header='Authorization: Bearer $RESIN_TOKEN' \
-         --header='content-type: application/json' \
-         http://127.0.0.1:2260/api/v1/subscriptions" >/dev/null 2>&1; then
+    # body 从 stdin 进，不进命令行 —— 它含 URL 与引号，拼进命令行迟早出事。
+    if printf '%s' "$body" | docker compose exec -T resin \
+        wget -qO- --post-file=- \
+          --header="Authorization: Bearer $RESIN_TOKEN" \
+          --header='content-type: application/json' \
+          http://127.0.0.1:2260/api/v1/subscriptions >/dev/null 2>&1; then
       SUB_OK=$((SUB_OK+1))
     else
       SUB_FAIL=$((SUB_FAIL+1)); echo "        失败: $name" >&2
     fi
-  done < "$WORK/subs.ndjson"
+  done < "$WORK/subs.tsv"
   echo "      订阅源: 新建 $SUB_OK / 已存在跳过 $SUB_SKIP / 失败 $SUB_FAIL"
   [ "$SUB_FAIL" -eq 0 ] || echo "      警告: 有订阅源没恢复，出口容量会不足" >&2
 fi

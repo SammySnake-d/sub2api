@@ -106,6 +106,19 @@ services:
     image: postgres:18-alpine
     restart: unless-stopped
     environment:
+      # **PGDATA 必须显式设置,否则容器直接拒绝启动。**
+      #
+      # postgres:18-alpine 默认 PGDATA=/var/lib/postgresql/18/docker(在镜像自己声明的
+      # 匿名卷 /var/lib/postgresql 内)。只把命名卷挂到 /var/lib/postgresql/data 的话,
+      # 18+ 的入口脚本会检测到"挂载点在那儿但不是我要用的目录",**报 Error 并退出**,
+      # 容器进入无限 restart —— 实测 2026-09-16,在真机上撞到过。
+      #
+      # 更隐蔽的是 18 之前的版本:那时它不报错,只是安静地把数据写进容器可写层,
+      # 于是 compose down/up 之后 initdb 重新初始化,用户和密码全丢。
+      #
+      # 与本仓 deploy/docker-compose.yml:252 的处理方式保持一致(那边踩过同一个坑),
+      # 不另造第二种解法。
+      PGDATA: /var/lib/postgresql/data
       POSTGRES_DB: ${POSTGRES_DB:-sub2api}
       POSTGRES_USER: ${POSTGRES_USER:-sub2api}
       # 没有默认值是刻意的。上游曾经把 database.password 的默认值设成 "postgres",

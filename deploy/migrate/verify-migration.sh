@@ -68,8 +68,12 @@ echo " 2. settings 表逐项对照（**DB 存值优先于 config.yaml，这里�
 echo "=============================================================="
 # 按 key 排序后整表哈希，先看整体；不同再逐项列差异。
 # 只比 key/value，不比 id/时间戳 —— 后者迁移后必然不同且无意义。
-OLD_SET=$(old_psql "select key||'='||coalesce(value,'') from settings order by key")
-NEW_SET=$(new_psql "select key||'='||coalesce(value,'') from settings order by key")
+# 排序在 shell 侧用 `sort` 做，**不用 SQL 的 order by**。
+# 踩过的坑：旧环境是裸机 PG(en_US.UTF-8 collation)、新环境是 alpine 容器(C collation)，
+# 同一批数据 `order by key` 出来的顺序不同，diff 就把一份逐字相同的配置报成"全表差异"。
+# 那是假阳性，而假阳性比漏报更糟——它会让人学会忽略这个门。
+OLD_SET=$(old_psql "select key||'='||coalesce(value,'') from settings" | LC_ALL=C sort)
+NEW_SET=$(new_psql "select key||'='||coalesce(value,'') from settings" | LC_ALL=C sort)
 if [ -z "$OLD_SET" ] && [ -z "$NEW_SET" ]; then
   note_diff "两边 settings 都读不到 —— 无法证明一致"
 elif [ "$OLD_SET" = "$NEW_SET" ]; then
@@ -100,7 +104,7 @@ done
 o=$(old_psql "select md5(string_agg(md5(credentials->>'mirasim_device_seed'), ',' order by id)) from accounts where credentials ? 'mirasim_device_seed'")
 n=$(new_psql "select md5(string_agg(md5(credentials->>'mirasim_device_seed'), ',' order by id)) from accounts where credentials ? 'mirasim_device_seed'")
 if [ "$o" = "$n" ] && [ -n "$o" ]; then
-  ok "设备根指纹一致（$o）—— 是同一批设备，不只是数量相同"
+  ok "设备根指纹一致（${o}）—— 是同一批设备，不只是数量相同"
 else
   note_diff "设备根指纹不一致: 旧 $o vs 新 $n —— 上游会认为这是一批全新设备"
 fi
