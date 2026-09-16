@@ -1,0 +1,423 @@
+{
+ "_note": "S4 双侧标定注入清单 —— acceptance-lint.py --calibrate --execute 的输入。每条 find/replace 都在真源码上跑红过一次才写进来；阴性 = 同一命令的基线那一次运行（把 switch 里那一个开关改回去 = 什么都不注入）。写成 JSON 而不是 YAML,是因为 find/replace 里有 tab 与换行,JSON 的转义是唯一的,YAML 块标量不是。",
+ "gates": [
+  {
+   "id": "C1",
+   "positive": [
+    {
+     "case": "C1-pos-sig-ignores-body",
+     "file": "backend/internal/pkg/mirasim/device.go",
+     "find": "\tsig, err := ccore.Sign(d.private.Seed(), canonical, meta, body)",
+     "replace": "\tsig, err := ccore.Sign(d.private.Seed(), canonical, meta, nil)",
+     "expect_text": "signature is not covering the body"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C1-pos-sig-ignores-body-neg",
+     "differential_of": "C1-pos-sig-ignores-body",
+     "switch": "ccore.Sign 的第四个实参由 nil 改回 body（签名重新覆盖请求体）"
+    }
+   ]
+  },
+  {
+   "id": "C2",
+   "positive": [
+    {
+     "case": "C2-pos-redirect-mark-dropped",
+     "file": "backend/internal/repository/mirasim_upstream.go",
+     "find": "\t*req = *req.WithContext(service.WithHTTPUpstreamRedirectsDisabled(ctx))\n\tctx = req.Context()",
+     "replace": "\tctx = req.Context()",
+     "expect_text": "the decorator did not mark the request"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C2-pos-redirect-mark-dropped-neg",
+     "differential_of": "C2-pos-redirect-mark-dropped",
+     "switch": "sign() 里那一行 WithHTTPUpstreamRedirectsDisabled 标记补回来"
+    }
+   ]
+  },
+  {
+   "id": "C4",
+   "positive": [
+    {
+     "case": "C4-pos-cache-control-stripped-from-every-tool",
+     "file": "backend/internal/service/gateway_tool_rewrite.go",
+     "find": "\t\tif !isDeferredLoadingTool(tool) || !tool.Get(\"cache_control\").Exists() {",
+     "replace": "\t\tif !tool.Get(\"cache_control\").Exists() {",
+     "expect_text": "必须是字节 no-op"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C4-pos-cache-control-stripped-from-every-tool-neg",
+     "differential_of": "C4-pos-cache-control-stripped-from-every-tool",
+     "switch": "stripDeferredToolCacheControl 的 isDeferredLoadingTool 前置条件补回来"
+    }
+   ]
+  },
+  {
+   "id": "C5",
+   "positive": [
+    {
+     "case": "C5-pos-body-map-roundtrip-on-exit",
+     "file": "backend/internal/service/gateway_request.go",
+     "find": "\tres, err := sjson.SetRawBytes(body, \"messages\", buildJSONArrayRaw(out))\n\tif err != nil {\n\t\treturn body\n\t}\n\treturn res",
+     "replace": "\tres, err := sjson.SetRawBytes(body, \"messages\", buildJSONArrayRaw(out))\n\tif err != nil {\n\t\treturn body\n\t}\n\tvar roundTrip map[string]any\n\tif json.Unmarshal(res, &roundTrip) == nil {\n\t\tif again, marshalErr := json.Marshal(roundTrip); marshalErr == nil {\n\t\t\treturn again\n\t\t}\n\t}\n\treturn res",
+     "expect_text": "会把对象 key 按字母序重排"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C5-pos-body-map-roundtrip-on-exit-neg",
+     "differential_of": "C5-pos-body-map-roundtrip-on-exit",
+     "switch": "StripEmptyTextBlocks 出口处新增的整体 map 往返序列化去掉"
+    }
+   ]
+  },
+  {
+   "id": "C6",
+   "positive": [
+    {
+     "case": "C6-pos-history-messages-reserialised",
+     "file": "backend/internal/service/gateway_request.go",
+     "find": "\t\tcleaned, changed := stripEmptyTextBlocksFromRawContent(raw, \"content\")\n\t\tout[i] = cleaned",
+     "replace": "\t\tcleaned, changed := stripEmptyTextBlocksFromRawContent(raw, \"content\")\n\t\tvar oneMsg any\n\t\tif json.Unmarshal(cleaned, &oneMsg) == nil {\n\t\t\tif again, marshalErr := json.Marshal(oneMsg); marshalErr == nil {\n\t\t\t\tcleaned = again\n\t\t\t}\n\t\t}\n\t\tout[i] = cleaned",
+     "expect_text": "必须以第 1 轮的为字节前缀（纯追加）"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C6-pos-history-messages-reserialised-neg",
+     "differential_of": "C6-pos-history-messages-reserialised",
+     "switch": "逐条消息新增的 json 往返序列化去掉（历史消息回到原字节）"
+    }
+   ]
+  },
+  {
+   "id": "C8",
+   "positive": [
+    {
+     "case": "C8-pos-session-id-never-persisted",
+     "file": "backend/internal/pkg/mirasim/runtime.go",
+     "find": "\t\t_ = persist(ctx, c.accountID, map[string]any{ExtraSessionID: c.sessionID})",
+     "replace": "\t\t_ = ctx",
+     "expect_text": "否则重启就丢"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C8-pos-session-id-never-persisted-neg",
+     "differential_of": "C8-pos-session-id-never-persisted",
+     "switch": "ensureSessionIDLocked 里的 persist 调用补回来（session id 重新落库）"
+    }
+   ]
+  },
+  {
+   "id": "C9",
+   "positive": [
+    {
+     "case": "C9-pos-stainless-package-version-drift",
+     "file": "backend/internal/pkg/mirasim/fingerprint.go",
+     "find": "\tcanonicalStainlessPackageVersion = \"0.112.1\"",
+     "replace": "\tcanonicalStainlessPackageVersion = \"0.94.0\"",
+     "expect_text": "必须整组来自同一份真实快照，不得混搭"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C9-pos-stainless-package-version-drift-neg",
+     "differential_of": "C9-pos-stainless-package-version-drift",
+     "switch": "canonicalStainlessPackageVersion 由 0.94.0 改回 0.112.1"
+    }
+   ]
+  },
+  {
+   "id": "C10",
+   "positive": [
+    {
+     "case": "C10-pos-ja3-cipher-drift",
+     "file": "backend/internal/pkg/tlsfingerprint/mirasim_profile.go",
+     "find": "0xc027, // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+     "replace": "0xc028, // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+     "expect_text": "JA3 string mismatch"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C10-pos-ja3-cipher-drift-neg",
+     "differential_of": "C10-pos-ja3-cipher-drift",
+     "switch": "那一个 cipher suite 码点由 0xc028 改回 0xc027"
+    }
+   ]
+  },
+  {
+   "id": "C11",
+   "positive": [
+    {
+     "case": "C11-pos-claude-window-dropped",
+     "file": "backend/internal/service/mirasim_scheduling.go",
+     "find": "\t\treturn append(windows, MirasimWindow7dClaude)",
+     "replace": "\t\treturn windows",
+     "expect_text": "opus 请求消耗的窗口集合变了"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C11-pos-claude-window-dropped-neg",
+     "differential_of": "C11-pos-claude-window-dropped",
+     "switch": "MirasimWindowsForModel 的 claude 分支改回追加 MirasimWindow7dClaude"
+    }
+   ]
+  },
+  {
+   "id": "C13",
+   "positive": [
+    {
+     "case": "C13-pos-503-cools-the-account",
+     "file": "backend/internal/service/mirasim_scheduling.go",
+     "find": "\tcase http.StatusServiceUnavailable, statusMirasimClientClosedRequest:\n\t\treturn MirasimActionRequestScoped",
+     "replace": "\tcase statusMirasimClientClosedRequest:\n\t\treturn MirasimActionRequestScoped\n\tcase http.StatusServiceUnavailable:\n\t\treturn MirasimActionWindowCooldown",
+     "expect_text": "503 改写了账号状态"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C13-pos-503-cools-the-account-neg",
+     "differential_of": "C13-pos-503-cools-the-account",
+     "switch": "MirasimClassifyStatus 对 503 的归类由 window_cooldown 改回 request_scoped"
+    }
+   ]
+  },
+  {
+   "id": "C14",
+   "positive": [
+    {
+     "case": "C14-pos-499-becomes-failover",
+     "file": "backend/internal/service/gateway_forward.go",
+     "find": "\tcase 401, 403, 429, 529:\n\t\treturn true",
+     "replace": "\tcase 401, 403, 429, 499, 529:\n\t\treturn true",
+     "expect_text": "499 被判成可换号重试的话"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C14-pos-499-becomes-failover-neg",
+     "differential_of": "C14-pos-499-becomes-failover",
+     "switch": "shouldFailoverUpstreamError 的可换号集合里去掉 499"
+    }
+   ]
+  },
+  {
+   "id": "C15",
+   "positive": [
+    {
+     "case": "C15-pos-mirasim-branch-catches-plain-anthropic",
+     "file": "backend/internal/service/mirasim_scheduling.go",
+     "find": "\tif s == nil || account == nil || !IsMirasimAccount(account) {\n\t\treturn false, false\n\t}",
+     "replace": "\tif s == nil || account == nil {\n\t\treturn false, false\n\t}",
+     "expect_text": "must stay on the shared path"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C15-pos-mirasim-branch-catches-plain-anthropic-neg",
+     "differential_of": "C15-pos-mirasim-branch-catches-plain-anthropic",
+     "switch": "handleMirasimUpstreamError 的 IsMirasimAccount 前置守卫补回来"
+    }
+   ]
+  },
+  {
+   "id": "C16",
+   "positive": [
+    {
+     "case": "C16-pos-unverified-seed-imported-anyway",
+     "file": "backend/internal/handler/admin/account_mirasim_import.go",
+     "find": "\t\tdeviceID, verifyErr := verifyMirasimDeviceIdentity(item.DeviceSeed)\n\t\tif verifyErr != nil {\n\t\t\tresult.recordFailure(entry.Index, name, verifyErr.Error())\n\t\t\tcontinue\n\t\t}",
+     "replace": "\t\tdeviceID, verifyErr := verifyMirasimDeviceIdentity(item.DeviceSeed)\n\t\tif verifyErr != nil {\n\t\t\tdeviceID = item.DeviceSeed\n\t\t}",
+     "expect_text": "want 3/1/0/0"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C16-pos-unverified-seed-imported-anyway-neg",
+     "differential_of": "C16-pos-unverified-seed-imported-anyway",
+     "switch": "导入器对验签失败的处理由放行改回 recordFailure 硬失败"
+    }
+   ]
+  },
+  {
+   "id": "C18",
+   "positive": [
+    {
+     "case": "C18-pos-cache-read-billed-at-input-price",
+     "file": "backend/internal/service/billing_service.go",
+     "find": "\tbd.CacheReadCost = float64(tokens.CacheReadTokens) * cacheReadPrice",
+     "replace": "\tbd.CacheReadCost = float64(tokens.CacheReadTokens) * inputPrice",
+     "expect_text": "折扣方向反了，命中率越高亏越多"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C18-pos-cache-read-billed-at-input-price-neg",
+     "differential_of": "C18-pos-cache-read-billed-at-input-price",
+     "switch": "CacheReadCost 的单价由 inputPrice 改回 cacheReadPrice"
+    }
+   ]
+  },
+  {
+   "id": "C21",
+   "positive": [
+    {
+     "case": "C21-pos-fable-window-writes-claude-scope",
+     "file": "backend/internal/service/mirasim_scheduling.go",
+     "find": "\tcase MirasimWindow7dFable:\n\t\treturn mirasimFable7dRateLimitKey, true",
+     "replace": "\tcase MirasimWindow7dFable:\n\t\treturn mirasimClaude7dRateLimitKey, true",
+     "expect_text": "FAIL: TestMirasimKnownWindowTokenWritesItsScope"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C21-pos-fable-window-writes-claude-scope-neg",
+     "differential_of": "C21-pos-fable-window-writes-claude-scope",
+     "switch": "mirasimWindowScope 对 7d_fable 的 scope 由 claude 键改回 fable 键"
+    }
+   ]
+  },
+  {
+   "id": "C22",
+   "positive": [
+    {
+     "case": "C22-pos-unknown-window-alarm-silenced",
+     "file": "backend/internal/service/mirasim_scheduling.go",
+     "find": "\t\t\tslog.Warn(\"mirasim_unrecognized_quota_window_exhausted\", attrs...)\n\t\t\tcontinue",
+     "replace": "\t\t\t_ = attrs\n\t\t\tcontinue",
+     "expect_text": "no unrecognized-window record was emitted"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C22-pos-unknown-window-alarm-silenced-neg",
+     "differential_of": "C22-pos-unknown-window-alarm-silenced",
+     "switch": "reportMirasimUnknownWindows 里那条 slog.Warn 记录补回来"
+    }
+   ]
+  },
+  {
+   "id": "C32",
+   "positive": [
+    {
+     "case": "C32-pos-ua-pattern-rejects-2xx-client",
+     "file": "backend/internal/service/claude_code_validator.go",
+     "find": "\tclaudeCodeUAPattern = regexp.MustCompile(`(?i)^claude-cli/\\d+\\.\\d+\\.\\d+`)",
+     "replace": "\tclaudeCodeUAPattern = regexp.MustCompile(`(?i)^claude-cli/1\\.\\d+\\.\\d+`)",
+     "expect_text": "claudeCodeUAPattern 必须匹配实抓 UA"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C32-pos-ua-pattern-rejects-2xx-client-neg",
+     "differential_of": "C32-pos-ua-pattern-rejects-2xx-client",
+     "switch": "claudeCodeUAPattern 的主版本段由 1 改回通配数字"
+    }
+   ]
+  },
+  {
+   "id": "C33",
+   "positive": [
+    {
+     "case": "C33-pos-system-prompt-check-removed",
+     "file": "backend/internal/service/claude_code_validator.go",
+     "find": "\t// 4.1 检查 system prompt 相似度\n\tif !v.hasClaudeCodeSystemPrompt(body) {\n\t\treturn false\n\t}",
+     "replace": "\t// 4.1 检查 system prompt 相似度\n\t_ = v.hasClaudeCodeSystemPrompt(body)",
+     "expect_text": "UA 对但 body 里没有 system，仍必须被拒"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C33-pos-system-prompt-check-removed-neg",
+     "differential_of": "C33-pos-system-prompt-check-removed",
+     "switch": "Validate 第 4.1 步 system prompt 相似度的 return false 补回来"
+    }
+   ]
+  },
+  {
+   "id": "C34",
+   "positive": [
+    {
+     "case": "C34-pos-claimed-plan-not-byte-identical",
+     "file": "backend/internal/handler/admin/account_mirasim_import.go",
+     "find": "\t\textra[mirasim.ExtraPlanClaimed] = item.Plan",
+     "replace": "\t\textra[mirasim.ExtraPlanClaimed] = strings.ToUpper(item.Plan)",
+     "expect_text": "want the source plan"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C34-pos-claimed-plan-not-byte-identical-neg",
+     "differential_of": "C34-pos-claimed-plan-not-byte-identical",
+     "switch": "extra 里的声称档位由 strings.ToUpper(item.Plan) 改回 item.Plan"
+    }
+   ]
+  },
+  {
+   "id": "C35",
+   "positive": [
+    {
+     "case": "C35-pos-probe-leaves-through-default-egress",
+     "file": "backend/internal/service/account_mirasim_plan_probe.go",
+     "find": "\t\tproxyURL = account.Proxy.URL()",
+     "replace": "\t\tproxyURL = \"\"",
+     "expect_text": "want the account's own Proxy.URL()"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C35-pos-probe-leaves-through-default-egress-neg",
+     "differential_of": "C35-pos-probe-leaves-through-default-egress",
+     "switch": "proxyURL 由空串改回 account.Proxy.URL()"
+    }
+   ]
+  },
+  {
+   "id": "C36",
+   "positive": [
+    {
+     "case": "C36-pos-claim-overwritten-by-authoritative",
+     "file": "backend/internal/service/account_mirasim_plan_probe.go",
+     "find": "\t\tClaimedPlan:    claimed,",
+     "replace": "\t\tClaimedPlan:    authoritative,",
+     "expect_text": "want max/plus"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C36-pos-claim-overwritten-by-authoritative-neg",
+     "differential_of": "C36-pos-claim-overwritten-by-authoritative",
+     "switch": "快照的 ClaimedPlan 由 authoritative 改回 claimed"
+    }
+   ]
+  },
+  {
+   "id": "C38",
+   "positive": [
+    {
+     "case": "C38-pos-empty-current-plan-counts-as-reading",
+     "file": "backend/internal/service/account_mirasim_plan_probe.go",
+     "find": "\tif referral == nil || strings.TrimSpace(referral.CurrentPlan) == \"\" {",
+     "replace": "\tif referral == nil {",
+     "expect_text": "an unreadable shape must never count as a reading"
+    }
+   ],
+   "negative": [
+    {
+     "case": "C38-pos-empty-current-plan-counts-as-reading-neg",
+     "differential_of": "C38-pos-empty-current-plan-counts-as-reading",
+     "switch": "referral 守卫里「CurrentPlan 为空」的那一半条件补回来"
+    }
+   ]
+  }
+ ]
+}

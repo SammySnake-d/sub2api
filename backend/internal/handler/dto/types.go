@@ -204,6 +204,101 @@ type AdminGroup struct {
 	SortOrder int `json:"sort_order"`
 }
 
+// ---------------------------------------------------------------------------
+// mirasim 额度 + 套餐（账号 DTO 契约）
+// ---------------------------------------------------------------------------
+
+// MirasimQuotaWindow is one usage window of a mirasim account.
+//
+// Every numeric field is a POINTER on purpose: "上游没给这个数" and "上游给的是 0"
+// are different facts, and collapsing them is the single mistake that turns an
+// unknown budget into a full green bar — i.e. displays "没探到" as "额度充足".
+// nil means UNKNOWN and must render as unknown, never as 0.
+type MirasimQuotaWindow struct {
+	// Name is the upstream window token VERBATIM ("5h", "7d", ...). It is never
+	// mapped, normalized or filtered here: an unrecognized token has to reach
+	// the console as itself, because silently dropping a window is exactly how a
+	// multi-day exhaustion gets downgraded to a seconds-scale cooldown
+	// (service/mirasim_scheduling.go, mirasimWindowTokenEvidence spells out the
+	// whole silent failure chain). A renderer that does not know a token must
+	// show it with a neutral style, not skip it.
+	Name string `json:"name"`
+	// Used and Budget are absolute counts exactly as the upstream reported them.
+	// Both are nil whenever Source is "headers": response headers carry a ratio
+	// only, and back-deriving counts from a ratio invents data.
+	Used   *float64 `json:"used"`
+	Budget *float64 `json:"budget"`
+	// Utilization is a 0..1 FRACTION, not a percent, and it MAY EXCEED 1 —
+	// "1.02" is a real observed value from this upstream meaning 102% of budget
+	// consumed. A progress bar must clamp its WIDTH, not the number, and a
+	// percent display must multiply by 100 itself.
+	// nil when it could not be derived (no budget and no upstream ratio).
+	Utilization *float64 `json:"utilization"`
+	// ResetAt is when this window rolls over. nil = unknown.
+	ResetAt *time.Time `json:"reset_at"`
+}
+
+// MirasimQuotaSnapshot is the account-level mirasim reading the admin console
+// renders: the independent quota windows plus the subscription tier.
+//
+// Presence rules the frontend is written against (pinned by
+// handler/admin/account_mirasim_quota_contract_test.go):
+//   - the whole object is null for every non-mirasim account;
+//   - for a mirasim account the object is always present, and each half stands
+//     on its own producer — Windows is [] with Source "" until a quota reading
+//     exists, Plan is "" until the plan probe has run. Neither half is ever
+//     synthesized from the other, and no default is invented for a missing one.
+//
+// The `mirasim_quota` field carrying this type is deliberately NOT omitempty,
+// on BOTH Account and AccountListItem. An explicit null is how the contract says
+// "this account has no mirasim dimension at all"; omitting the key instead would
+// make that indistinguishable from a backend too old to know the field. And the
+// list item needs it because the account TABLE is the view that renders the
+// quota cell — a contract that covered only the detail DTO would leave the table
+// blank while the detail API looked perfectly correct.
+type MirasimQuotaSnapshot struct {
+	// Source says WHERE Windows came from, and therefore how much it can carry:
+	//
+	//	"limits"  — the active GET /v1/limits probe: absolute used/budget.
+	//	"headers" — passive sampling of the anthropic-ratelimit-unified-*
+	//	            response headers on normal traffic: ratio only.
+	//	""        — no reading at all; Windows is [].
+	//
+	// A reading with windows wins over one without, limits over headers. The two
+	// are never merged: merging is what produces budget=0 placeholder windows
+	// that render as "探到了，额度是 0" instead of "没探到".
+	Source string `json:"source"`
+	// Status is the last /v1/limits probe outcome ("ok" | "failed"), or "" when
+	// that probe never ran for this account. It describes the PROBE, not the
+	// reading: "failed" together with a non-nil ObservedAt means Windows is the
+	// last good reading carried over, not a fresh one.
+	Status string `json:"status"`
+	// Suspended: the upstream reported this account's quota as suspended, as of
+	// the last limits probe. Only that probe can observe it.
+	Suspended bool `json:"suspended"`
+	// ObservedAt is when the reading in Windows was taken. nil = never observed.
+	ObservedAt *time.Time `json:"observed_at"`
+	// Windows is never null — [] when there is no reading — so a renderer can
+	// iterate unconditionally. It contains ONLY windows that were actually
+	// reported: an absent window is absent, not zero-filled.
+	Windows []MirasimQuotaWindow `json:"windows"`
+
+	// Plan, NextPlan and PlanExpiresAt come from service.ResolveMirasimPlan, the
+	// single place claimed-vs-authoritative precedence is decided. Nothing here
+	// re-reads extra for them, so there is exactly one precedence rule in the
+	// system. "" means unknown. PlanExpiresAt is passed through as the stored
+	// RFC3339 string rather than reparsed into a time.
+	Plan          string `json:"plan"`
+	NextPlan      string `json:"next_plan"`
+	PlanExpiresAt string `json:"plan_expires_at"`
+	// PlanSource grades Plan: "authoritative" (read from upstream by the plan
+	// probe), "claimed" (the import-time label — UNVERIFIED, and known to
+	// over-state the tier) or "unknown". A badge that paints a claimed tier as
+	// fact is the "标 max 实为 plus" bug in UI form, which is why the grade
+	// travels with the value instead of being dropped here.
+	PlanSource string `json:"plan_source"`
+}
+
 type Account struct {
 	ID       int64   `json:"id"`
 	Name     string  `json:"name"`
@@ -216,6 +311,7 @@ type Account struct {
 	CredentialsStatus       map[string]bool                `json:"credentials_status,omitempty"`
 	Extra                   map[string]any                 `json:"extra"`
 	OllamaCloudUsage        *service.OllamaCloudUsageState `json:"ollama_cloud_usage,omitempty"`
+	MirasimQuota            *MirasimQuotaSnapshot          `json:"mirasim_quota"`
 	ProxyID                 *int64                         `json:"proxy_id"`
 	ProxyFallbackOriginID   *int64                         `json:"proxy_fallback_origin_id"`
 	ProxyFallbackOriginName *string                        `json:"proxy_fallback_origin_name,omitempty"`
@@ -340,6 +436,7 @@ type AccountListItem struct {
 	CredentialsStatus map[string]bool                `json:"credentials_status,omitempty"`
 	Extra             map[string]any                 `json:"extra,omitempty"`
 	OllamaCloudUsage  *service.OllamaCloudUsageState `json:"ollama_cloud_usage,omitempty"`
+	MirasimQuota      *MirasimQuotaSnapshot          `json:"mirasim_quota"`
 
 	ProxyID                 *int64     `json:"proxy_id"`
 	ProxyFallbackOriginID   *int64     `json:"proxy_fallback_origin_id"`

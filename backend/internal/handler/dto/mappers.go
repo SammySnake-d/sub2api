@@ -251,6 +251,7 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		CredentialsStatus:       credsStatus,
 		Extra:                   extra,
 		OllamaCloudUsage:        ollamaCloudUsage,
+		MirasimQuota:            buildMirasimQuotaSnapshot(a),
 		ProxyID:                 a.ProxyID,
 		ProxyFallbackOriginID:   a.ProxyFallbackOriginID,
 		ProxyFallbackOriginName: a.ProxyFallbackOriginName,
@@ -426,6 +427,64 @@ func redactAccountManagedExtra(extra map[string]any) map[string]any {
 	return redacted
 }
 
+// ---------------------------------------------------------------------------
+// mirasim quota snapshot (service view -> wire contract)
+// ---------------------------------------------------------------------------
+
+// buildMirasimQuotaSnapshot projects service.BuildMirasimQuotaSnapshot onto the
+// JSON contract the admin console is written against. It READS ONLY: no probe,
+// no upstream call, no write.
+//
+// Why a projection instead of embedding service.MirasimQuotaSnapshot directly,
+// the way OllamaCloudUsage embeds its service type: the service view is an
+// internal composition that also carries probe bookkeeping (retry schedule,
+// failure counts, unrecognised window names) and is free to grow more, while
+// `mirasim_quota` is a published shape whose field NAMES are load-bearing for a
+// renderer that fails silently — a blank cell, not an error. Keeping one
+// translation here means the service view can be reshaped without any of that
+// reaching the browser, and the contract test below fails the moment a rename
+// would have gone out unnoticed.
+//
+// Composition itself is NOT duplicated: service.BuildMirasimQuotaSnapshot is the
+// single place that decides limits-vs-headers provenance and plan precedence.
+// Re-deriving any of that here would create a second answer to the same
+// question, free to disagree with the scheduler's.
+func buildMirasimQuotaSnapshot(a *service.Account) *MirasimQuotaSnapshot {
+	view := service.BuildMirasimQuotaSnapshot(a)
+	if view == nil {
+		// Not a mirasim account: the field is an explicit null, not an empty
+		// object. "No mirasim dimension" and "a mirasim account we know nothing
+		// about" are different answers and the console renders them differently.
+		return nil
+	}
+	out := &MirasimQuotaSnapshot{
+		Source: view.Source,
+		// ProbeStatus is renamed to `status` on the wire, where it sits next to
+		// `source` and `observed_at` and needs no prefix to be unambiguous.
+		Status:        view.ProbeStatus,
+		Suspended:     view.Suspended,
+		ObservedAt:    view.ObservedAt,
+		Windows:       make([]MirasimQuotaWindow, 0, len(view.Windows)),
+		Plan:          view.Plan,
+		NextPlan:      view.NextPlan,
+		PlanExpiresAt: view.PlanExpiresAt,
+		PlanSource:    view.PlanSource,
+	}
+	for _, window := range view.Windows {
+		// The pointers are copied, not dereferenced: nil has to survive the trip.
+		// Flattening any of them to 0 here would turn "not measured" into
+		// "measured as empty" at the last step before the browser.
+		out.Windows = append(out.Windows, MirasimQuotaWindow{
+			Name:        window.Name,
+			Used:        window.Used,
+			Budget:      window.Budget,
+			Utilization: window.Utilization,
+			ResetAt:     window.ResetAt,
+		})
+	}
+	return out
+}
+
 func AccountFromService(a *service.Account) *Account {
 	if a == nil {
 		return nil
@@ -459,6 +518,7 @@ func AccountListItemFromAccount(a *Account) *AccountListItem {
 		ID: a.ID, Name: a.Name, Notes: a.Notes, Platform: a.Platform, Type: a.Type,
 		Credentials: a.Credentials, CredentialsStatus: a.CredentialsStatus, Extra: a.Extra,
 		OllamaCloudUsage: a.OllamaCloudUsage,
+		MirasimQuota:     a.MirasimQuota,
 		ProxyID:          a.ProxyID, ProxyFallbackOriginID: a.ProxyFallbackOriginID, ProxyFallbackOriginName: a.ProxyFallbackOriginName,
 		Concurrency: a.Concurrency, LoadFactor: a.LoadFactor, Priority: a.Priority, RateMultiplier: a.RateMultiplier,
 		Status: a.Status, ErrorMessage: a.ErrorMessage, LastUsedAt: a.LastUsedAt, ExpiresAt: a.ExpiresAt,

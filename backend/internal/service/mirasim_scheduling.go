@@ -635,8 +635,9 @@ func mirasimUnverifiedWindowExpectations() []string {
 	return out
 }
 
-// persistMirasimWindowLimits writes one cooldown per exhausted window. Returns
-// true when at least one window was recognised and handled.
+// persistMirasimWindowLimits writes one cooldown per window this 429's headers
+// say is exhausted. Returns true when at least one window was recognised and
+// handled.
 //
 // Global windows go to the account-level scalar via SetRateLimited; family
 // windows go to their own scope via SetModelRateLimit, so an exhausted
@@ -646,8 +647,29 @@ func (s *RateLimitService) persistMirasimWindowLimits(ctx context.Context, accou
 		return false
 	}
 	now := time.Now()
-	limits := selectMirasimExhaustedWindows(headers, now)
-	if len(limits) == 0 {
+	return s.persistMirasimWindowLimitSet(ctx, account, selectMirasimExhaustedWindows(headers, now), now)
+}
+
+// persistMirasimWindowLimitSet is the write half of persistMirasimWindowLimits,
+// split out so a cooldown can be driven by a source other than 429 headers.
+//
+// SOURCE-AGNOSTIC ON PURPOSE. There are exactly two ways this system learns a
+// mirasim window is spent — reactively, from the unified-ratelimit headers on a
+// 429 (selectMirasimExhaustedWindows), and proactively, from a /v1/limits
+// snapshot (selectMirasimExhaustedWindowsFromQuota) — and they must land in the
+// same storage with the same precedence rules. A second write path would be free
+// to forget shouldPersistAnthropicWindowLimit and shorten a live cooldown, which
+// is the failure this split exists to make impossible.
+//
+// The caller decides WHICH windows are exhausted; this function only decides
+// WHERE each one is stored. Returns true when at least one window was handled.
+func (s *RateLimitService) persistMirasimWindowLimitSet(
+	ctx context.Context,
+	account *Account,
+	limits []mirasimWindowLimit,
+	now time.Time,
+) bool {
+	if s == nil || s.accountRepo == nil || account == nil || len(limits) == 0 {
 		return false
 	}
 	handled := false

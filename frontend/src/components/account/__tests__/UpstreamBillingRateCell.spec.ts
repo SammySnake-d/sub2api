@@ -357,4 +357,119 @@ describe('UpstreamBillingRateCell', () => {
     )
     expect(wrapper.text()).not.toContain('-admin.accounts.upstreamBilling.unsupported')
   })
+
+  // 「从没探过」与「探过了、上游没有这个接口」是两个结论，界面上必须分得开：
+  // 同形显示会让用户把已完成的探测读成按钮没反应。
+  it('separates never-probed from a completed upstream-unsupported verdict', async () => {
+    const wrapper = mount(UpstreamBillingRateCell, {
+      attachTo: document.body,
+      props: {
+        account: makeAccount({ extra: { upstream_billing_probe_enabled: true } }),
+        now: Date.now()
+      }
+    })
+    await wrapper.get('[data-testid="upstream-billing-details"]').trigger('mouseenter')
+    await flushPromises()
+    const tooltips = document.body.querySelectorAll('[role="tooltip"]')
+    const tooltip = tooltips[tooltips.length - 1] as HTMLElement
+    const probeButton = () => wrapper.get('[data-testid="upstream-billing-probe"]')
+    const tooltipText = (testid: string) =>
+      tooltip.querySelector(`[data-testid="${testid}"]`)?.textContent?.trim()
+
+    expect(wrapper.get('[data-testid="upstream-billing-rate"]').text()).toBe(
+      'admin.accounts.upstreamBilling.notProbed'
+    )
+    expect(tooltipText('upstream-billing-not-probed-hint')).toBe(
+      'admin.accounts.upstreamBilling.notProbedHint'
+    )
+    expect(tooltip.querySelector('[data-testid="upstream-billing-unsupported-hint"]')).toBeNull()
+    expect(probeButton().attributes('aria-label')).toBe('admin.accounts.upstreamBilling.manualProbe')
+    expect(probeButton().classes()).toContain('text-blue-600')
+
+    await wrapper.setProps({
+      account: makeAccount({
+        extra: {
+          upstream_billing_probe_enabled: true,
+          upstream_billing_probe: {
+            status: 'unsupported',
+            http_status: 404,
+            failure_count: 1,
+            last_attempt_at: '2026-07-13T00:00:00Z',
+            next_probe_at: '2026-07-13T04:00:00Z',
+            last_error: 'unsupported'
+          }
+        }
+      })
+    })
+
+    expect(wrapper.get('[data-testid="upstream-billing-rate"]').text()).toBe(
+      'admin.accounts.upstreamBilling.unsupported'
+    )
+    expect(tooltipText('upstream-billing-unsupported-title')).toBe(
+      'admin.accounts.upstreamBilling.unsupportedTitle'
+    )
+    expect(tooltipText('upstream-billing-unsupported-hint')).toBe(
+      'admin.accounts.upstreamBilling.unsupportedHint'
+    )
+    expect(tooltipText('upstream-billing-http-status')).toBe(
+      'admin.accounts.upstreamBilling.httpStatus:404'
+    )
+    // 时间串按运行环境时区渲染，断言只钉住「用的是自动重判文案而不是待办式的下次探测」。
+    expect(tooltipText('upstream-billing-next-probe')).toContain(
+      'admin.accounts.upstreamBilling.nextRecheckAt:'
+    )
+    expect(tooltipText('upstream-billing-next-probe')).not.toContain(
+      'admin.accounts.upstreamBilling.nextProbeAt'
+    )
+    expect(tooltip.querySelector('[data-testid="upstream-billing-not-probed-hint"]')).toBeNull()
+    expect(probeButton().attributes('aria-label')).toBe(
+      'admin.accounts.upstreamBilling.recheckUnsupported'
+    )
+    expect(probeButton().classes()).not.toContain('text-blue-600')
+    wrapper.unmount()
+  })
+
+  it('names the probe failure reason and keeps unknown codes verbatim', async () => {
+    const failedAccount = (lastError: string) => makeAccount({
+      extra: {
+        upstream_billing_probe: {
+          status: 'failed',
+          failure_count: 3,
+          http_status: 500,
+          last_attempt_at: '2026-07-13T00:00:00Z',
+          next_probe_at: '2026-07-13T01:00:00Z',
+          last_error: lastError
+        }
+      }
+    })
+    const wrapper = mount(UpstreamBillingRateCell, {
+      attachTo: document.body,
+      props: { account: failedAccount('http_error'), now: Date.now() }
+    })
+    await wrapper.get('[data-testid="upstream-billing-details"]').trigger('mouseenter')
+    await flushPromises()
+    const tooltips = document.body.querySelectorAll('[role="tooltip"]')
+    const tooltip = tooltips[tooltips.length - 1] as HTMLElement
+    const tooltipText = (testid: string) =>
+      tooltip.querySelector(`[data-testid="${testid}"]`)?.textContent?.trim()
+
+    expect(wrapper.get('[data-testid="upstream-billing-rate"]').text()).toBe(
+      'admin.accounts.upstreamBilling.failed'
+    )
+    expect(tooltipText('upstream-billing-failure-title')).toBe(
+      'admin.accounts.upstreamBilling.failedTitle'
+    )
+    expect(tooltipText('upstream-billing-failure-reason')).toBe(
+      'admin.accounts.upstreamBilling.failureReason.http_error'
+    )
+    expect(tooltipText('upstream-billing-failure-count')).toBe(
+      'admin.accounts.upstreamBilling.failureCount:3'
+    )
+
+    await wrapper.setProps({ account: failedAccount('network_error') })
+    expect(tooltipText('upstream-billing-failure-reason')).toBe(
+      'admin.accounts.upstreamBilling.failureReasonUnknown:network_error'
+    )
+    wrapper.unmount()
+  })
 })

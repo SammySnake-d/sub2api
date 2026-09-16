@@ -1,0 +1,35 @@
+{
+ "schema": "acceptance-atlas/failures/1",
+ "note": "失败必须留下有鉴别力的观察量（逐行 ✓/✗，或被截断前的完整探针输出）。没有这一条，「重跑一次看到绿」在机检上无解。本文件的记录全部摘自 2026-09-16 那一轮 S4 双侧标定的真实注入探针：每一条都在真源码上改过字节、跑过 `go test -tags unit`、读过真实输出。其中 F-1 / F-2 是**阳性埋雷竟不红**（判据失效的那一类，最贵的读数），不是产品缺陷；把它们留在这里是因为「这个雷没炸」比「这个雷炸了」更需要事后有人能复现。",
+ "failures": [
+  {"id": "F-1",
+   "case": "C13-pos-503-not-request-scoped（已弃用的第一版阳性注入）",
+   "when": "2026-09-16",
+   "observables": "✓ verified_changed=true（mirasim_scheduling.go 的 `case http.StatusServiceUnavailable, statusMirasimClientClosedRequest:` 真被改成只剩 499，503 落进默认分支 MirasimActionShared）  ✗ 套件 rc=0 全绿，`go test -run TestMirasim503CapacityLeavesAccountHealthy` 输出 `ok github.com/Wei-Shaw/sub2api/internal/service 0.048s`  ✗ expect_text「503 不该产生任何一次账号状态落库」命中 0 行  → 判读：共享路径对 503 同样不写任何账号状态，所以「mirasim 分支不再认领 503」这个缺陷对 C13 的断言是不可见的；C13 只对『503 被冷却/禁用』敏感，对『503 无人认领』不敏感。换成把 503 归到 window_cooldown 之后才红：RateLimitResetAt 由 <nil> 变成 2026-09-16T03:35:23.844617Z。"},
+
+  {"id": "F-2",
+   "case": "C18-pos-cache-read-priced-as-input（已弃用的第一版阳性注入）",
+   "when": "2026-09-16",
+   "observables": "✓ verified_changed=true（billing_service.go initFallbackPricing 里 claude-sonnet-5 的 CacheReadPricePerToken 由 0.2e-6 真改成 2e-6）  ✗ 套件 rc=0，`-run TestMirasimBillingCacheReadChargedAtTenPercentOfInput` 输出 `ok ... 0.052s`  ✗ expect_text「折扣方向反了」命中 0 行  → 判读：仪器打偏了，不是门钝了。mirasim_billing_test.go:132 走 newMirasimPricingCatalog 读**真实价卡文件** ../../resources/model-pricing/model_prices_and_context_window.json，整条路径不经过 fallbackPrices，所以改 fallback 价对这五个已启用模型一个都碰不到。改打在 CalculateCost 的 `bd.CacheReadCost = ... * cacheReadPrice` 上之后，5 个模型的子用例全红。"},
+
+  {"id": "F-3",
+   "case": "C11-pos-claude-window-dropped / TestMirasimOpusSchedulabilityIsTheAndOfItsThreeWindows",
+   "when": "2026-09-16",
+   "observables": "✗ MirasimWindowsForModel(\"claude-opus-4-6\") 期望 []string{\"5h\",\"7d\",\"7d_claude\"} 实际 []string{\"5h\",\"7d\"}（len 3 → 2，丢的是 7d_claude）  ✓ 断言位置 mirasim_quota_test.go:49  ✓ 失败消息「opus 请求消耗的窗口集合变了 —— 调度的 AND 条件会跟着错」  → 注入：mirasim_scheduling.go 的 claude 分支由 `append(windows, MirasimWindow7dClaude)` 改成 `return windows`，即家族窗口退出 AND 条件。"},
+
+  {"id": "F-4",
+   "case": "C34-pos-claimed-plan-not-byte-identical / TestImportMirasimAccountsCarriesPlanFieldsIntoExtra",
+   "when": "2026-09-16",
+   "observables": "✗ extra[mirasim_plan] 期望 \"max\"（来源逐字节） 实际 \"MAX\"  ✓ created=1 failed=0（导入本身成功，正是「不报错但值变了」那种形态）  ✓ 断言位置 account_mirasim_plan_import_test.go:70  → 注入：account_mirasim_import.go 里 `extra[mirasim.ExtraPlanClaimed] = item.Plan` 改成 strings.ToUpper(item.Plan)。这条记录的价值在于它证明 C34 钉的是**逐字节等于来源**，不是「非空」。"},
+
+  {"id": "F-5",
+   "case": "C38-pos-empty-current-plan-counts-as-reading / TestMirasimMalformedReferralNeverPollutesPlanState",
+   "when": "2026-09-16",
+   "observables": "✗ 一个 200 但字段名全不认识的响应，snapshot.Status 期望 \"failed\" 实际 \"ok\"  ✓ 基线那次好读数仍在（plan=plus claimed=max）  ✓ 断言位置 mirasim_plan_evidence_test.go:199，消息「an unreadable shape must never count as a reading」  → 注入：account_mirasim_plan_probe.go 的 `if referral == nil || strings.TrimSpace(referral.CurrentPlan) == \"\"` 只留前一半。空 CurrentPlan 是这个故障**唯一**的可辨识信号：HTTP 200、JSON 合法、解析不报错，每一层都是绿的。"},
+
+  {"id": "F-6",
+   "case": "C4-pos-cache-control-stripped-from-every-tool / TestMirasimCachePrefixSystemBytewise",
+   "when": "2026-09-16",
+   "observables": "✓ TestMirasimCachePrefixToolsBytewise 红：tools[2].cache_control 被整段删掉，期望串尾 `...\"required\":[\"file_path\"]},\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"5m\"}}]` 实际 `...\"required\":[\"file_path\"]}}]`  ✗ 同一条注入下 TestMirasimCachePrefixSystemBytewise 仍为绿  → 判读（不是产品缺陷，是标定覆盖的如实记录）：C4 covers 两条义务，这个雷只打到 CP:tools-bytewise 一侧；CP:system-bytewise 一侧由 C5 那条整体 map 往返注入证明（它把 system 段的 key 排成字母序、把 < > & 转义成 \\u003c，SystemBytewise 当场红）。C4 的阳性只对 tools 半边有鉴别力这件事，写在这里而不是靠读者去推。"}
+ ]
+}

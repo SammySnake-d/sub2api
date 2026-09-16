@@ -78,3 +78,24 @@ resin 侧已修（单次请求内换节点重试 + 每次 dial 限时 8s）。�
 - 「阈值恢复后该节点重新进池」这一段没有当场演练：它要等该节点的下一次成功探测，
   周期最长 10 分钟。代码路径（`EnforceLatencyCeiling` 的注释与 `RecordResult`）
   是读过的，但**没有观测到一次真实的恢复**。这一条仍是推断。
+
+## 作用域订正（2026-09-16，同日晚些时候）
+
+本记录的全部实测（熔断演练、143 身份两轮、30%→6.7%）都是在
+**agcn(124.221.206.59) 的 resin** 上做的。当天拓扑改了：**143 个账号已全部改走
+loon(45.205.28.160)**（见 proxy-auth-and-exposure.md 的「新事实」节）。
+所以这些数字是**那条路的**历史读数，不自动转移到现在在跑的那条路。
+
+在 loon 上复核了本记录依赖的两项配置真源，结论分两半：
+
+- `max_routable_latency_ms = 1000`、`latency_test_url =
+  https://www.gstatic.com/generate_204`、`latency_authorities =
+  [gstatic.com, relay.mirasim.ai]` —— 与 agcn **一致**，第一条判据的前提在新机器上仍成立。
+- `max_leases_per_ip` 在 loon 上是 **6**，agcn 是 3 —— **不一致**。
+  引用本记录去论证「每 IP 不超过 3 个账号」的地方要按机器分别取值
+  （详见 egress-geo-and-proxy-effective.md 的订正节）。
+
+「坏身份率 30%→6.7%」这条 resin 侧修复的收益也只在 agcn 口径下测过。
+新拓扑下同口径抽测 12 个账号为 11 成 1 败（≈8%），与 6.7% 同量级，
+但样本小得多，**不足以当作 loon 上的复现**，只能说没有观察到反例。
+

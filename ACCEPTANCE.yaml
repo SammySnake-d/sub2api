@@ -125,6 +125,29 @@ toolchain:
     tool: "manual-injection"
     report: "adequacy/injections.json"
 
+# ── S4 双侧标定的三项事先声明 ──────────────────────────────────────────────
+#
+# 这三项是 `evidence: executed` 的锚②③④：判决器会核 calibration.json 里的
+# executed_by / command 与这里**逐字**相符、且每条阳性的 case 名能在 spec 原文里
+# 找到；对不上就降级按 declared 判读并写进未机检项。所以它们必须**事先**在这里
+# 声明，不能由报表事后自填。
+#
+# executor 用判决器自带的执行器：本仓是确定性档,注入就是「改一处源码字节」,
+# 不需要项目自带跑批器。它会亲自改文件 → 校验真改动(改前==改后则抛「变异未生效」)
+# → 跑下面这条命令 → 抓红因 → 还原。
+#
+# command 里的 `-tags unit` 不是可选项:SC / QU / RG / QW 四组的判据住在带
+# `//go:build unit` 的文件里(见上面 toolchain 的注释)。漏了 tag 的那次「全绿」,
+# 绿的是一个更小的集合 —— 而标定报表的差分阴性读的正是这条命令的基线退出码,
+# 用一条编译不到判据的命令做基线,阴性会「绿得毫无鉴别力」。
+#
+# 这里**刻意不收窄**到某几个包:22 条门散在 5 个包里,按包收窄能省约 40 秒、
+# 却会让「注入 A 包的缺陷把 B 包的测试打红」这类真实的越界失效照不出来。
+calibration:
+  executor: "acceptance-lint --calibrate --execute"
+  command: "cd backend && go test -tags unit ./internal/... -count=1"
+  spec: "calibration/injections.json"
+
 # ── 义务集由机器从这里展开;作者只声明「有什么对象」,维度由脚本做乘法 ──
 structure_sources:
 

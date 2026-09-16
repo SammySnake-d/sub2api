@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
-	"github.com/Wei-Shaw/sub2api/internal/pkg/mirasim"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -371,14 +370,12 @@ func (s *GatewayService) buildUpstreamRequestAnthropicAPIKeyPassthrough(
 	// 账号级请求头覆写（最终生效，覆盖上面所有来源的同名头）
 	account.ApplyHeaderOverrides(req.Header)
 
-	// mirasim identity normalisation — see the note in
-	// gateway_upstream_request.go. This is the branch mirasim accounts actually
-	// take (api_key + anthropic_passthrough), so it is the one that matters.
-	if IsMirasimAccount(account) {
-		for k, v := range mirasim.CanonicalIdentityHeaders() {
-			setHeaderRaw(req.Header, resolveWireCasing(k), v)
-		}
-	}
+	// mirasim 的身份头**不在这里写**。它的唯一落点是传输层的签名收口
+	// （repository.mirasimUpstream.sign → mirasim.ApplyCanonicalIdentityHeaders），
+	// 因为网关只覆盖客户流量：账号健康检查、计划探测、额度探测都不走这里。
+	// 曾经两条网关路径各挂一份，于是那些不走网关的请求拿到了 defaultFingerprint
+	// 的陈旧值（Linux / 0.94.0 / v24.3.0），同一个账号在上游看来是两台设备。
+	// 多一个调用点就多一条将来会被漏掉的路径，所以这里刻意不留。
 
 	return req, body, nil
 }

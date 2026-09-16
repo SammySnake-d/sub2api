@@ -1,6 +1,6 @@
 {
-  "count": 43,
-  "digest": "6f38ea8fcc266ae94024cc1f7ee2c245ea2a494c4445e96d37645eb19392c127",
+  "count": 71,
+  "digest": "8d73464b5904566bc1b40dd79361441c5373c6a30e6360ef0406fdb2693a100c",
   "narrowed": [],
   "obligations": {
     "BL:cache-read-discount": {
@@ -26,6 +26,18 @@
       "kind": "fault",
       "row": "no-price-fallback",
       "src": "BL"
+    },
+    "CC:impostor-still-fails": {
+      "expect": "伪造者(UA 或 system prompt 对不上)仍被拒绝 —— 放真客户端进来不能顺手把门拆了",
+      "kind": "fault",
+      "row": "impostor-still-fails",
+      "src": "CC"
+    },
+    "CC:real-client-passes": {
+      "expect": "真实 Claude Code 2.1.272 的请求通过「仅 CC」校验",
+      "kind": "fault",
+      "row": "real-client-passes",
+      "src": "CC"
     },
     "CP:bigint-precision": {
       "expect": "工具入参中的大整数不丢精度(json.Marshal 经 float64 会把 12345678901234567890 变成 ...567000)",
@@ -62,6 +74,72 @@
       "kind": "fault",
       "row": "tools-bytewise",
       "src": "CP"
+    },
+    "DP:egress-not-cn-hk": {
+      "expect": "出口 IP 不含中国大陆与香港",
+      "kind": "fault",
+      "row": "egress-not-cn-hk",
+      "src": "DP"
+    },
+    "DP:egress-not-vps-itself": {
+      "expect": "出口 IP 不等于 VPS 自身公网 IP(124.221.206.59)—— 相等即说明代理没生效,请求在裸奔",
+      "kind": "fault",
+      "row": "egress-not-vps-itself",
+      "src": "DP"
+    },
+    "DP:latency-eviction": {
+      "expect": "延迟超阈值的节点被熔断,挂在它上面的 sticky 账号自动迁走;阈值恢复后该节点重新进池",
+      "kind": "fault",
+      "row": "latency-eviction",
+      "src": "DP"
+    },
+    "DP:latency-probe-target": {
+      "expect": "resin 的 latency_test_url 是轻量 204 探针(gstatic generate_204),上游域名只出现在 latency_authorities —— 不是把上游域名当测速靶",
+      "kind": "fault",
+      "row": "latency-probe-target",
+      "src": "DP"
+    },
+    "DP:leases-per-ip-max-3": {
+      "expect": "同一出口 IP 上的账号数 ≤ 3",
+      "kind": "fault",
+      "row": "leases-per-ip-max-3",
+      "src": "DP"
+    },
+    "DP:no-domain-plain-http": {
+      "expect": "对外是 IP:6699 明文 HTTP(腾讯云未备案,上不了域名),这个事实被显式记录下来而不是留给下一个人去撞",
+      "kind": "fault",
+      "row": "no-domain-plain-http",
+      "src": "DP"
+    },
+    "DP:proxy-auth-header": {
+      "expect": "代理认证用 Proxy-Authorization 而非 Authorization(用错会拿到 407)",
+      "kind": "fault",
+      "row": "proxy-auth-header",
+      "src": "DP"
+    },
+    "DP:sticky-per-account": {
+      "expect": "同一账号连续 10 次请求的出口 IP 不变",
+      "kind": "fault",
+      "row": "sticky-per-account",
+      "src": "DP"
+    },
+    "E2E:generated-key": {
+      "expect": "鉴权用后台生成的 key,不是管理员 token(管理员 token 走的是另一条路径,过了不代表客户过得了)",
+      "kind": "fault",
+      "row": "generated-key",
+      "src": "E2E"
+    },
+    "E2E:real-client-not-curl": {
+      "expect": "验收用的是真实 Claude Code 客户端指向 sub2 的 URL 发起会话,不是 curl 手拼的 body",
+      "kind": "fault",
+      "row": "real-client-not-curl",
+      "src": "E2E"
+    },
+    "E2E:real-content-and-usage": {
+      "expect": "返回真实 content,且 usage 的 input/output token 均非零",
+      "kind": "fault",
+      "row": "real-content-and-usage",
+      "src": "E2E"
     },
     "ID:deviceseed-db-backed": {
       "expect": "清空 Redis 后 DeviceSeed 仍不变(必须来自 DB,不是缓存)",
@@ -111,6 +189,36 @@
       "row": "version-coherent",
       "src": "ID"
     },
+    "IMP:honor-explicit-keep": {
+      "expect": "运营者点名要导的账号,即使命中 skip-disabled / skip-annual-reserved 也要导入",
+      "kind": "fault",
+      "row": "honor-explicit-keep",
+      "src": "IMP"
+    },
+    "IMP:honor-explicit-skip": {
+      "expect": "运营者点名不导的账号一定不导入",
+      "kind": "fault",
+      "row": "honor-explicit-skip",
+      "src": "IMP"
+    },
+    "IMP:import-count-matches": {
+      "expect": "导入数 + 保留数 == 来源总数(账目守恒:没有账号在中间悄悄蒸发)",
+      "kind": "fault",
+      "row": "import-count-matches",
+      "src": "IMP"
+    },
+    "IMP:skip-annual-reserved": {
+      "expect": "2027 年到期的一年期账号不导入(运营者自用)",
+      "kind": "fault",
+      "row": "skip-annual-reserved",
+      "src": "IMP"
+    },
+    "IMP:skip-disabled": {
+      "expect": "来源里标记为 disabled 的账号不导入",
+      "kind": "fault",
+      "row": "skip-disabled",
+      "src": "IMP"
+    },
     "MG:idempotent": {
       "expect": "导入脚本重复执行结果一致,不产生重复账号",
       "kind": "fault",
@@ -128,6 +236,36 @@
       "kind": "fault",
       "row": "source-preserved",
       "src": "MG"
+    },
+    "PL:claimed-vs-authoritative": {
+      "expect": "声称 max 而权威 plus 时,两个值都保留且冲突被标记,不静默覆盖成其中一个",
+      "kind": "fault",
+      "row": "claimed-vs-authoritative",
+      "src": "PL"
+    },
+    "PL:import-carries-plan": {
+      "expect": "导入后 extra 里有 plan 与 plan_expires_at,取值与来源一致",
+      "kind": "fault",
+      "row": "import-carries-plan",
+      "src": "PL"
+    },
+    "PL:malformed-referral-is-safe": {
+      "expect": "响应结构不符时不写入、不污染已有值(保留上一次的好读数)",
+      "kind": "fault",
+      "row": "malformed-referral-is-safe",
+      "src": "PL"
+    },
+    "PL:probe-updates-plan": {
+      "expect": "探测拿到权威 current_plan 后正确更新账号档位",
+      "kind": "fault",
+      "row": "probe-updates-plan",
+      "src": "PL"
+    },
+    "PL:probe-uses-account-proxy": {
+      "expect": "探测请求走该账号自己的代理(否则探测本身就是一次裸奔,还会把出口 IP 和账号解绑)",
+      "kind": "fault",
+      "row": "probe-uses-account-proxy",
+      "src": "PL"
     },
     "QU:fable-window-and": {
       "expect": "fable 请求的可调度性 = 5h ∧ 7d ∧ 7d_fable 三个窗口都有余量",
@@ -152,6 +290,18 @@
       "kind": "fault",
       "row": "single-quota-state",
       "src": "QU"
+    },
+    "QW:known-window-tokens-map": {
+      "expect": "5h / 7d 落账号级标量,7d_claude / 7d_fable 各落自己的 scope",
+      "kind": "fault",
+      "row": "known-window-tokens-map",
+      "src": "QW"
+    },
+    "QW:unknown-window-is-observable": {
+      "expect": "上游给出不在四窗口内的 window token 时,留下可观测信号(日志/计数),不静默吞掉",
+      "kind": "fault",
+      "row": "unknown-window-is-observable",
+      "src": "QW"
     },
     "RG:existing-channels-unchanged": {
       "expect": "现有渠道(openai/grok/gemini/bedrock/antigravity 等)的状态码冷却时长与禁用条件未被改变",
@@ -218,6 +368,24 @@
       "kind": "fault",
       "row": "503-capacity",
       "src": "SC"
+    },
+    "SEC:admin-compliance-ack": {
+      "expect": "管理员合规确认由运营者本人完成,自动化不得代签",
+      "kind": "fault",
+      "row": "admin-compliance-ack",
+      "src": "SEC"
+    },
+    "SEC:no-default-secrets": {
+      "expect": "JWT、admin 口令、DB 口令、resin token 全部是部署时随机生成的值,没有一个等于仓库默认值",
+      "kind": "fault",
+      "row": "no-default-secrets",
+      "src": "SEC"
+    },
+    "SEC:secrets-not-in-repo": {
+      "expect": "任何 secret 都不出现在仓库、日志与测试输出里",
+      "kind": "fault",
+      "row": "secrets-not-in-repo",
+      "src": "SEC"
     },
     "SG:body-sensitivity": {
       "expect": "body 改 1 bit,签名必须变化(防止签了个与 body 无关的常量)",

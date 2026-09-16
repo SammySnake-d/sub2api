@@ -157,6 +157,10 @@ type AccountTestService struct {
 	// grokWSDialer is optional; realtime account tests use the default OpenAI-style
 	// WS dialer when nil (supports proxy + coder/websocket handshake).
 	grokWSDialer openAIWSClientDialer
+	// quotaRecorder 把测试请求真实烧掉的上游额度记回账号；见 recordAccountTestUpstreamUsage。
+	quotaRecorder accountTestQuotaRecorder
+	// modelPricer 只用于按账号挑健康检查型号时比价；见 cheapestWhitelistedAccountTestModel。
+	modelPricer accountTestModelPricer
 }
 
 func (s *AccountTestService) SetSettingService(settingService *SettingService) {
@@ -175,6 +179,24 @@ func (s *AccountTestService) SetOpenAIGatewayService(gateway *OpenAIGatewayServi
 	if s != nil {
 		s.openaiGatewayService = gateway
 	}
+}
+
+// SetRateLimitService 注入额度落账口（可选依赖）。参数刻意收窄成具体类型而不是
+// accountTestQuotaRecorder：装配侧传进来的 nil *RateLimitService 会变成一个非 nil 的
+// 接口值，之后每次落账都 panic 在一个离装配很远的地方。
+func (s *AccountTestService) SetRateLimitService(rateLimitService *RateLimitService) {
+	if s == nil || rateLimitService == nil {
+		return
+	}
+	s.quotaRecorder = rateLimitService
+}
+
+// SetBillingService 注入价卡查询面（可选依赖）。收窄成具体类型的理由同 SetRateLimitService。
+func (s *AccountTestService) SetBillingService(billingService *BillingService) {
+	if s == nil || billingService == nil {
+		return
+	}
+	s.modelPricer = billingService
 }
 
 // FetchOpenAIAccountModels uses the shared cached discovery path for the test picker.
@@ -456,14 +478,146 @@ func (s *AccountTestService) testCNProviderChatCompletionsConnection(c *gin.Cont
 	return s.testOpenAIChatCompletionsConnection(c, account, testModelID, prompt, normalizedBaseURL, authToken)
 }
 
+// accountTestQuotaRecorder 把一次上游调用消耗掉的额度记回账号。
+// 这是转发主干在用的同一个口——gateway_upstream_response.go:708、
+// gateway_anthropic_passthrough.go:396、openai_gateway_messages_anthropic_native.go:233
+// 每条响应都调 RateLimitService.UpdateSessionWindow。测试请求复用它，不另立一套
+// 账号额度口径。*RateLimitService 即实现。
+type accountTestQuotaRecorder interface {
+	UpdateSessionWindow(ctx context.Context, account *Account, headers http.Header)
+}
+
+// accountTestModelPricer 是按账号挑健康检查型号时需要的价卡最小面。两个方法必须成对
+// 使用：HasIdentifiedTokenPricing 回答"价格表确定认得这个型号"，认得了才用 GetModelPricing
+// 取数。只用后者会拿到按名字子串猜出来的系列兜底价（pricing_service.go 的
+// matchByModelFamily / matchOpenAIModel 对任何名字都能返回一个价），拿猜来的价格排序
+// 等于在这里偷偷内置一张型号→价格表。这个配对是仓库既有口径
+// （gateway_usage_billing.go hasIdentifiedResponseModelPricing 同款）。*BillingService 即实现。
+type accountTestModelPricer interface {
+	HasIdentifiedTokenPricing(model string) bool
+	GetModelPricing(model string) (*ModelPricing, error)
+}
+
+// recordAccountTestUpstreamUsage 记录一次账号测试真实消耗的上游额度。
+//
+// 为什么不写 usage_logs：usage_logs.user_id / api_key_id 都是 NOT NULL 且外键指向
+// users / api_keys（migrations/001_init.sql:136-137；ent/schema/usage_log.go:35-36 两个
+// 字段也都不是 Optional），GatewayService.recordUsageCore 更是无条件解引用 apiKey 与 user
+// （gateway_usage_billing.go:749 的 apiKey.GroupID、:1142 的 user.ID）。全仓找不到任何
+// "没有客户"的用量行既有约定——没有系统用户、没有哨兵 key，也没有别的内部请求这么写过。
+// 因此这里不发明哨兵值：那会凭空造出一个假客户，把按用户、按 key 的所有统计一起污染。
+// 测试请求进 usage_logs 需要先给这两列一个合法归属（迁移层的事），不在本次改动面内。
+//
+// 账号侧的额度口径则有现成的口。UpdateSessionWindow 按上游
+// anthropic-ratelimit-unified-* 头回写 5h 窗口边界与 5h/7d/7d_oi 被动用量，那正是额度
+// 调度器读的同一份数据（account_scheduling_threshold_eval.go 的 anthropicThresholdCandidates
+// 读 session_window_utilization / passive_usage_7d*）。对 mirasim 账号尤其关键：它的响应
+// 只回 5h/7d 的 reset + utilization 四个头（ratelimit_service.go:1977 记录的实测），而这
+// 几个数字里已经含了本次测试烧掉的那一份。
+//
+// 非 200 也照记：422/429 的响应一样带这些头，那部分额度是真消耗掉的。上游根本没应答
+// （传输层出错）时走不到这里，于是"没调用成功"和"调用了但没记"在这一层天然可分——
+// 拿到响应就一定过一次落账口，没拿到才没有。
+func (s *AccountTestService) recordAccountTestUpstreamUsage(ctx context.Context, account *Account, headers http.Header) {
+	if s == nil || s.quotaRecorder == nil || account == nil || headers == nil {
+		return
+	}
+	s.quotaRecorder.UpdateSessionWindow(ctx, account, headers)
+}
+
+// resolveClaudeDefaultTestModel 决定"调用方没指定型号"时这次健康检查打哪个模型。
+//
+// 既有实现无条件取全局常量 claude.DefaultTestModel（claude-sonnet-4-5-20250929），之后
+// 只过一道模型映射——映射只负责改名，从不判断账号究竟服不服务这个型号。于是白名单里
+// 没有 sonnet-4-5 的账号（实测 mirasim）每次健康检查都拿 422
+// `model "claude-sonnet-4-5-20250929" is not supported at this time`，界面上永远停在
+// "尚无请求结果"。
+//
+// 判据直接用账号自己的白名单：IsModelSupported 就是调度器判断"这个账号能不能接这个
+// 型号"的同一个函数（account.go:855）。它说全局默认可服务时一律沿用全局默认——没有映射
+// （=允许所有）、通配符覆盖、白名单里本来就有 sonnet-4-5 的账号因此逐字节不变；只有账号
+// 白名单明确排除了全局默认，才改从白名单里另挑一个。
+//
+// 这里没有"平台默认型号"单独一档：本函数只服务 anthropic 平台的直连测试路径
+// （bedrock / vertex 在调用它之前就分流走了），该平台的默认型号就是 claude.DefaultTestModel
+// 自己，单列一档只是同一个常量换个名字。
+func (s *AccountTestService) resolveClaudeDefaultTestModel(account *Account) string {
+	if s == nil || account == nil || account.IsModelSupported(claude.DefaultTestModel) {
+		return claude.DefaultTestModel
+	}
+	if model := cheapestWhitelistedAccountTestModel(account, s.modelPricer); model != "" {
+		return model
+	}
+	return claude.DefaultTestModel
+}
+
+// cheapestWhitelistedAccountTestModel 从账号白名单（model_mapping 的键，也就是
+// IsModelSupported 判定用的那份集合）里挑一个型号做健康检查。
+//
+// 健康检查只要求上游肯回一个 token，所以在"账号真的服务"的型号里选最便宜的那个。
+// "最便宜"不自带表，一律问价卡服务：成本度量取 输入单价 + 输出单价（每 token 同权）——
+// 测试载荷是几十个输入 token、几个输出 token，同权已经足够把 haiku 排到 opus 前面，而
+// 任何加权都得先假定一个 in/out 比例，那是比问题本身更强的假设。
+//
+// 价格表认不出的型号不参与比价，但不会因此被丢掉：白名单里一个都比不出价时仍返回字典序
+// 最小的那个——它至少是账号真的服务的型号，而全局默认已经被账号白名单排除在外了。
+// 通配符键（claude-*）是映射规则不是具体型号，原样发给上游必然 4xx，一律跳过。
+// 同价并列按名字取小，保证同一个账号每次选到同一个型号（map 迭代无序）。
+func cheapestWhitelistedAccountTestModel(account *Account, pricer accountTestModelPricer) string {
+	if account == nil {
+		return ""
+	}
+	var (
+		bestModel string
+		bestCost  float64
+		bestKnown bool
+	)
+	for model := range account.GetModelMapping() {
+		candidate := strings.TrimSpace(model)
+		if candidate == "" || strings.Contains(candidate, "*") {
+			continue
+		}
+		cost, known := accountTestModelTokenCost(pricer, candidate)
+		if bestModel == "" || accountTestModelPreferred(candidate, cost, known, bestModel, bestCost, bestKnown) {
+			bestModel, bestCost, bestKnown = candidate, cost, known
+		}
+	}
+	return bestModel
+}
+
+// accountTestModelPreferred 定义候选型号的全序：比得出价的排在比不出价的前面，其次比
+// 单价，最后用名字定死次序——否则 map 迭代顺序会让同一个账号每次选到不同型号。
+func accountTestModelPreferred(model string, cost float64, known bool, bestModel string, bestCost float64, bestKnown bool) bool {
+	if known != bestKnown {
+		return known
+	}
+	if known && cost != bestCost {
+		return cost < bestCost
+	}
+	return model < bestModel
+}
+
+// accountTestModelTokenCost 返回型号的 token 单价之和；价格表确定认不出时 known=false。
+func accountTestModelTokenCost(pricer accountTestModelPricer, model string) (cost float64, known bool) {
+	if pricer == nil || !pricer.HasIdentifiedTokenPricing(model) {
+		return 0, false
+	}
+	pricing, err := pricer.GetModelPricing(model)
+	if err != nil || pricing == nil {
+		return 0, false
+	}
+	return pricing.InputPricePerToken + pricing.OutputPricePerToken, true
+}
+
 // testClaudeAccountConnection tests an Anthropic Claude account's connection
 func (s *AccountTestService) testClaudeAccountConnection(c *gin.Context, account *Account, modelID string) error {
 	ctx := c.Request.Context()
 
 	// Determine the model to use
-	testModelID := modelID
+	testModelID := strings.TrimSpace(modelID)
 	if testModelID == "" {
-		testModelID = claude.DefaultTestModel
+		// 默认型号按账号解析，不再无条件套用全局常量：见 resolveClaudeDefaultTestModel。
+		testModelID = s.resolveClaudeDefaultTestModel(account)
 	}
 
 	// API Key 账号测试连接时也需要应用通配符模型映射。
@@ -564,6 +718,9 @@ func (s *AccountTestService) testClaudeAccountConnection(c *gin.Context, account
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
 	}
 	defer func() { _ = resp.Body.Close() }()
+
+	// 这一次调用真的打到了上游、真的烧了额度，所以无论状态码都先落账。
+	s.recordAccountTestUpstreamUsage(ctx, account, resp.Header)
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

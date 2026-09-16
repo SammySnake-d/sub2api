@@ -1155,6 +1155,88 @@ export interface OllamaCloudUsageSettings {
   debounce_minutes: number
 }
 
+/**
+ * mirasim 的四个并存用量窗口。`5h` / `7d` 是账号级全局窗口，`7d_claude` /
+ * `7d_fable` 是模型族独立窗口（fable 属 claude 家族但走自己的计数器）。
+ *
+ * 这四个 token 只有 `5h` / `7d` 是实测确认的；`7d_claude` / `7d_fable` 仍是
+ * 推断值（真实 anthropic 响应头里出现过 `7d_oi`）。因此本层**不做别名映射**：
+ * 上游返回的任何其它名字都按 `未识别窗口` 原样显示，不静默当成 `7d_fable`。
+ */
+export type MirasimQuotaWindowName = '5h' | '7d' | '7d_claude' | '7d_fable'
+
+/**
+ * 一个窗口的读数。数值字段**全部可为 null**，与后端 DTO 的指针字段一一对应：
+ * 「上游没给这个数」和「上游给的是 0」是两个事实，合并它们就是把「没探到」
+ * 显示成「额度充足」的那一个错误。null = 未知，必须渲染成未知，不能渲染成 0。
+ *
+ * - `source: 'limits'`（主动 GET /v1/limits）：used / budget 绝对值齐全
+ * - `source: 'headers'`（响应头被动采样）：只有 utilization，used / budget 恒为 null
+ *
+ * `utilization` 是 **0..1 小数**（不是百分数），且**可能大于 1** —— 1.02 是真实
+ * 观测值，意思是用掉了额度的 102%。进度条只许 clamp 宽度，不许 clamp 这个数。
+ */
+export interface MirasimQuotaWindow {
+  /** 上游原样返回的窗口名，未必是 MirasimQuotaWindowName 里的值。 */
+  name: string
+  used: number | null
+  budget: number | null
+  utilization: number | null
+  reset_at: string | null
+}
+
+/**
+ * 账号的 mirasim 额度快照 + 套餐投影。**非 mirasim 账号是显式 null**（字段恒在，
+ * 不省略：省略会让「不是 mirasim 账号」和「后端还不认识这个字段」无法区分）。
+ *
+ * mirasim 账号则字段恒在，两半各有各的生产者：额度那半在有读数前是
+ * `windows: []` + `source: ''`，套餐那半在 plan probe 跑过之前是 `plan: ''`。
+ * 两半不会互相合成，缺的那半也不会被编一个默认值。
+ */
+export interface MirasimQuotaSnapshot {
+  /**
+   * windows 是哪来的，决定了它能承载多少信息：
+   * - `'limits'`  主动探测，有绝对额度
+   * - `'headers'` 被动采样，只有比例
+   * - `''`        根本没有读数，windows 为 []。**这与「探到 0%」是两件事。**
+   */
+  source: '' | 'limits' | 'headers'
+  /**
+   * 最近一次 /v1/limits 探测的结果（`'ok' | 'failed'`，没跑过是 `''`）。
+   * 它描述的是**探测**不是读数：`'failed'` 配上非空 observed_at，意味着
+   * windows 是上一次的好读数被带过来的，不是新鲜的。
+   */
+  status: '' | 'ok' | 'failed'
+  /** 上游把这个账号的额度整体挂起（只有主动探测能观测到）。 */
+  suspended: boolean
+  /** windows 这份读数是什么时候取的。null = 从未观测。 */
+  observed_at: string | null
+  /** 恒非 null（无读数时是 []）。只含上游真的报过的窗口，缺的窗口就是缺，不补零。 */
+  windows: MirasimQuotaWindow[]
+  /** 来自 ResolveMirasimPlan 的单一优先级判定，`''` = 未知。 */
+  plan: string
+  next_plan: string
+  /** 订阅到期（RFC3339 原样透传），不是 access token 的 expires_at。 */
+  plan_expires_at: string
+  /**
+   * 给 plan 定级：`'authoritative'` 是探测读回来的事实，`'claimed'` 是导入时的
+   * 声明值（**未经核实，且已知会虚标**），`'unknown'` 是没有值。
+   * 把 claimed 画成事实徽章，就是「标 max 实为 plus」这个 bug 的 UI 版本。
+   */
+  plan_source: 'authoritative' | 'claimed' | 'unknown'
+}
+
+/** POST /admin/accounts/:id/mirasim-quota 的返回（外层 {code,message,data} 已由拦截器剥掉）。 */
+export interface MirasimQuotaProbeResponse {
+  account_id: number
+  /**
+   * 这次调用有没有真的走上游。false = 返回的是存量读数，新鲜度由
+   * `quota.observed_at` 说了算 —— 此时说「探测成功」是运营者无法察觉的谎。
+   */
+  probed: boolean
+  quota: MirasimQuotaSnapshot | null
+}
+
 export interface Account {
   id: number
   name: string
@@ -1168,6 +1250,8 @@ export interface Account {
   credentials?: Record<string, unknown>
   credentials_status?: Record<string, boolean>
   ollama_cloud_usage?: OllamaCloudUsageState
+  /** mirasim 额度窗口 + 套餐快照。非 mirasim 账号为 null / 缺失。 */
+  mirasim_quota?: MirasimQuotaSnapshot | null
   // Extra fields including Codex usage, OpenAI compact capability, and model-level rate limits.
   extra?: (CodexUsageSnapshot & OpenAICompactState & {
     model_rate_limits?: Record<string, { rate_limited_at: string; rate_limit_reset_at: string }>

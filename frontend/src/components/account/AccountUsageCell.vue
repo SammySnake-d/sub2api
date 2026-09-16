@@ -581,6 +581,12 @@
         :account="account"
         @updated="handleOllamaCloudUsageUpdated"
       />
+      <!-- mirasim 账号（anthropic + apikey）：四个并存额度窗口 + 套餐 -->
+      <MirasimQuotaCell
+        v-if="account.mirasim_quota"
+        :account="account"
+        @updated="handleMirasimQuotaUpdated"
+      />
       <!-- Today stats row (requests, tokens, cost, user_cost) -->
       <div
         v-if="todayStats"
@@ -639,7 +645,7 @@
 
       <!-- No data at all -->
       <div
-        v-if="!todayStats && !todayStatsLoading && !hasApiKeyQuota && !account.ollama_cloud_usage?.eligible"
+        v-if="!todayStats && !todayStatsLoading && !hasApiKeyQuota && !account.ollama_cloud_usage?.eligible && !account.mirasim_quota"
         class="text-xs text-gray-400"
       >-</div>
     </div>
@@ -661,6 +667,7 @@ import GrokQuotaProbeCell from './GrokQuotaProbeCell.vue'
 import CNProviderQuotaCell from './CNProviderQuotaCell.vue'
 import CNProviderBalanceCell from './CNProviderBalanceCell.vue'
 import OllamaCloudUsageCell from './OllamaCloudUsageCell.vue'
+import MirasimQuotaCell from './MirasimQuotaCell.vue'
 import { cnQuotaCellVisible as cnQuotaCellVisibleFn, cnBalanceCellVisible as cnBalanceCellVisibleFn } from './credentialsBuilder'
 
 // Module-level cache shared across all AccountUsageCell instances
@@ -1559,6 +1566,10 @@ const handleQuotaResetAccountUpdated = (account: Account) => {
 
 const handleOllamaCloudUsageUpdated = (state: NonNullable<Account['ollama_cloud_usage']>) => {
   emit('account-updated', { ...props.account, ollama_cloud_usage: state })
+}
+
+const handleMirasimQuotaUpdated = (snapshot: NonNullable<Account['mirasim_quota']>) => {
+  emit('account-updated', { ...props.account, mirasim_quota: snapshot })
 }
 
 // ===== Key account today stats formatters =====

@@ -461,6 +461,27 @@ func (s *MirasimPlanProbeService) SetLeaderLock(lockCache LeaderLockCache, db *s
 	s.db = db
 }
 
+// SharedRegistry exposes this probe's credential registry so a SECOND mirasim
+// control-plane prober can reuse it instead of building a third one.
+//
+// WHY SHARING MATTERS. A mirasim.Registry owns, per account, the live access
+// token AND the short-lived device ticket minted from it. Every extra registry
+// is an extra ticket mint on the same account — N registries mean N tickets
+// racing, each one invalidating the others' issuer hash, and a token rotation
+// performed by one is invisible to the others until it has round-tripped through
+// the database. The signing decorator already keeps a registry of its own
+// (converging through the DB, see NewMirasimPlanProbeService), and two is the
+// price of that seam; a third has no such excuse.
+//
+// Returns a fresh registry when the plan probe is absent, so a caller never has
+// to nil-check before wiring itself up.
+func (s *MirasimPlanProbeService) SharedRegistry() *mirasim.Registry {
+	if s == nil || s.registry == nil {
+		return mirasim.NewRegistry()
+	}
+	return s.registry
+}
+
 // ProvideMirasimPlanProbeService starts the process-wide periodic runner.
 func ProvideMirasimPlanProbeService(
 	accountRepo AccountRepository,
