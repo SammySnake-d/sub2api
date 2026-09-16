@@ -694,6 +694,11 @@ const (
 	// 在检测到非官方 base URL 时注入的 3 bit 隐写指纹。仅适用于 Anthropic OAuth/SetupToken
 	// 账号；API Key 账号不受影响。
 	SettingKeyEnableClientDatelineNormalization = "enable_client_dateline_normalization"
+	// SettingKeyMirasimCapacityParkMinutes mirasim 上游 503（service_capacity_overloaded）
+	// 之后，把「这个账号 × 这个模型」停调多少分钟（默认 10）。
+	// 0 = 完全不停调，行为与该功能上线前一致（运维逃生口）。
+	// 容量池每模型独立，所以停调粒度是模型级，绝不是账号级；见 mirasim_capacity_park.go。
+	SettingKeyMirasimCapacityParkMinutes = "mirasim_capacity_park_minutes"
 	// SettingKeyRewriteMessageCacheControl 是否改写 messages[*].content[*].cache_control（默认 false）
 	SettingKeyRewriteMessageCacheControl = "rewrite_message_cache_control"
 	// SettingKeyAntigravityUserAgentVersion Antigravity 上游 User-Agent 版本号（空值使用环境变量/默认值）

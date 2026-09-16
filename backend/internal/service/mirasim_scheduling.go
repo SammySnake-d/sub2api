@@ -275,16 +275,29 @@ func mirasimWindowReason(window string) string {
 
 // mirasimModelRateLimitKeys is the read-side hook, called from
 // modelRateLimitKeysForRequest inside case PlatformAnthropic. It returns the
-// family scope this request must also clear. Returning nil for a non-mirasim
-// account is what keeps every other anthropic account byte-identical.
+// scopes this request must also clear:
+//
+//	the family 7d window scope (quota exhaustion, day-scale), and
+//	the per-model capacity scope (503 capacity park, minute-scale).
+//
+// Both are per-(account, scope) entries in extra.model_rate_limits and they are
+// deliberately different keys — see mirasim_capacity_park.go for why merging
+// them would let a 10-minute capacity park shorten a multi-day window cooldown.
+//
+// Returning nil for a non-mirasim account is what keeps every other anthropic
+// account byte-identical.
 func mirasimModelRateLimitKeys(a *Account, modelKey string) []string {
 	if !IsMirasimAccount(a) {
 		return nil
 	}
+	var keys []string
 	if scope := mirasimFamilyScope(modelKey); scope != "" {
-		return []string{scope}
+		keys = append(keys, scope)
 	}
-	return nil
+	if scope := mirasimCapacityRateLimitScope(modelKey); scope != "" {
+		keys = append(keys, scope)
+	}
+	return keys
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +328,13 @@ const (
 	// MirasimActionAccountFatal: an operator-visible account state (banned, no
 	// balance). Handled by the existing shared path, which disables the account.
 	MirasimActionAccountFatal MirasimStatusAction = "account_fatal"
+	// MirasimActionModelCapacityPark: the upstream capacity pool for THIS MODEL
+	// is momentarily full (503 service_capacity_overloaded). The account's quota
+	// is untouched and the account is healthy — but it has no capacity for this
+	// model right now, so scheduling the same (account, model) again in the next
+	// seconds only buys another 503. Parked per model, never per account: the
+	// capacity pools are independent per model. See mirasim_capacity_park.go.
+	MirasimActionModelCapacityPark MirasimStatusAction = "model_capacity_park"
 )
 
 // mirasimAccountFatal400Markers are the three upstream 400 messages sub2api
@@ -338,7 +358,10 @@ var mirasimAccountFatal400Markers = []string{
 //	      being spent on the upstream.
 //	400 → account-fatal only for the three known messages; every other 400 is a
 //	      property of this request's headers/body, not of the account.
-//	503 → the model has no capacity right now. The account is healthy.
+//	503 → the model's capacity pool is full right now. The account is healthy and
+//	      its quota is untouched, so nothing account-level is written; only the
+//	      (account, model) pair is parked for a short while (mirasim_capacity_park.go),
+//	      because re-offering the same pair immediately only buys another 503.
 //	499 → the downstream client went away. Says nothing about anything upstream.
 func MirasimClassifyStatus(statusCode int, responseBody []byte) MirasimStatusAction {
 	switch statusCode {
@@ -353,7 +376,9 @@ func MirasimClassifyStatus(statusCode int, responseBody []byte) MirasimStatusAct
 			return MirasimActionAccountFatal
 		}
 		return MirasimActionRequestScoped
-	case http.StatusServiceUnavailable, statusMirasimClientClosedRequest:
+	case http.StatusServiceUnavailable:
+		return MirasimActionModelCapacityPark
+	case statusMirasimClientClosedRequest:
 		return MirasimActionRequestScoped
 	}
 	return MirasimActionShared
@@ -805,6 +830,14 @@ func (s *RateLimitService) handleMirasimUpstreamError(
 		slog.Info("mirasim_401_credential_refresh",
 			"account_id", account.ID,
 			"has_refresh_token", strings.TrimSpace(account.GetCredential(mirasim.CredRefreshToken)) != "")
+		return true, false
+
+	case MirasimActionModelCapacityPark:
+		// 503：这个模型的容量池此刻满了。账号级状态一个字段都不动 —— 额度是好的，
+		// 号是好的；只把「这个账号 × 这个模型」停调一小会儿，否则同一个没容量的号
+		// 会被后续请求反复选中、反复吃 503。
+		// 粒度是模型不是账号：容量池每模型独立，停整号会白白废掉一个健康号。
+		s.parkMirasimModelCapacity(ctx, account, statusCode, responseBody)
 		return true, false
 
 	case MirasimActionRequestScoped:

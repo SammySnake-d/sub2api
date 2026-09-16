@@ -6,6 +6,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	mathrand "math/rand"
@@ -94,10 +95,38 @@ func (s *GatewayService) SelectAccountForModelWithExclusions(ctx context.Context
 	return s.hydrateSelectedAccount(ctx, account)
 }
 
-// SelectAccountWithLoadAwareness selects account with load-awareness and wait plan.
+// SelectAccountWithLoadAwareness 选号入口（负载感知 + 等待计划）。
 // metadataUserID: 用于客户端亲和调度，从中提取客户端 ID
 // sub2apiUserID: 系统用户 ID，用于二维亲和调度
+//
+// 它在真正的选号外面包了一层 mirasim 503 容量停调的 fail-open：先严格选一轮，
+// 只有在严格轮**确实**返回 ErrNoAvailableAccounts、且本轮至少有一个账号是
+// 「只被容量停调挡住」时，才忽略容量停调重选一轮。
+//
+// 判据放在这里而不是选号内部，是因为「候选到底空不空」是选号全部过滤跑完之后
+// 才知道的事实；任何在过滤之前做的预测都会漏掉后面那几道（渠道限制、模型不支持、
+// 配额、RPM……），说「不用退化」而候选集其实是空的。
+//
+// 重选是安全的：选号过滤是纯读，不改粘性绑定，也不消耗并发槽位——槽位获取发生在
+// 选出账号之后。正常情况下（没有任何账号被容量停调）observer 恒为 false，
+// 第二轮根本不会发生，对非 mirasim 渠道是零行为变化、零额外开销。
 func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, metadataUserID string, sub2apiUserID int64) (*AccountSelectionResult, error) {
+	strictCtx, parkObserver := withMirasimCapacityParkObserver(ctx)
+	result, err := s.selectAccountWithLoadAwarenessOnce(strictCtx, groupID, sessionHash, requestedModel, excludedIDs, metadataUserID, sub2apiUserID)
+	if !errors.Is(err, ErrNoAvailableAccounts) || !parkObserver.blocked.Load() {
+		return result, err
+	}
+
+	slog.Info("mirasim_capacity_park_fail_open",
+		"model", requestedModel,
+		"group_id", derefGroupID(groupID),
+		"session", shortSessionHash(sessionHash),
+		"detail", "严格轮无可用账号且有号仅被 503 容量停调挡住，忽略停调重选：宁可撞 503，也不返回无可用账号")
+
+	return s.selectAccountWithLoadAwarenessOnce(withMirasimCapacityParkIgnored(ctx), groupID, sessionHash, requestedModel, excludedIDs, metadataUserID, sub2apiUserID)
+}
+
+func (s *GatewayService) selectAccountWithLoadAwarenessOnce(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, metadataUserID string, sub2apiUserID int64) (*AccountSelectionResult, error) {
 	// 调试日志：记录调度入口参数
 	excludedIDsList := make([]int64, 0, len(excludedIDs))
 	for id := range excludedIDs {
@@ -242,6 +271,10 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 		_, excluded := excludedIDs[accountID]
 		return excluded
 	}
+
+	// mirasim 503 容量停调的退化不在这里决定：事前预测会漏掉本函数后面那六道过滤
+	// （渠道限制、模型不支持、平台归属、利润门、配额、RPM），说「不用退化」而候选集
+	// 其实是空的。判据改由入口按「严格一轮真的没选出来」来下，见 mirasim_capacity_park.go。
 
 	// upstream 计费基准的渠道模型限制以账号映射后的上游模型为准，只能逐账号判定；
 	// 负载感知各层的候选过滤与粘性 gate 共用这一判定。
@@ -1157,7 +1190,12 @@ func (s *GatewayService) isAccountSchedulableForModelSelection(ctx context.Conte
 	if account == nil {
 		return false
 	}
-	return account.IsSchedulableForModelWithContext(ctx, requestedModel)
+	if account.IsSchedulableForModelWithContext(ctx, requestedModel) {
+		return true
+	}
+	// mirasim 503 容量停调的退化放行。严格轮里它恒返回 false（只是记一笔），
+	// 只有入口在严格轮确实选不出账号后重选时才会放行。见 mirasim_capacity_park.go。
+	return mirasimCapacityParkAdmits(ctx, account, requestedModel)
 }
 
 // isAccountInGroup checks if the account belongs to the specified group.

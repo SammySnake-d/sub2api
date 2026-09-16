@@ -250,13 +250,16 @@ type UpdateSettingsRequest struct {
 	EnableClaudeOAuthSystemPromptInjection *bool   `json:"enable_claude_oauth_system_prompt_injection"`
 	ClaudeOAuthSystemPrompt                *string `json:"claude_oauth_system_prompt"`
 	ClaudeOAuthSystemPromptBlocks          *string `json:"claude_oauth_system_prompt_blocks"`
-	EnableAnthropicCacheTTL1hInjection     *bool   `json:"enable_anthropic_cache_ttl_1h_injection"`
-	RewriteMessageCacheControl             *bool   `json:"rewrite_message_cache_control"`
-	EnableClientDatelineNormalization      *bool   `json:"enable_client_dateline_normalization"`
-	AntigravityUserAgentVersion            *string `json:"antigravity_user_agent_version"`
-	OpenAICodexUserAgent                   *string `json:"openai_codex_user_agent"`
-	OpenAICodexClientVersion               *string `json:"openai_codex_client_version"`
-	OpenAICodexVersionAutoSyncEnabled      *bool   `json:"openai_codex_version_auto_sync_enabled"`
+	// MirasimCapacityParkMinutes 用 *int 而不是 int：0 是有意义的值（完全不停调，
+	// 运维逃生口），必须与"这次 PATCH 没带这个字段"区分开，后者应保留原值。
+	MirasimCapacityParkMinutes         *int    `json:"mirasim_capacity_park_minutes"`
+	EnableAnthropicCacheTTL1hInjection *bool   `json:"enable_anthropic_cache_ttl_1h_injection"`
+	RewriteMessageCacheControl         *bool   `json:"rewrite_message_cache_control"`
+	EnableClientDatelineNormalization  *bool   `json:"enable_client_dateline_normalization"`
+	AntigravityUserAgentVersion        *string `json:"antigravity_user_agent_version"`
+	OpenAICodexUserAgent               *string `json:"openai_codex_user_agent"`
+	OpenAICodexClientVersion           *string `json:"openai_codex_client_version"`
+	OpenAICodexVersionAutoSyncEnabled  *bool   `json:"openai_codex_version_auto_sync_enabled"`
 
 	// codex_cli_only 加固（global-only）
 	MinCodexVersion                      string `json:"min_codex_version"`
@@ -1717,6 +1720,12 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 				return *req.ClaudeOAuthSystemPrompt
 			}
 			return previousSettings.ClaudeOAuthSystemPrompt
+		}(),
+		MirasimCapacityParkMinutes: func() int {
+			if req.MirasimCapacityParkMinutes != nil {
+				return *req.MirasimCapacityParkMinutes
+			}
+			return previousSettings.MirasimCapacityParkMinutes
 		}(),
 		ClaudeOAuthSystemPromptBlocks: func() string {
 			if req.ClaudeOAuthSystemPromptBlocks != nil {

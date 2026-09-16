@@ -225,11 +225,21 @@ func mirasimSnapshotAccount(a *Account) mirasimAccountSchedulingSnapshot {
 
 func TestMirasim503CapacityLeavesAccountHealthy(t *testing.T) {
 	// [[cov:SC:503-capacity]]
+	//
+	// 本测试的口径在「503 按模型停调」上线后改过一次，改动本身就是断言：
+	//
+	//	之前：503 什么都不写（于是同一个没容量的号被反复选中、反复吃 503）
+	//	现在：503 只写**模型级**容量停调，账号级状态仍然一个字段都不许动
+	//
+	// 「账号仍然健康」这句话的含义没有变 —— 变的是「不写任何东西」不再是它的
+	// 正确编码方式。停调时长、模型隔离、0=关闭、fail-open 见
+	// mirasim_capacity_park_test.go。
+	ctx := context.Background()
 	svc, repo, account := mirasimServiceWithStub()
 	before := mirasimSnapshotAccount(account)
 
 	shouldDisable := svc.HandleUpstreamError(
-		context.Background(),
+		ctx,
 		account,
 		http.StatusServiceUnavailable,
 		http.Header{},
@@ -239,13 +249,27 @@ func TestMirasim503CapacityLeavesAccountHealthy(t *testing.T) {
 
 	require.Equal(t, false, shouldDisable,
 		"503 是「这个模型此刻没容量」，不是账号出了问题 —— 禁用账号会把一个健康号从池子里摘掉")
-	// 账号状态必须一个字段都没动。整体快照比较，而不是逐字段挑几个查：
-	// 后者在新增冷却字段后会静默失效。
-	require.Equal(t, before, mirasimSnapshotAccount(account),
-		"503 改写了账号状态；差异见上（左=收到 503 之前，右=之后）")
-	require.Len(t, repo.calls, 0, "503 不该产生任何一次账号状态落库")
-	require.True(t, account.IsSchedulable())
-	require.True(t, account.IsSchedulableForModelWithContext(context.Background(), "claude-opus-4-6"))
+
+	// 账号**级**状态必须一个字段都没动。整体快照比较，而不是逐字段挑几个查：
+	// 后者在新增冷却字段后会静默失效。model_rate_limits 这一项被排除在比较之外，
+	// 因为它正是这次 503 唯一允许改写的地方（改写内容由下面单独断言）。
+	afterAccountLevel := mirasimSnapshotAccount(account)
+	afterAccountLevel.ModelRateLimits = before.ModelRateLimits
+	require.Equal(t, before, afterAccountLevel,
+		"503 改写了账号级状态；差异见上（左=收到 503 之前，右=之后）")
+
+	// 唯一允许的落库是模型级容量停调。账号级限流/临时不可调度/禁用一个都不许有。
+	require.Len(t, repo.callsOf("SetModelRateLimit"), 1)
+	require.Equal(t, mirasimCapacityRateLimitScope("claude-opus-4-6"), repo.calls[0].scope)
+	require.Empty(t, repo.callsOf("SetRateLimited"), "容量 503 不得写账号级限流")
+	require.Empty(t, repo.callsOf("SetTempUnschedulable"))
+	require.Empty(t, repo.callsOf("SetError"))
+
+	require.True(t, account.IsSchedulable(), "账号本身仍然健康")
+	require.False(t, account.IsSchedulableForModelWithContext(ctx, "claude-opus-4-6"),
+		"被 503 的那个模型此刻不该再被调度到这个号上")
+	require.True(t, account.IsSchedulableForModelWithContext(ctx, "claude-fable-5"),
+		"容量池每模型独立：另一个模型必须仍可调度")
 }
 
 func TestMirasim4295hWindowCoolsAccountLevelScalarOnly(t *testing.T) {

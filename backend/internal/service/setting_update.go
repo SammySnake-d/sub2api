@@ -481,6 +481,16 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	updates[SettingKeyEnableAnthropicCacheTTL1hInjection] = strconv.FormatBool(settings.EnableAnthropicCacheTTL1hInjection)
 	updates[SettingKeyRewriteMessageCacheControl] = strconv.FormatBool(settings.RewriteMessageCacheControl)
 	updates[SettingKeyEnableClientDatelineNormalization] = strconv.FormatBool(settings.EnableClientDatelineNormalization)
+	// mirasim 503 容量停调分钟数。0 是合法值（= 关闭停调），必须能被写进去；
+	// 负数/超限当成误配，按默认/上限归一，不让一次手滑把停调变成天级。
+	mirasimParkMinutes := settings.MirasimCapacityParkMinutes
+	if mirasimParkMinutes < 0 {
+		mirasimParkMinutes = mirasimCapacityParkDefaultMinutes
+	}
+	if mirasimParkMinutes > mirasimCapacityParkMaxMinutes {
+		mirasimParkMinutes = mirasimCapacityParkMaxMinutes
+	}
+	updates[SettingKeyMirasimCapacityParkMinutes] = strconv.Itoa(mirasimParkMinutes)
 	updates[SettingKeyAntigravityUserAgentVersion] = antigravity.NormalizeUserAgentVersion(settings.AntigravityUserAgentVersion)
 	updates[SettingKeyOpenAICodexUserAgent] = strings.TrimSpace(settings.OpenAICodexUserAgent)
 	updates[SettingKeyOpenAICodexClientVersion] = NormalizeCodexClientVersion(settings.OpenAICodexClientVersion)

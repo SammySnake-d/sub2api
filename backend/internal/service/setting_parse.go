@@ -881,6 +881,16 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	} else {
 		result.EnableClientDatelineNormalization = true
 	}
+	// mirasim 503 容量停调：默认 10 分钟。
+	// 显式的 "0" 必须原样保留（= 关闭停调，运维逃生口），所以这里只把
+	// 「缺失 / 空 / 解析失败 / 负数」当作未配置回落默认值，不能用 v > 0 做判据。
+	result.MirasimCapacityParkMinutes = mirasimCapacityParkDefaultMinutes
+	if v, err := strconv.Atoi(strings.TrimSpace(settings[SettingKeyMirasimCapacityParkMinutes])); err == nil && v >= 0 {
+		if v > mirasimCapacityParkMaxMinutes {
+			v = mirasimCapacityParkMaxMinutes
+		}
+		result.MirasimCapacityParkMinutes = v
+	}
 	result.AntigravityUserAgentVersion = antigravity.NormalizeUserAgentVersion(settings[SettingKeyAntigravityUserAgentVersion])
 	result.OpenAICodexUserAgent = strings.TrimSpace(settings[SettingKeyOpenAICodexUserAgent])
 	result.OpenAICodexClientVersion = NormalizeCodexClientVersion(settings[SettingKeyOpenAICodexClientVersion])

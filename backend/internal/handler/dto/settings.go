@@ -212,11 +212,14 @@ type SystemSettings struct {
 	EnableAnthropicCacheTTL1hInjection     bool   `json:"enable_anthropic_cache_ttl_1h_injection"`
 	RewriteMessageCacheControl             bool   `json:"rewrite_message_cache_control"`
 	EnableClientDatelineNormalization      bool   `json:"enable_client_dateline_normalization"`
-	AntigravityUserAgentVersion            string `json:"antigravity_user_agent_version"`
-	OpenAICodexUserAgent                   string `json:"openai_codex_user_agent"`
-	OpenAICodexClientVersion               string `json:"openai_codex_client_version"`
-	OpenAICodexClientVersionSynced         string `json:"openai_codex_client_version_synced"`
-	OpenAICodexVersionAutoSyncEnabled      bool   `json:"openai_codex_version_auto_sync_enabled"`
+	// MirasimCapacityParkMinutes: mirasim 503（容量池满）之后按模型停调的分钟数。
+	// 默认 10；0 = 完全不停调（运维逃生口，行为回到该功能上线前）。
+	MirasimCapacityParkMinutes        int    `json:"mirasim_capacity_park_minutes"`
+	AntigravityUserAgentVersion       string `json:"antigravity_user_agent_version"`
+	OpenAICodexUserAgent              string `json:"openai_codex_user_agent"`
+	OpenAICodexClientVersion          string `json:"openai_codex_client_version"`
+	OpenAICodexClientVersionSynced    string `json:"openai_codex_client_version_synced"`
+	OpenAICodexVersionAutoSyncEnabled bool   `json:"openai_codex_version_auto_sync_enabled"`
 
 	// codex_cli_only 加固
 	MinCodexVersion                      string `json:"min_codex_version"`
