@@ -29,12 +29,25 @@ package service
 // 第 6 段（device.go:98），所以「声称的版本」与「实际签名算法」是一个组合，
 // 不能单独 bump。
 //
-// 测试落点说明（为什么不在这里驱动 repository/mirasim_upstream.go 的装饰器）：
-// internal/repository 依赖 internal/service，本文件在 package service 内，
-// 反向 import 会成环。因此 1/2 两条不变量直接打在真正的身份内核
-// mirasim.Registry 上，账号读取路径按 repository/mirasim_upstream.go:262-272
-// 逐字段镜像（mirasimIDIdentity）；3 与配套不变量则直接跑真实的出站组装函数
-// buildUpstreamRequest 与真实签名实现 DeviceSigner.Headers / ccore.Sign。
+// 测试落点说明：
+//
+//   - 不变量 1（设备根）不在本文件。它的两条义务 ID:deviceseed-stable /
+//     ID:deviceseed-db-backed 讲的是「真源是 accounts 行，不是缓存」和「跨客户端、
+//     跨重启不变」，而生产里的「缓存」是 repository/mirasim_upstream.go 的
+//     mirasimUpstream.bindings（TTL = mirasimBindingTTL）与 mirasim.Registry，
+//     「客户端」是进到装饰器的那个 *http.Request。本文件在 package service 内，
+//     反向 import repository 会成环，所以这两条打在
+//     repository/mirasim_upstream_test.go 上，驱动真的装饰器与真的缓存层。
+//     在这里用两个测试自造的 map 扮演「DB」和「缓存」只能得到恒真结论。
+//
+//   - 不变量 2（会话根）打在真正的身份内核 mirasim.Registry 上，账号读取路径按
+//     repository/mirasim_upstream.go:262-272 逐字段镜像（mirasimIDIdentity）。
+//
+//   - 不变量 3 与配套不变量直接跑真实的出站组装函数 buildUpstreamRequest 与真实
+//     签名实现 DeviceSigner.Headers / ccore.Sign。
+//
+//   - 末尾的 SG:retry-resigns 跑真实的透传重试循环
+//     （forwardAnthropicAPIKeyPassthrough），因为那段代码就在 package service 里。
 
 import (
 	"bytes"
@@ -57,6 +70,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/mirasim"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/mirasim/ccore"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 )
 
 // ============================================================================
@@ -148,12 +162,6 @@ func (d *mirasimIDDurable) read(id int64) *Account {
 	return &clone
 }
 
-func (d *mirasimIDDurable) readCount() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.reads
-}
-
 func (d *mirasimIDDurable) writeCredentials(id int64, updates map[string]any) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -180,13 +188,6 @@ func (d *mirasimIDDurable) writeExtra(id int64, updates map[string]any) {
 	d.extraWrites = append(d.extraWrites, updates)
 }
 
-func (d *mirasimIDDurable) credential(id int64, key string) string {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	s, _ := d.rows[id].Credentials[key].(string)
-	return s
-}
-
 func (d *mirasimIDDurable) extra(id int64, key string) string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -210,14 +211,6 @@ func (d *mirasimIDDurable) extraWriteCount(key string) int {
 		}
 	}
 	return n
-}
-
-// mirasimIDDropSeed 把持久层里的 device seed 抹掉，用作反向对照：
-// 证明测得的 deviceID 只可能来自持久层，而不是某个缓存里的残留。
-func (d *mirasimIDDurable) dropSeed(id int64) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	delete(d.rows[id].Credentials, mirasim.CredDeviceSeed)
 }
 
 // mirasimIDProcess 是一个运行中的 sub2api 进程：
@@ -339,15 +332,6 @@ func mirasimIDContextHeaders(prepared mirasim.Prepared, clientSessionID string) 
 	return h
 }
 
-// mirasimIDSignedHeaders 跑真实的签名实现（未封装 seal，便于读出明文的
-// x-mirasim-device / x-mirasim-client）。
-func mirasimIDSignedHeaders(t *testing.T, prepared mirasim.Prepared, meta string) map[string]string {
-	t.Helper()
-	hdrs, err := prepared.Signer.Headers(http.MethodPost, mirasimIDSignPath, mirasimIDBody, prepared.Credential, meta, time.Now())
-	require.NoError(t, err)
-	return hdrs
-}
-
 // ----------------------------------------------------------------------------
 // 出站请求组装（版本类义务用）
 // ----------------------------------------------------------------------------
@@ -427,78 +411,6 @@ func mirasimIDKnownSnapshots() []mirasimIDSnapshot {
 // ============================================================================
 // 义务
 // ============================================================================
-
-func TestMirasimIdentityDeviceSeedStableAcrossRestartsAndClients(t *testing.T) {
-	// [[cov:ID:deviceseed-stable]] 同一账号的 DeviceSeed 跨进程重启、跨不同客户端请求保持不变
-	seed := mirasimIDNewSeed(t)
-	durable := mirasimIDNewDurable(mirasimIDAccount(7, seed))
-
-	// 设备根的定义：deviceID 完全由 seed 派生，与请求、与进程、与时间都无关。
-	want, err := mirasim.NewDeviceSigner(seed)
-	require.NoError(t, err)
-
-	// 进程 1：两个不同客户打进同一个号（客户 A 自带 session id，客户 B 没有）。
-	proc1 := mirasimIDBoot(durable)
-	clientA := proc1.prepare(t, 7)
-	clientB := proc1.prepare(t, 7)
-	headersA := mirasimIDContextHeaders(clientA, "session_from_client_a")
-	headersB := mirasimIDContextHeaders(clientB, "")
-
-	require.NotEqual(t, headersA.Get("x-mirasim-session"), headersB.Get("x-mirasim-session"),
-		"前提自检：两个客户在会话维度确实不同，否则下面的『设备仍然同一台』不成立")
-
-	signedA := mirasimIDSignedHeaders(t, clientA, "")
-	signedB := mirasimIDSignedHeaders(t, clientB, "")
-	require.Equal(t, want.DeviceID, signedA["x-mirasim-device"],
-		"客户 A 的出站设备 id 必须等于 NewDeviceSigner(seed) 派生值")
-	require.Equal(t, want.DeviceID, signedB["x-mirasim-device"],
-		"客户 B 打的是同一个号，上游必须看到同一台设备")
-	require.Equal(t, want.PublicKeyB64, clientA.Signer.PublicKeyB64,
-		"device-session 注册用的 SPKI 公钥同样由 seed 派生，不得随请求变化")
-
-	// 进程 2 = 重启（Registry 全新、缓存全空）。迁移/重启后设备 id 必须原样。
-	proc2 := mirasimIDBoot(durable)
-	proc2.flushCache()
-	afterRestart := proc2.prepare(t, 7)
-	require.Equal(t, want.DeviceID, afterRestart.Signer.DeviceID,
-		"重启后设备 id 变了 = 上游看到这个号换了一台新设备")
-	require.Equal(t, seed, durable.credential(7, mirasim.CredDeviceSeed),
-		"持久层里的 device seed 不得被任何一次请求重铸")
-	require.Empty(t, durable.credWrites,
-		"正常请求路径不得往 credentials 写任何东西（一次重铸 seed 的写入就是一次换设备）")
-}
-
-func TestMirasimIdentityDeviceSeedSurvivesCacheWipe(t *testing.T) {
-	// [[cov:ID:deviceseed-db-backed]] 清空缓存层后 DeviceSeed 仍不变（必须来自持久存储，不是 Redis）
-	seed := mirasimIDNewSeed(t)
-	durable := mirasimIDNewDurable(mirasimIDAccount(11, seed))
-
-	warm := mirasimIDBoot(durable)
-	before := warm.prepare(t, 11).Signer.DeviceID
-	require.NotEmpty(t, before)
-
-	// 把所有非持久层一起抹掉：新 Registry（进程内存态没了）+ 空账号快照缓存
-	// （Redis flushall / 装饰器 binding 过期）。
-	cold := mirasimIDBoot(durable)
-	cold.flushCache()
-	readsBefore := durable.readCount()
-	after := cold.prepare(t, 11).Signer.DeviceID
-	require.Greater(t, durable.readCount(), readsBefore,
-		"仪器自检：缓存清空后这次 Prepare 必须真的回持久层读了一次")
-	require.Equal(t, before, after,
-		"清掉缓存层后设备 id 必须不变 —— 它的真源是 accounts.credentials.%s", mirasim.CredDeviceSeed)
-
-	// 反向对照（证明上面的等式不是某个缓存里的残留在撑着）：
-	// 把持久层的 seed 抹掉后再冷启，身份必须立刻失败而不是「还能跑」。
-	durable.dropSeed(11)
-	orphan := mirasimIDBoot(durable)
-	orphan.flushCache()
-	_, err := orphan.prepareErr(11)
-	require.Error(t, err,
-		"持久层的 seed 没了却还能签出设备 id，说明身份根实际来自某个缓存层，不是持久存储")
-	require.Contains(t, err.Error(), "device seed",
-		"mirasim.Registry.Prepare 必须明确拒绝无 device seed 的账号（runtime.go:222）")
-}
 
 func TestMirasimIdentitySessionIDStableAcrossRestart(t *testing.T) {
 	// [[cov:ID:sessionid-stable]] x-mirasim-session fallback 跨重启不变
@@ -612,6 +524,22 @@ func TestMirasimIdentityOutboundVersionSetIsCoherent(t *testing.T) {
 			break
 		}
 	}
+	// 先钉死出站的三个值各自是什么，再判它们属于同一份快照。
+	// 只断言 "matched 非空" 的话，把三个值全改成另一份一致的快照照样绿 ——
+	// 那就丢掉了「归一到 canonical 值」这半条不变量。
+	require.Equal(t, claude.CLIVersion(), gotCLI,
+		"出站 claude-cli 版本必须是 canonical 值，而不是客户自报的 2.1.100")
+	// 比的是 **mirasim 自己的** canonical 快照，不是 sub2api 的 defaultFingerprint。
+	// 两者此刻并不相同：defaultFingerprint.StainlessPackageVersion 还停在 0.94.0，
+	// 而真实 Claude Code 2.1.272 实测发的是 0.112.1（2026-09-16 本地抓包，
+	// 连同 x-stainless-runtime-version=v26.3.0 一起核过）。mirasim lane 用的是后者。
+	// 拿 defaultFingerprint 当期望值会把这条门钉在一个**过时**的值上。
+	canonicalHeaders := mirasim.CanonicalIdentityHeaders()
+	require.Equal(t, canonicalHeaders["X-Stainless-Package-Version"], gotPackage,
+		"出站 x-stainless-package-version 必须是 mirasim canonical 值")
+	require.Equal(t, canonicalHeaders["X-Stainless-Runtime-Version"], gotRuntime,
+		"出站 x-stainless-runtime-version 必须是 mirasim canonical 值")
+
 	require.NotEmptyf(t, matched,
 		"出站的 (claude-cli, x-stainless-package-version, x-stainless-runtime-version) "+
 			"必须整组来自同一份真实快照，不得混搭。\n"+
@@ -669,4 +597,148 @@ func TestMirasimIdentityClientHeaderPairedWithSigningScheme(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, base64.RawURLEncoding.EncodeToString(declaredSig), base64.RawURLEncoding.EncodeToString(otherSig),
 		"规范串第 6 段换了版本号签名却没变，说明 ClientVersion 根本没进签名")
+}
+
+// ============================================================================
+// 重试路径：每次尝试都是新建 + 重新签名的请求
+// ============================================================================
+
+// mirasimRetryCredential 是 seam 注入的设备票据，扮演生产里
+// mirasim.Prepared.Credential 的位置：它只可能由签名层写上去，所以它出现在
+// 「进入签名层的那一刻」就等于这个请求已经被签过一次了。
+const mirasimRetryCredential = "mirasim-device-ticket"
+
+// mirasimRetryAttempt 是签名层在一次尝试里看到的东西。
+type mirasimRetryAttempt struct {
+	req     *http.Request // 指针身份：重放的话两次会是同一个对象
+	inbound http.Header   // 进入签名层那一刻的头（克隆，尚未被本层改写）
+	body    []byte
+	sealed  string // 本层签完之后的 x-mirasim-enc
+}
+
+// mirasimRetrySeam 站在生产里签名装饰器所在的**那个位置**：GatewayService.httpUpstream。
+// 组装时包住这个口子的就是 repository.NewMirasimUpstream(NewHTTPUpstream(cfg), accountRepo)，
+// 所以「重试时装饰器会看到什么」等价于「这个 seam 会看到什么」。
+//
+// 本包 import repository 会成环，所以这里不是包装那个装饰器，而是在同一个位置、按
+// repository/mirasim_upstream.go sign() 的同一顺序跑**真实的**签名实现
+// （删 x-api-key → 换 Authorization → ApplyContextHeaders → SignAndSeal），
+// 并把每次尝试进来时的原始头原样留证。
+type mirasimRetrySeam struct {
+	signer   *mirasim.DeviceSigner
+	statuses []int
+	attempts []mirasimRetryAttempt
+}
+
+func (s *mirasimRetrySeam) DoWithTLS(req *http.Request, proxyURL string, accountID int64, concurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	return s.Do(req, proxyURL, accountID, concurrency)
+}
+
+func (s *mirasimRetrySeam) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+	att := mirasimRetryAttempt{req: req, inbound: req.Header.Clone()}
+	if req.Body != nil {
+		b, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		_ = req.Body.Close()
+		att.body = b
+		req.Body = io.NopCloser(bytes.NewReader(b))
+	}
+
+	const credential = mirasimRetryCredential
+	req.Header.Del("x-api-key")
+	req.Header.Set("Authorization", "Bearer "+credential)
+	mirasim.ApplyContextHeaders(req.Header, mirasim.ContextInput{
+		Path:       req.URL.Path,
+		SessionID:  "session_from_client",
+		AccountSub: "usr_identity",
+		Locale:     "en-US",
+	})
+	if err := mirasim.SignAndSeal(req.Header, s.signer, req.Method, req.URL.Path, att.body, credential); err != nil {
+		return nil, err
+	}
+	att.sealed = req.Header.Get("x-mirasim-enc")
+	s.attempts = append(s.attempts, att)
+
+	status := s.statuses[len(s.statuses)-1]
+	if i := len(s.attempts) - 1; i < len(s.statuses) {
+		status = s.statuses[i]
+	}
+	body := `{"type":"error","error":{"type":"api_error","message":"boom"}}`
+	if status == http.StatusOK {
+		body = `{"id":"msg_1","type":"message","usage":{"input_tokens":12,"output_tokens":7}}`
+	}
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}, nil
+}
+
+func TestMirasimRetryRebuildsAndResignsInsteadOfReplaying(t *testing.T) {
+	// [[cov:SG:retry-resigns]] 失败重试走的是「重新构造请求 + 重新签名」，
+	// 不是把上一次那个已签请求改一改再发一遍。
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, mirasimIDSignPath, bytes.NewReader(mirasimIDBody))
+	c.Request.Header.Set("x-claude-code-session-id", "session_from_client")
+
+	seed := mirasimIDNewSeed(t)
+	signer, err := mirasim.NewDeviceSigner(seed)
+	require.NoError(t, err)
+	seam := &mirasimRetrySeam{signer: signer, statuses: []int{http.StatusInternalServerError, http.StatusOK}}
+
+	acc := mirasimIDAccount(51, seed)
+	// 透传路径的前置条件，与生产一致：apikey 账号（GetAccessToken 要 api_key，
+	// 导入器写的是占位符）+ extra.anthropic_passthrough=true。
+	acc.Credentials["api_key"] = "mirasim-placeholder"
+	// 500 要真的进这个重试循环，账号必须开自定义错误码且 500 不在表里：
+	// account.go:1254 ShouldHandleErrorCode 在未开启时返回 true，于是
+	// shouldRetryUpstreamError 恒为 false，5xx 会直接走账号 failover 而不是本循环。
+	acc.Credentials["custom_error_codes_enabled"] = true
+	acc.Credentials["custom_error_codes"] = []any{float64(http.StatusPaymentRequired)}
+	acc.Extra = map[string]any{"anthropic_passthrough": true}
+	require.True(t, IsMirasimAccount(acc), "前提自检：这必须是一个 mirasim 账号")
+
+	svc := &GatewayService{
+		cfg:              &config.Config{},
+		httpUpstream:     seam,
+		rateLimitService: &RateLimitService{},
+	}
+
+	result, err := svc.forwardAnthropicAPIKeyPassthrough(context.Background(), c, acc,
+		mirasimIDBody, "claude-opus-5", "claude-opus-5", false, time.Now())
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	require.Len(t, seam.attempts, 2,
+		"上游 500 之后必须真的有第二次尝试，否则这条义务无从谈起（前提自检）")
+	first, second := seam.attempts[0], seam.attempts[1]
+
+	// 核心区分度：第二次尝试到达签名层时，是一个**全新的、还没签过的**请求。
+	require.NotSame(t, first.req, second.req,
+		"重试把第一次那个 *http.Request 又交给了签名层 = 改写并重发已签请求")
+	for k := range second.inbound {
+		require.Falsef(t, strings.HasPrefix(strings.ToLower(k), "x-mirasim-"),
+			"第二次尝试进签名层时就带着 %s：上一次签好的头被重放了", k)
+	}
+	require.NotEmpty(t, second.inbound.Get("x-api-key"),
+		"第二次尝试没有重新走 buildUpstreamRequestAnthropicAPIKeyPassthrough："+
+			"入站鉴权头在上一次签名时已经被删掉，它不会自己长回来")
+	require.NotEqual(t, "Bearer "+mirasimRetryCredential, second.inbound.Get("Authorization"),
+		"第二次尝试带着上一次签名层注入的设备票据进来 = 同一个已签请求被重发")
+
+	// 重新签名的结果：两次的封套不同。这是必要条件不是充分条件
+	// （SealHeaders 每次都画新 nonce），真正的区分度在上面三条。
+	require.NotEmpty(t, second.sealed, "第二次尝试没有被签名")
+	require.NotEqual(t, first.sealed, second.sealed,
+		"两次的 x-mirasim-enc 完全相同：同一个封套被重放了")
+
+	// 重试不得改写请求体：mirasim 的签名覆盖 body，改一个字节两边就对不上。
+	require.NotEmpty(t, first.body)
+	require.Equal(t, first.body, second.body, "重试改写了请求体")
+	require.Equal(t, mirasim.ClientVersion, second.req.Header.Get("x-mirasim-client"),
+		"重签用的仍必须是 mirasim.ClientVersion 这套方案")
 }

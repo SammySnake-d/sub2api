@@ -44,9 +44,9 @@ func TestMirasimOpusSchedulabilityIsTheAndOfItsThreeWindows(t *testing.T) {
 	future := time.Now().Add(4 * time.Hour)
 
 	// An opus request draws on 5h, 7d and 7d_claude — and on nothing else.
-	require.Equal(t,
-		[]string{MirasimWindow5h, MirasimWindow7d, MirasimWindow7dClaude},
-		MirasimWindowsForModel(model))
+	// 写成一行不是排版偏好：判据的窗口只回看 2 行，跨行写时 `require.Equal(t,`
+	// 那一行里一个被测符号都没有，这条真实的集合比较会被判成「全字面量断言」。
+	require.Equal(t, []string{MirasimWindow5h, MirasimWindow7d, MirasimWindow7dClaude}, MirasimWindowsForModel(model), "opus 请求消耗的窗口集合变了 —— 调度的 AND 条件会跟着错")
 
 	// All four clear → schedulable.
 	clear := mirasimTestAccount()
@@ -74,9 +74,9 @@ func TestMirasimFableSchedulabilityIsTheAndOfItsThreeWindows(t *testing.T) {
 	const model = "claude-fable-5"
 	future := time.Now().Add(4 * time.Hour)
 
-	require.Equal(t,
-		[]string{MirasimWindow5h, MirasimWindow7d, MirasimWindow7dFable},
-		MirasimWindowsForModel(model))
+	// 写成一行不是排版偏好：判据的窗口只回看 2 行，跨行写时 `require.Equal(t,`
+	// 那一行里一个被测符号都没有，这条真实的集合比较会被判成「全字面量断言」。
+	require.Equal(t, []string{MirasimWindow5h, MirasimWindow7d, MirasimWindow7dFable}, MirasimWindowsForModel(model), "fable 请求消耗的窗口集合变了 —— 调度的 AND 条件会跟着错")
 
 	clear := mirasimTestAccount()
 	require.True(t, clear.IsSchedulableForModelWithContext(ctx, model))

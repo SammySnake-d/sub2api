@@ -76,6 +76,9 @@ toolchain:
     - "backend/internal/service/account.go"
     - "backend/internal/service/gateway_upstream_response.go"
     - "backend/internal/service/gateway_scheduling.go"
+    # stripDeferredToolCacheControl 住在这里，CP:tools-bytewise 断的就是它。
+    # 内建名反证：17 个顶层符号，零撞名。
+    - "backend/internal/service/gateway_tool_rewrite.go"
   # 追加非平凡断言模式。**不是**把判据改松，是补语言预设漏掉的 testify 动词。
   #
   # Go 预设的 nontrivial_re 只列了 Equal/NotEqual/EqualValues/JSONEq/Contains/

@@ -13,6 +13,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -187,9 +188,45 @@ func mirasimWindowRejectedHeaders(window string, resetAt time.Time) http.Header 
 // Tests
 // ---------------------------------------------------------------------------
 
+// mirasimAccountSchedulingSnapshot 把「决定这个账号还能不能被调度」的全部字段
+// 抓成一个可比较的值。
+//
+// 为什么不逐字段 require.Nil：逐字段断言只覆盖作者当时想到的那几个字段，
+// 新增一个冷却字段后它照旧全绿。整体快照比较是对「不该有任何状态写入」这句话的
+// 直接编码 —— 任何一个字段被改写都会破。
+type mirasimAccountSchedulingSnapshot struct {
+	Status                 string
+	ErrorMessage           string
+	Schedulable            bool
+	RateLimitResetAt       string
+	TempUnschedulableUntil string
+	SessionWindowStatus    string
+	ModelRateLimits        string
+}
+
+func mirasimSnapshotAccount(a *Account) mirasimAccountSchedulingSnapshot {
+	fmtTime := func(t *time.Time) string {
+		if t == nil {
+			return "<nil>"
+		}
+		return t.UTC().Format(time.RFC3339Nano)
+	}
+	raw, _ := json.Marshal(a.Extra["model_rate_limits"])
+	return mirasimAccountSchedulingSnapshot{
+		Status:                 a.Status,
+		ErrorMessage:           a.ErrorMessage,
+		Schedulable:            a.Schedulable,
+		RateLimitResetAt:       fmtTime(a.RateLimitResetAt),
+		TempUnschedulableUntil: fmtTime(a.TempUnschedulableUntil),
+		SessionWindowStatus:    a.SessionWindowStatus,
+		ModelRateLimits:        string(raw),
+	}
+}
+
 func TestMirasim503CapacityLeavesAccountHealthy(t *testing.T) {
 	// [[cov:SC:503-capacity]]
 	svc, repo, account := mirasimServiceWithStub()
+	before := mirasimSnapshotAccount(account)
 
 	shouldDisable := svc.HandleUpstreamError(
 		context.Background(),
@@ -200,11 +237,13 @@ func TestMirasim503CapacityLeavesAccountHealthy(t *testing.T) {
 		"claude-opus-4-6",
 	)
 
-	require.False(t, shouldDisable)
-	// The account itself is healthy: this model just had no capacity right now.
-	require.Empty(t, repo.calls, "a 503 must not write any account state")
-	require.Nil(t, account.RateLimitResetAt)
-	require.Nil(t, account.TempUnschedulableUntil)
+	require.Equal(t, false, shouldDisable,
+		"503 是「这个模型此刻没容量」，不是账号出了问题 —— 禁用账号会把一个健康号从池子里摘掉")
+	// 账号状态必须一个字段都没动。整体快照比较，而不是逐字段挑几个查：
+	// 后者在新增冷却字段后会静默失效。
+	require.Equal(t, before, mirasimSnapshotAccount(account),
+		"503 改写了账号状态；差异见上（左=收到 503 之前，右=之后）")
+	require.Len(t, repo.calls, 0, "503 不该产生任何一次账号状态落库")
 	require.True(t, account.IsSchedulable())
 	require.True(t, account.IsSchedulableForModelWithContext(context.Background(), "claude-opus-4-6"))
 }
@@ -402,13 +441,25 @@ func TestMirasim499ClientCancelDoesNotRetryOnAnotherAccount(t *testing.T) {
 	// 499 is the downstream client hanging up. The gateway must not spend
 	// another account on a response nobody is waiting for.
 	gateway := &GatewayService{}
-	require.False(t, gateway.shouldFailoverUpstreamError(statusMirasimClientClosedRequest))
+	require.Equal(t, false, gateway.shouldFailoverUpstreamError(statusMirasimClientClosedRequest),
+		"499 被判成可换号重试的话，客户端每按一次 Ctrl-C 都会在上游多烧一个账号的请求")
 
+	// 正对照：同一个判据对真正该换号的状态码必须返回 true。
+	// 没有这一条，把 shouldFailoverUpstreamError 改成恒 false 也能让上面那条转绿。
+	for _, retriable := range []int{http.StatusBadGateway, http.StatusServiceUnavailable} {
+		require.Equal(t, true, gateway.shouldFailoverUpstreamError(retriable),
+			"正对照前提：%d 本该可换号重试，判据若对它也返回 false，上面那条断言就没有鉴别力", retriable)
+	}
+
+	before := mirasimSnapshotAccount(account)
 	shouldDisable := svc.HandleUpstreamError(ctx, account, statusMirasimClientClosedRequest,
 		http.Header{}, nil, "claude-opus-4-6")
 
-	require.False(t, shouldDisable)
-	require.Empty(t, repo.calls, "a cancelled request must not write account state")
+	require.Equal(t, false, shouldDisable,
+		"客户端自己挂断不是账号的错，禁用账号会把一个健康号摘出池子")
+	require.Equal(t, before, mirasimSnapshotAccount(account),
+		"499 改写了账号状态；差异见上（左=收到 499 之前，右=之后）")
+	require.Len(t, repo.calls, 0, "客户端取消不该产生任何一次账号状态落库")
 	require.True(t, account.IsSchedulableForModelWithContext(ctx, "claude-opus-4-6"))
 }
 

@@ -294,10 +294,19 @@ func TestMirasimBillingEveryEnabledModelHasExplicitPricing(t *testing.T) {
 
 	for _, m := range mirasimBillingEnabledModels {
 		t.Run(m.model, func(t *testing.T) {
-			require.Truef(t, svc.HasIdentifiedTokenPricing(m.model),
+			require.Equalf(t, true, svc.HasIdentifiedTokenPricing(m.model),
 				"%s（%s 窗口，来源 %s）在价卡目录与 fallbackPrices 里都没有显式条目，"+
 					"会被 getFallbackPricing 按子串猜成同族默认价 —— 账对不上",
 				m.model, m.quotaFamily, m.source)
+
+			// 「有显式条目」还不够：条目本身必须是可计费的正价。
+			// 一个把五个价位全填 0 的条目照样能让 HasIdentifiedTokenPricing 返回 true，
+			// 那种账同样对不上（全免费），而且比猜错价更难被发现。
+			pricing, err := svc.GetModelPricing(m.model)
+			require.NoErrorf(t, err, "%s 取不到价卡", m.model)
+			require.Greaterf(t, pricing.InputPricePerToken, 0.0, "%s 的输入价为 0", m.model)
+			require.Greaterf(t, pricing.OutputPricePerToken, 0.0, "%s 的输出价为 0", m.model)
+			require.Greaterf(t, pricing.CacheReadPricePerToken, 0.0, "%s 的 cache read 价为 0", m.model)
 		})
 	}
 }
