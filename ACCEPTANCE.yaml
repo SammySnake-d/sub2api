@@ -929,3 +929,56 @@ criteria:
     risk: "high"
     covers: ["PL:malformed-referral-is-safe"]
 
+
+# ── 代号豁免 ────────────────────────────────────────────────────────────────
+#
+# 这六条是「机器判不了、只能由人在真机上核过」的义务。它们不是欠账，是**判据类型**
+# 本身就落在 Q3：出口 IP 的归属地、一次熔断迁移演练、对外只有明文 IP 这个事实、
+# 「发请求的那个客户端是不是真的 Claude Code」、合规确认由谁签字 —— 没有一条
+# 能由本仓库的代码断言。
+#
+# 每条的 ref 指向一份**已填实**的人判记录（不是空模板）：里面有日期、执行了什么、
+# 观察到的真实数字、结论，以及一段「机器核不到的那一半」。
+#
+# 配额自检（判决器会算，这里写出来是为了让人也看得见）：
+#   全局 6 条 ≤ 0.15 × |E|=71 → 10.65 ✓
+#   DP 4/8 = 50%（判据是 > 50% 才红，等于不红）✓   E2E 1/3 ✓   SEC 1/3 ✓
+# 这个余量很窄是刻意的：另外 13 条 DP/E2E/IMP/SEC 义务都是**先补成机器可判**
+# 才腾出的位置（部署配置进仓库、导入策略从 shell 脚本固化进代码、密钥卫生做成
+# AST 扫描、真端到端做成门控测试），而不是靠多挂豁免。
+waivers:
+  - code: "W-HUMAN-ONLY"
+    obligation: "DP:egress-not-cn-hk"
+    by: "snakesammy"
+    date: "2026-09-16"
+    ref: "acceptance/records/egress-geo-and-proxy-effective.md"
+
+  - code: "W-HUMAN-ONLY"
+    obligation: "DP:egress-not-vps-itself"
+    by: "snakesammy"
+    date: "2026-09-16"
+    ref: "acceptance/records/egress-geo-and-proxy-effective.md"
+
+  - code: "W-HUMAN-ONLY"
+    obligation: "DP:latency-eviction"
+    by: "snakesammy"
+    date: "2026-09-16"
+    ref: "acceptance/records/latency-probe-and-eviction.md"
+
+  - code: "W-HUMAN-ONLY"
+    obligation: "DP:no-domain-plain-http"
+    by: "snakesammy"
+    date: "2026-09-16"
+    ref: "acceptance/records/proxy-auth-and-exposure.md"
+
+  - code: "W-HUMAN-ONLY"
+    obligation: "E2E:real-client-not-curl"
+    by: "snakesammy"
+    date: "2026-09-16"
+    ref: "acceptance/records/e2e-real-client.md"
+
+  - code: "W-HUMAN-ONLY"
+    obligation: "SEC:admin-compliance-ack"
+    by: "snakesammy"
+    date: "2026-09-16"
+    ref: "acceptance/records/admin-compliance-ack.md"
