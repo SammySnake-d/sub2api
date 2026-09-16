@@ -2161,7 +2161,17 @@ func setDefaults() {
 	viper.SetDefault("database.host", "localhost")
 	viper.SetDefault("database.port", 5432)
 	viper.SetDefault("database.user", "postgres")
-	viper.SetDefault("database.password", "postgres")
+	// 口令没有默认值 —— 这是一条安全判据，不是疏漏。
+	//
+	// sub2api 是开源白盒：任何写进仓库的"可用"默认口令，等于对所有部署公开了一条
+	// 现成的凭据。这里曾经是 "postgres"，而 database.password 与 jwt.secret 不同 ——
+	// 它既没有 required 校验也没有弱值校验（jwt.secret 两者都有，见 config.go 的
+	// isWeakJWTSecret），于是"没配"和"配成默认值"在启动时看起来一模一样，
+	// setup.go 会直接拿它拼出一条能连上的 DSN。
+	//
+	// 空串的后果是连接失败并报错 —— 一个**响亮**的失败，远好过一条静默可用的默认凭据。
+	// 正常路径由 internal/setup/cli.go:96 的交互式输入或 DATABASE_PASSWORD 环境变量提供。
+	viper.SetDefault("database.password", "")
 	viper.SetDefault("database.dbname", "sub2api")
 	viper.SetDefault("database.sslmode", "prefer")
 	viper.SetDefault("database.max_open_conns", 256)

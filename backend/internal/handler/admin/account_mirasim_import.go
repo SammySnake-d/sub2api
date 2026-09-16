@@ -1016,6 +1016,21 @@ func parseMirasimProxyURL(raw string) (mirasimProxySpec, error) {
 		spec.Username = parsed.User.Username()
 		spec.Password, _ = parsed.User.Password()
 	}
+	// "有用户名、没口令"必须在这里被响亮拒绝。
+	//
+	// service.(*Proxy).URL() 只在 Username 与 Password **同时**非空时才写 userinfo
+	//（那是上游刻意的兼容选择，有一条名为 username_only_keeps_no_auth_for_compatibility
+	// 的用例钉着，本 fork 不动它）。后果是：一条只有用户名的代理行会**静默地**
+	// 丢掉整段身份 —— 地址仍然合法、请求仍然发得出去、没有任何报错，
+	// 只是该账号从出口池的默认身份出去。
+	//
+	// 对 mirasim 这条 lane，粘性身份就住在用户名里（Default.mirasim-<N>），
+	// 丢了它等于一号一出口 IP 的隔离当场失效，而所有功能测试照样绿（请求还是 200）。
+	// 静默降级是这里唯一不可接受的结果，所以在导入时就拒掉。
+	if spec.Username != "" && spec.Password == "" {
+		return mirasimProxySpec{}, fmt.Errorf(
+			"代理只有用户名没有口令：粘性身份会被静默丢弃，该账号将从出口池默认身份出去")
+	}
 	return spec, nil
 }
 

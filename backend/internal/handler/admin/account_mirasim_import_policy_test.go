@@ -438,3 +438,43 @@ func TestImportMirasimAccountsAppliesSelectionBeforeWriting(t *testing.T) {
 	require.Len(t, plainResult.Decisions, 0, "没筛选就没有判定,空判定不该被伪造出来")
 	require.NotEqual(t, len(svc.createdAccounts), len(plainSvc.createdAccounts))
 }
+
+// ---------------------------------------------------------------------------
+// 代理行的"半条凭据"必须在导入时就被拒
+// ---------------------------------------------------------------------------
+
+// TestParseMirasimProxyURLRejectsUsernameWithoutPassword
+//
+// 这条门守的是一种**静默降级**，不是一个报错：
+// service.(*Proxy).URL() 只在 Username 与 Password 同时非空时才写 userinfo
+// （上游刻意的兼容选择，有 username_only_keeps_no_auth_for_compatibility 钉着）。
+// 于是一条"只有用户名没有口令"的代理行会整段丢掉身份 —— 地址仍然合法、
+// 请求仍然发得出去、零报错，只是该账号从出口池的**默认身份**出去。
+//
+// 对 mirasim 这条 lane，粘性身份就住在用户名里（Default.mirasim-<N>），
+// 丢了它等于"一号一出口 IP"当场失效，而所有功能测试照样绿（请求还是 200）。
+// 没有任何下游信号能发现它，所以拦截点只能放在最早的这一层。
+func TestParseMirasimProxyURLRejectsUsernameWithoutPassword(t *testing.T) {
+	_, err := parseMirasimProxyURL("http://Default.mirasim-7@127.0.0.1:2260")
+	require.Error(t, err, "只有用户名没有口令的代理行必须被拒 —— 否则粘性身份被静默丢弃")
+	require.Contains(t, err.Error(), "粘性身份",
+		"报错必须点明后果（身份被丢），而不是一句泛泛的「代理无效」")
+}
+
+// 差分阴性两条：只改一个开关，必须放行。
+// 没有它们，把判据放宽成"凡带 userinfo 的都拒"也能让上面那条转绿。
+func TestParseMirasimProxyURLAcceptsCompleteAndAnonymousForms(t *testing.T) {
+	// 开关一：把口令补上 → 放行，且用户名与口令都被解出来。
+	withPass, err := parseMirasimProxyURL("http://Default.mirasim-7:tok3n@127.0.0.1:2260")
+	require.NoError(t, err)
+	require.Equal(t, "Default.mirasim-7", withPass.Username,
+		"粘性身份必须被完整解出 —— 它是一号一出口 IP 的载体")
+	require.Equal(t, "tok3n", withPass.Password)
+	require.Equal(t, 2260, withPass.Port)
+
+	// 开关二：整段 userinfo 都不写 → 放行（匿名代理是合法形态，只是没有粘性身份）。
+	anon, err := parseMirasimProxyURL("http://127.0.0.1:2260")
+	require.NoError(t, err)
+	require.Equal(t, "", anon.Username,
+		"匿名代理是合法形态：它没有身份可丢，不属于本门要挡的静默降级")
+}

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -597,4 +598,204 @@ func TestClaudeCodeValidator_MaxTokensOneProbeStillRequiresClaudeCodeUA(t *testi
 	req.Header.Set("User-Agent", "python-requests/2.32")
 
 	require.False(t, validator.Validate(req, map[string]any{"model": "claude-sonnet-4-5", "max_tokens": 1}))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// G12 / C32 / C33 — 真实 Claude Code 2.1.272 必须通过「仅 CC」校验，
+// 而伪造者不能因为放行真客户端而顺带通过。
+//
+// 夹具来自 2026-09-16 本机实抓（一个本地 HTTP 服务器直收 Claude Code 的请求，
+// 见 /private/tmp/ccdump*.log）。头是原样抄的**全集**，body 的形态（system 为
+// 长度 2 的数组、首块是 Agent SDK 身份 prose、metadata.user_id 是内嵌 JSON 串且
+// account_uuid 为空串、max_tokens=32000）也是实抓值。
+// 只有 device_id / session_id 换成了同形状的合成值：它们是那台机器的指纹，
+// 校验逻辑只看「非空」，换值不改变任何判据。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 实抓 UA。注意后缀是 "(external, sdk-cli)" 而不是旧版的 "(external, cli)"。
+const realClaudeCodeUA2_1_272 = "claude-cli/2.1.272 (external, sdk-cli)"
+
+// 实抓 system[0].text 全文（94 字符）。这是 Agent SDK 形态的身份 prose，
+// 比 2.1.78 之前的短句长，Dice 相似度必须仍然过阈值。
+const realClaudeCodeAgentSDKSystemPrompt = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
+
+// 实抓请求体的线上形态。用 JSON 原文而不是手拼 map：手拼的 map 形态与真客户端
+// 不同，过了不代表客户过得了（见 ACCEPTANCE.yaml C31 的 negative）。
+const realClaudeCode2_1_272BodyJSON = `{
+  "model": "claude-haiku-4-5",
+  "max_tokens": 32000,
+  "temperature": 1,
+  "stream": true,
+  "system": [
+    {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.","cache_control":{"type":"ephemeral"}},
+    {"type":"text","text":"\nYou are a Claude agent, built on Anthropic's Claude Agent SDK.\n\n# Environment\nWorking directory: /Users/example/project\nPlatform: darwin\n\n# Tools\nUse the tools available to complete the task.\n","cache_control":{"type":"ephemeral"}}
+  ],
+  "messages": [
+    {"role":"user","content":[{"type":"text","text":"ping"}]}
+  ],
+  "metadata": {"user_id": "{\"device_id\":\"9f3c17ab55e24d0e8c6b1f4a20d7e8930c5a6b7d8e9f0a1b2c3d4e5f60718293\",\"account_uuid\":\"\",\"session_id\":\"4e41a0a4-2d25-49c0-8b9e-9bf1728e387f\"}"}
+}`
+
+// realClaudeCode2_1_272Request 复现实抓到的**全部**请求头，一个不少，
+// 包括 Validate 不看的那些（X-Stainless-*、Accept 等）——多余的头不能让判据翻车。
+func realClaudeCode2_1_272Request() *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "http://relay.example.com/v1/messages?beta=true", nil)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-placeholder")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", realClaudeCodeUA2_1_272)
+	req.Header.Set("X-Claude-Code-Session-Id", "4e41a0a4-2d25-49c0-8b9e-9bf1728e387f")
+	req.Header.Set("X-Stainless-Arch", "arm64")
+	req.Header.Set("X-Stainless-Lang", "js")
+	req.Header.Set("X-Stainless-OS", "MacOS")
+	req.Header.Set("X-Stainless-Package-Version", "0.112.1")
+	req.Header.Set("X-Stainless-Retry-Count", "0")
+	req.Header.Set("X-Stainless-Runtime", "node")
+	req.Header.Set("X-Stainless-Runtime-Version", "v26.3.0")
+	req.Header.Set("X-Stainless-Timeout", "600")
+	req.Header.Set("anthropic-beta", "interleaved-thinking-2025-05-14,claude-code-20250219")
+	req.Header.Set("anthropic-dangerous-direct-browser-access", "true")
+	req.Header.Set("anthropic-version", "2023-06-01")
+	// 实抓里这个头是小写的 "x-app"；Go 的 header map 会规范化成 "X-App"。
+	req.Header.Set("x-app", "cli")
+	return req
+}
+
+func realClaudeCode2_1_272Body(t *testing.T) map[string]any {
+	t.Helper()
+	var body map[string]any
+	require.NoError(t, json.Unmarshal([]byte(realClaudeCode2_1_272BodyJSON), &body))
+	return body
+}
+
+func TestClaudeCodeValidator_RealClaudeCode2_1_272RequestPasses(t *testing.T) {
+	// [[cov:CC:real-client-passes]] 真实 Claude Code 2.1.272 的完整请求
+	// （实抓头全集 + 实抓 body 形态）必须通过「仅 CC」校验。
+	// 逐步读数先落地，这样一旦将来红了，报告里能直接看出是哪一步翻的，
+	// 而不是只知道「总判据 false」。
+	validator := NewClaudeCodeValidator()
+	req := realClaudeCode2_1_272Request()
+	body := realClaudeCode2_1_272Body(t)
+
+	// Step 1：UA。
+	require.True(t, validator.ValidateUserAgent(realClaudeCodeUA2_1_272),
+		"claudeCodeUAPattern 必须匹配实抓 UA %q", realClaudeCodeUA2_1_272)
+	require.Equal(t, "2.1.272", validator.ExtractVersion(realClaudeCodeUA2_1_272))
+
+	// Step 4.1：身份 prose 的 Dice 相似度。实抓的是 Agent SDK 长句，
+	// 必须落在 systemPromptThreshold 之上（模板表里有精确项时为 1.0）。
+	require.GreaterOrEqual(t,
+		validator.bestSimilarityScore(realClaudeCodeAgentSDKSystemPrompt),
+		systemPromptThreshold,
+		"Agent SDK 身份 prose 的最佳相似度低于 systemPromptThreshold，门会误拒真客户端")
+	require.True(t, validator.IncludesClaudeCodeSystemPrompt(body),
+		"hasClaudeCodeSystemPrompt 没在实抓 system 数组里认出身份 prose")
+
+	// Step 4.3：metadata.user_id 是内嵌 JSON 串，account_uuid 为空串。
+	metadata, ok := body["metadata"].(map[string]any)
+	require.True(t, ok)
+	rawUserID, ok := metadata["user_id"].(string)
+	require.True(t, ok)
+	parsedUserID := ParseMetadataUserID(rawUserID)
+	require.NotNil(t, parsedUserID, "ParseMetadataUserID 解不出实抓的 user_id")
+	require.True(t, parsedUserID.IsNewFormat)
+	require.NotEmpty(t, parsedUserID.DeviceID)
+	require.NotEmpty(t, parsedUserID.SessionID)
+	require.Empty(t, parsedUserID.AccountUUID, "实抓里 account_uuid 就是空串，它不能成为拒绝理由")
+
+	// 反例保护：放行不能是探测请求豁免顺带给的。实抓 max_tokens=32000，
+	// 既不满足 isMaxTokensOneBody，context 里也没有探测标记，
+	// 所以下面的 Validate 只可能是走完整的严格校验过的。
+	require.False(t, isMaxTokensOneBody(body), "实抓 max_tokens=32000，不该被当成 max_tokens=1 探测")
+	probeFlag, probeFlagSet := IsMaxTokensOneHaikuRequestFromContext(req.Context())
+	require.False(t, probeFlagSet && probeFlag, "context 里不该有探测豁免标记")
+
+	require.True(t, validator.Validate(req, body),
+		"真实 Claude Code 2.1.272 被 ClaudeCodeValidator.Validate 判为非 Claude Code")
+}
+
+func TestClaudeCodeValidator_ImpostorsStillRejected(t *testing.T) {
+	// [[cov:CC:impostor-still-fails]] 伪造者仍被拒 —— 放真客户端进来不能顺手把门拆了。
+	// 每个用例都从**同一份实抓夹具**出发，只改一处：这样"被拒"只能归因到被改的
+	// 那一处，而不是夹具本身就不合格。
+	validator := NewClaudeCodeValidator()
+
+	t.Run("ua_ok_but_no_system", func(t *testing.T) {
+		body := realClaudeCode2_1_272Body(t)
+		delete(body, "system")
+		require.False(t, validator.IncludesClaudeCodeSystemPrompt(body))
+		require.False(t, validator.Validate(realClaudeCode2_1_272Request(), body),
+			"UA 对但 body 里没有 system，仍必须被拒")
+	})
+
+	t.Run("ua_ok_but_foreign_system_prompt", func(t *testing.T) {
+		// 实测读数（2026-09-16）：这句 0.4237，在 systemPromptThreshold=0.5 之下。
+		// 注意选材：随手写的 "You are a helpful assistant..." 实测 0.5564，
+		// 反而**过得了**这道门（模板表里有 "You are a helpful AI assistant tasked
+		// with summarizing conversations."），拿它当伪造样本会把测试写成谎报。
+		const foreign = "You are ChatGPT, a large language model trained by OpenAI."
+		// 先证明这段文本确实过不了相似度门，再证明 Validate 因此拒绝——
+		// 否则"被拒"可能是别的原因。
+		require.Less(t, validator.bestSimilarityScore(foreign), systemPromptThreshold)
+		require.False(t, strings.HasPrefix(foreign, claudeCodeBillingHeaderPrefix))
+
+		body := realClaudeCode2_1_272Body(t)
+		body["system"] = []any{map[string]any{"type": "text", "text": foreign}}
+		require.False(t, validator.IncludesClaudeCodeSystemPrompt(body))
+		require.False(t, validator.Validate(realClaudeCode2_1_272Request(), body),
+			"UA 对但 system prompt 对不上，仍必须被拒")
+	})
+
+	t.Run("ua_ok_but_metadata_user_id_malformed", func(t *testing.T) {
+		for _, bad := range []string{
+			"not-a-user-id", // 两种格式都不是
+			`{"device_id":"","account_uuid":"","session_id":"4e41a0a4-2d25-49c0-8b9e-9bf1728e387f"}`, // device_id 空
+			`{"device_id":"9f3c17ab","account_uuid":"","session_id":""}`,                             // session_id 空
+			`{"device_id":"9f3c17ab","account_uuid":"",`,                                             // 截断的 JSON
+			"", // 干脆没有
+		} {
+			require.Nil(t, ParseMetadataUserID(bad), "ParseMetadataUserID 不该接受 %q", bad)
+
+			body := realClaudeCode2_1_272Body(t)
+			body["metadata"] = map[string]any{"user_id": bad}
+			require.False(t, validator.Validate(realClaudeCode2_1_272Request(), body),
+				"UA 对但 metadata.user_id=%q 非法，仍必须被拒", bad)
+		}
+	})
+
+	t.Run("ua_ok_but_metadata_missing", func(t *testing.T) {
+		body := realClaudeCode2_1_272Body(t)
+		delete(body, "metadata")
+		require.False(t, validator.Validate(realClaudeCode2_1_272Request(), body),
+			"UA 对但整个 metadata 缺失，仍必须被拒")
+	})
+
+	t.Run("perfect_body_but_non_claude_cli_ua", func(t *testing.T) {
+		body := realClaudeCode2_1_272Body(t)
+		// 这份 body 是真客户端的，上一个测试证明它自己能过；这里只换 UA。
+		for _, ua := range []string{
+			"curl/8.7.1",
+			"Go-http-client/1.1",
+			"python-requests/2.32.3",
+			"claude-cli", // 没有版本号
+			"x-claude-cli/2.1.272 (external, sdk-cli)", // 前缀不在开头
+			"",
+		} {
+			require.False(t, validator.ValidateUserAgent(ua), "ValidateUserAgent 不该接受 %q", ua)
+			req := realClaudeCode2_1_272Request()
+			req.Header.Set("User-Agent", ua)
+			require.False(t, validator.Validate(req, body),
+				"body 完美但 UA=%q 不是官方 CLI，仍必须被拒", ua)
+		}
+	})
+
+	t.Run("ua_ok_but_required_headers_stripped", func(t *testing.T) {
+		body := realClaudeCode2_1_272Body(t)
+		for _, header := range []string{"X-App", "anthropic-beta", "anthropic-version"} {
+			req := realClaudeCode2_1_272Request()
+			req.Header.Del(header)
+			require.False(t, validator.Validate(req, body),
+				"缺少必需头 %s 时仍必须被拒", header)
+		}
+	})
 }

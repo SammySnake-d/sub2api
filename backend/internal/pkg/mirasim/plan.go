@@ -12,6 +12,18 @@ package mirasim
 //  2. AUTHORITATIVE — what the server actually grants, read from
 //     GET <auth base>/auth/referral. current_plan is the tier in force now.
 //
+//     EVIDENCE GRADE: OBSERVED (2026-09-16). The request shape and response field
+//     names were ported from ma-relay (internal/relay/referral.go), and have
+//     since been confirmed against the live endpoint from this repository: the
+//     production deployment carries real probe results in accounts.extra, e.g.
+//
+//	{"plan":"plus","next_plan":"max","threshold":10,"http_status":200,
+//	 "plan_expires_at":"2026-10-08T07:02:27.551784Z","status":"ok"}
+//
+//     A non-zero plan / non-zero plan_expires_at could not have been produced by
+//     a mis-ported field set — both failure modes below end in a recorded
+//     failure, never in a plausible-looking value. See ReferralInfo.
+//
 // The two disagree in production and the disagreement is the interesting signal,
 // not noise: an account labelled max whose current_plan is still plus has met
 // the invitation threshold but the upgrade has not settled. ma-relay kept a
@@ -76,7 +88,39 @@ const referralTimeout = 15 * time.Second
 // next_plan=max: invitations met the threshold but the plus→max upgrade has not
 // settled yet.
 //
-// Field set ported verbatim from ma-relay internal/relay/referral.go.
+// ---------------------------------------------------------------------------
+// EVIDENCE GRADE: PORTED, NOT OBSERVED.
+// ---------------------------------------------------------------------------
+//
+// Every json tag below was copied from ma-relay internal/relay/referral.go
+// (lines 25-35). As of 2026-09-16 the ported shape has been confirmed against the
+// live auth server FROM THIS REPOSITORY: the production deployment's
+// accounts.extra->'mirasim_plan_probe' holds real readings (http_status 200,
+// current_plan "plus", next_plan "max", threshold 10, a real plan_expires_at).
+//
+// What is still second-hand is the shape of the fields we DON'T read. A response
+// carrying extra fields, or a rename of a field we never look at, would be
+// invisible here — the confirmation covers the subset below, not the endpoint.
+//
+// WHAT HAPPENS IF THE SHAPE IS WRONG — both failure modes end in a recorded
+// failure, never in a wrong plan value:
+//
+//  1. The body is not JSON (an HTML error page, a proxy interstitial):
+//     FetchReferral's json.Unmarshal fails and it returns an error. The caller
+//     records a failed probe.
+//
+//  2. The body is JSON but uses different names ({"tier":"max"}): decoding
+//     SUCCEEDS into an all-zero struct — this is encoding/json's documented
+//     behaviour for unknown fields and it is silent. The zero value is the whole
+//     reason CurrentPlan must be checked: a caller that trusted this struct
+//     would write Plan="" over a real reading. service.probeLoadedAccount is
+//     that check — it rejects an empty CurrentPlan as "empty_current_plan" with
+//     http_status=200, which is the observable signature of exactly this case:
+//     a 200 that our struct could not read.
+//
+// So the safety of case 2 lives in the CALLER, not here. Do not make that check
+// optional, and do not add a default/fallback value to any field below: a
+// defaulted field would turn "the shape is wrong" into a plausible-looking plan.
 type ReferralInfo struct {
 	Code           string `json:"code"`
 	Redeemed       int    `json:"redeemed"`
@@ -123,7 +167,11 @@ func ReferralStatus(err error) int {
 //
 // Ported from ma-relay internal/relay/pool.go planDiffNote, including its
 // wording, so an operator reading sub2api sees the same note they already read
-// in ma-relay for the same account.
+// in ma-relay for the same account. The wording is therefore as verified as
+// ma-relay's own — which is to say the note is only as true as the ReferralInfo
+// that fed it; see that type's evidence grade. It returns "" whenever ref is nil
+// or CurrentPlan is empty, so an unreadable response produces no note rather
+// than a confident-sounding one.
 func PlanDiffNote(claimedPlan string, ref *ReferralInfo) string {
 	claimedPlan = strings.TrimSpace(claimedPlan)
 	if ref == nil || ref.CurrentPlan == "" || claimedPlan == "" || claimedPlan == ref.CurrentPlan {
@@ -139,6 +187,17 @@ func PlanDiffNote(claimedPlan string, ref *ReferralInfo) string {
 }
 
 // FetchReferral reads one account's authoritative plan state.
+//
+// RETURN CONTRACT — a non-nil *ReferralInfo means "the auth server answered 2xx
+// and the body was valid JSON". It does NOT mean the body was a referral: a 2xx
+// whose JSON uses field names our ported struct does not know decodes into an
+// all-zero struct with no error (see ReferralInfo, evidence grade). Callers MUST
+// reject an empty CurrentPlan instead of persisting what they got.
+//
+// The unverified field set is deliberately not defended against here. Returning
+// an error for an all-zero decode would collapse "200 with an unreadable shape"
+// into the same bucket as a transport failure, and the HTTP status is precisely
+// what tells an operator which of the two happened.
 //
 // It reuses the SAME per-account credential machinery as an outbound data-plane
 // request — identity sync, and a token refresh when the access token is within
