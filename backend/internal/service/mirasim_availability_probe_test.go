@@ -8,6 +8,7 @@ package service
 // 这里把那三臂逐条钉住，外加两条阴性对照。
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/mirasim"
@@ -100,14 +101,23 @@ func TestMirasimAvailabilityProbeFailsOpenOnUnreadableBody(t *testing.T) {
 	require.NotNil(t, mirasimAvailabilityProbeBlock(acct, []byte(`{"model":"x","max_tokens":0}`)))
 }
 
-// 错误文案必须与上游逐字一致：客户端看到的东西不能因为「我们提前拦了」而变形。
-// ma-relay 的 bad_request_reason.go 就是按这条原文匹配来给 400 归类的。
-func TestMirasimAvailabilityProbeMessageIsUpstreamVerbatim(t *testing.T) {
-	const upstream = "this request asks for at most one token of output and carries no session, " +
-		"so it is read as an availability probe rather than work. Use GET /v1/limits to check availability; " +
-		"it costs no upstream call and is not rate limited per model"
+// 这条测试原来钉的是「文案必须与上游逐字一致」，理由是客户端看到的东西不该因为
+// 我们提前拦了而变形。2026-09-18 那条不变量被推翻并替换：上游原文里带 "upstream"
+// 和 "GET /v1/limits"，前者暴露我们是代理，后者是我们不对外暴露的端点，属于上游
+// 指纹。泄露的代价高于形态一致的收益。
+//
+// 换成的新不变量：文案必须**指出是哪个字段、以及怎么改**——这正是本地拦截相对
+// 直接透传的全部价值（上游从不指字段）。不泄露那一半由
+// TestClientVisibleMessagesDoNotNameTheUpstream 统一扫，这里不重复。
+func TestMirasimAvailabilityProbeMessageNamesTheFieldAndTheFix(t *testing.T) {
 	err := mirasimAvailabilityProbeBlock(probeTestMirasimAccount(),
 		[]byte(`{"model":"x","max_tokens":1}`))
 	require.NotNil(t, err)
-	require.Equal(t, upstream, err.Error())
+	msg := err.Error()
+	require.Contains(t, msg, "max_tokens", "文案必须指出是哪个字段——上游从不指，这是本地拦的全部价值")
+	require.Contains(t, msg, "at least 2", "文案必须给出可执行的修法，不能只说「被拒了」")
+	require.NotContains(t, strings.ToLower(msg), "upstream",
+		"客户端文案不许暴露我们是个代理")
+	require.NotContains(t, msg, "/v1/limits",
+		"不许引用我们不对外暴露的上游端点——那是上游指纹")
 }

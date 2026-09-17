@@ -342,9 +342,11 @@ func TestClientVisibleMessagesDoNotNameTheUpstream(t *testing.T) {
 		t.Fatalf("只扫到 %d 条文案，预期 %d 条", seen, len(bodies))
 	}
 
-	// 探活拒绝那条是逐字复刻上游文案的常量，同样会到客户端。
+	// 探活拒绝那条常量同样会到客户端，扫同一份禁词表。
+	// 2026-09-18 之前这里放宽过（它当时是上游原文的逐字复刻），结果实测漏掉了
+	// "upstream" 和 "GET /v1/limits" 两处泄露。放宽就是漏，所以不再放宽。
 	lower := strings.ToLower(mirasimAvailabilityProbeMessage)
-	for _, word := range []string{"mirasim", "relay", "anthropic"} {
+	for _, word := range append(append([]string{}, banned...), "/v1/limits") {
 		if strings.Contains(lower, word) {
 			t.Errorf("探活拒绝文案泄露了 %q：\n%s", word, mirasimAvailabilityProbeMessage)
 		}

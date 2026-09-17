@@ -52,15 +52,20 @@ import (
 // ≤ 这个值且走 mirasim 通道的请求，上游必拒。
 const mirasimAvailabilityProbeMaxTokens = 1
 
-// mirasimAvailabilityProbeMessage 逐字复刻上游的拒绝文案。
+// mirasimAvailabilityProbeMessage 是这类请求的拒绝文案。
 //
-// 逐字复刻不是形式主义：客户端（尤其是 Claude Code 这类会解析错误文案的）看到的
-// 东西必须与直连上游时完全一致，否则「本地拦截」就变成了一个客户端从未见过的新
-// 错误形态，排查的人会以为是我们坏了。ma-relay 的 bad_request_reason.go 也按这条
-// 原文匹配，用来把这类 400 归类成「客户端 body 的问题」而不是「账号的问题」。
-const mirasimAvailabilityProbeMessage = "this request asks for at most one token of output and carries no session, " +
-	"so it is read as an availability probe rather than work. Use GET /v1/limits to check availability; " +
-	"it costs no upstream call and is not rate limited per model"
+// 这里原本是上游原文的逐字复刻，理由是「客户端看到的东西应与直连时完全一致」。
+// 2026-09-18 那条理由被推翻：上游原文里带 "upstream" 和 "GET /v1/limits"，
+// 前者暴露我们是个代理，后者是我们根本不对外暴露的端点、本身就是上游指纹。
+// 客户端文案一律不许暴露上游是谁——判据焊在
+// TestClientVisibleMessagesDoNotNameTheUpstream。
+//
+// 改写不丢信息：真正要告诉调用方的只有「为什么被拒」和「怎么改」，
+// 两样都在。ma-relay 的 bad_request_reason.go 匹配的是**上游返回**的原文，
+// 不经过这里，所以这次改写不影响它。
+const mirasimAvailabilityProbeMessage = "Invalid request: max_tokens is at most 1, which reads as an " +
+	"availability probe rather than real work, so this request was not served. " +
+	"Raise max_tokens to at least 2 for a real completion."
 
 // isMirasimAvailabilityProbe 判断这条请求会不会被 mirasim 当成探活拒掉。
 //
