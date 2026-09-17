@@ -130,6 +130,26 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 				mirasimAvailabilityProbeModelHint(passthroughBody), account.Name)
 			return nil, probeErr
 		}
+		// mirasim 对 body 形状有两层校验，都只回一句不指字段的通用文案。
+		// 采样参数（temperature/top_p/top_k）上游一律拒收，且完全忽略其取值——
+		// 连官方默认值 1 都拒。剥掉它们不改变任何一次成功调用的语义，只把「必然
+		// 失败」变成「按默认采样成功」。其余形状问题属于内容（对话历史、工具定义），
+		// 替客户端重写就是在猜他想说什么，一律本地拒掉、但补上上游不肯给的那句话
+		// ——到底哪个字段错了。逐字段实测与作用域见 mirasim_request_shape.go。
+		if IsMirasimAccount(account) {
+			if sanitized, stripped := sanitizeMirasimSamplingParams(passthroughBody); len(stripped) > 0 {
+				passthroughBody = sanitized
+				logger.LegacyPrintf("service.gateway",
+					"mirasim sampling params stripped: %s (model=%s account=%s; upstream rejects their mere presence)",
+					strings.Join(stripped, ","), mirasimAvailabilityProbeModelHint(passthroughBody), account.Name)
+			}
+			if shapeErr := mirasimRequestShapeViolation(passthroughBody); shapeErr != nil {
+				logger.LegacyPrintf("service.gateway",
+					"mirasim request shape rejected locally: model=%s account=%s reason=%s",
+					mirasimAvailabilityProbeModelHint(passthroughBody), account.Name, shapeErr.Message)
+				return nil, shapeErr
+			}
+		}
 		// mirasim 上游按客户端身份收货：非 Claude Code 形态的 body 会被拒收。
 		// 此前靠分组的 claude_code_only 提前拒绝来回避（生产上一小时 180 条 503），
 		// 这里改成改造。真 CC 请求与非 mirasim 账号在函数内部就原样返回，不付任何代价。

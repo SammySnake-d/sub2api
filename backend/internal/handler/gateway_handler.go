@@ -987,6 +987,14 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					return
 				}
 
+				// body 形状违规同理：上游的 schema 是全局的，换账号拒绝不会变成接受。
+				// 与上面两个的区别只在文案——这里我们**指出了是哪个字段**，上游从不指。
+				var shapeErr *service.MirasimInvalidRequestError
+				if errors.As(err, &shapeErr) {
+					h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", shapeErr.Message)
+					return
+				}
+
 				var promptTooLongErr *service.PromptTooLongError
 				if errors.As(err, &promptTooLongErr) {
 					reqLog.Warn("gateway.prompt_too_long_from_antigravity",
