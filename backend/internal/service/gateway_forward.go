@@ -120,6 +120,16 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 				passthroughModel = mappedModel
 			}
 		}
+		// mirasim 把 max_tokens ≤ 1 的请求读成「探活」并 400 拒掉，而我们补不了
+		// 任何东西让它成功（带上合法 metadata.user_id 实测照样 400）。既然注定失败，
+		// 就在这里用上游的原样文案回掉，不再白烧一次上游往返、也不把账号往
+		// 「探活器」那个特征上推。判据与实测见 mirasim_availability_probe.go。
+		if probeErr := mirasimAvailabilityProbeBlock(account, passthroughBody); probeErr != nil {
+			logger.LegacyPrintf("service.gateway",
+				"mirasim availability probe rejected locally: model=%s account=%s (upstream would reject it anyway)",
+				mirasimAvailabilityProbeModelHint(passthroughBody), account.Name)
+			return nil, probeErr
+		}
 		// mirasim 上游按客户端身份收货：非 Claude Code 形态的 body 会被拒收。
 		// 此前靠分组的 claude_code_only 提前拒绝来回避（生产上一小时 180 条 503），
 		// 这里改成改造。真 CC 请求与非 mirasim 账号在函数内部就原样返回，不付任何代价。

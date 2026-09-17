@@ -977,6 +977,16 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					return
 				}
 
+				// mirasim 探活拦截：上游对 max_tokens ≤ 1 的请求必拒，且我们补不了任何
+				// 东西让它成功（实测见 service/mirasim_availability_probe.go）。所以和
+				// beta block 同样处理——立刻 400、**不 failover**：换账号只会换来同一个
+				// 拒绝，每次重试都是一次白烧的上游往返，也把更多账号推向"探活器"特征。
+				var probeErr *service.MirasimAvailabilityProbeError
+				if errors.As(err, &probeErr) {
+					h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", probeErr.Message)
+					return
+				}
+
 				var promptTooLongErr *service.PromptTooLongError
 				if errors.As(err, &promptTooLongErr) {
 					reqLog.Warn("gateway.prompt_too_long_from_antigravity",
