@@ -1,5 +1,11 @@
 # 待写测试清单(由 obligations.generated.json 机器生成)
 
+> **2026-09-17：`obligations.generated.json` 已从仓库删除**（连同 `calibration/`
+> 与 `adequacy/` 两个目录），只保留 `ACCEPTANCE.yaml` 与本目录下的人工签字记录。
+> 所以下面那段重新生成脚本当前跑不起来 —— 先跑 `acceptance-lint --expand`
+> 把义务集重新展开出来。删除前的整套内容备份在仓库外：
+> `~/.local/src/sub2api-acceptance-artifacts-20260917.tgz`
+
 **这不是手写清单。** 它由 `ACCEPTANCE.yaml` 的 `structure_sources[]` 展开 43 条义务,
 再按 `criteria[].covers[]` 映射到各自的测试文件。改结构源后重新生成,不要手改。
 

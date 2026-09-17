@@ -123,6 +123,13 @@ toolchain:
     - "\\bif\\s+\\w+\\s*:=[^;\\n]*;\\s*\\w+\\s*!=\\s*nil\\s*\\{\\s*t\\.(Fatal|Error)"
   mutation:
     tool: "manual-injection"
+    # 2026-09-17：机器生成的验收产物（calibration/ 与 adequacy/ 两个目录、
+    # obligations.generated.json）已从仓库删除，只保留本文件与 acceptance/records/
+    # 的人工签字。原因是它们内部不自洽：哈希链的锚 calibration/RUNS-LEDGER 被 git
+    # 跟踪，而它锚的链体 calibration/runs.jsonl 没有 —— 干净检出会被判成「流水被删」。
+    # 下面这个路径因此指向一个当前不存在的文件；跑 acceptance-lint 会重新生成它。
+    # 删除前的整套内容备份在仓库外：
+    #   ~/.local/src/sub2api-acceptance-artifacts-20260917.tgz
     report: "adequacy/injections.json"
 
 # ── S4 双侧标定的三项事先声明 ──────────────────────────────────────────────
@@ -146,6 +153,7 @@ toolchain:
 calibration:
   executor: "acceptance-lint --calibrate --execute"
   command: "cd backend && go test -tags unit ./internal/... -count=1"
+  # 同上：calibration/ 整个目录已于 2026-09-17 删除，这个 spec 路径当前不存在。
   spec: "calibration/injections.json"
 
 # ── 义务集由机器从这里展开;作者只声明「有什么对象」,维度由脚本做乘法 ──
