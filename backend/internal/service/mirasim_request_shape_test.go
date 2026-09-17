@@ -166,7 +166,7 @@ func TestMirasimRequestShapeViolation_实测会被拒的形状(t *testing.T) {
 			body: `{"model":"claude-fable-5-1","messages":[
 				{"role":"user","content":"hi"},
 				{"role":"assistant","content":"pre"}]}`,
-			want: []string{"messages[1]", "prefill", "fable"},
+			want: []string{"messages[1]", "prefill"},
 		},
 	}
 
@@ -274,6 +274,79 @@ func TestFirstCharOutsideMirasimToolNameSet(t *testing.T) {
 		}
 		if c != want {
 			t.Errorf("%q 期望首个越界字符 %q，实际 %q", name, want, c)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 泄露门：客户端看得到的文案不许暴露上游是谁
+//
+// 2026-09-18 真红一次：本地拒的文案写成了
+//
+//	"mirasim rejected this request locally: ..."
+//
+// 直接把上游渠道名报给了客户端，"locally" 还暗示了代理架构。用户在面板上看到
+// 原样文案后指出来的。
+//
+// 光把那几句改掉不够——下一个人加新错误时同样会漏。所以判据焊在这里：**遍历
+// 每一条会到客户端的文案**，逐个词扫。新增错误分支时这条自动覆盖，不需要有人
+// 记得。
+// ---------------------------------------------------------------------------
+
+func TestClientVisibleMessagesDoNotNameTheUpstream(t *testing.T) {
+	// 禁词。小写比较，所以这里也用小写。
+	banned := []string{
+		"mirasim",  // 上游渠道名
+		"upstream", // 暴露我们是个代理
+		"relay",    // 同上
+		"locally",  // 同上：客户端不该知道有"本地 vs 远端"这回事
+		"anthropic",
+		"claude.ai",
+	}
+
+	// 把每一条会走到 errorResponse 的文案都造出来一次。
+	// 新增拒绝分支时在这里补一行——漏补的代价只是这条门覆盖不到它，
+	// 不会让别的断言变绿。
+	bodies := []string{
+		// 工具名字符集
+		`{"model":"claude-fable-5-1","tools":[{"name":"a.b"}],"messages":[{"role":"user","content":"hi"}]}`,
+		// 工具重名
+		`{"model":"claude-fable-5-1","tools":[{"name":"d"},{"name":"d"}],"messages":[{"role":"user","content":"hi"}]}`,
+		// message 对象多余键
+		`{"model":"claude-fable-5-1","messages":[{"role":"assistant","content":"x","id":"m"},{"role":"user","content":"hi"}]}`,
+		// content 块多余键（含 index 的那条提示分支）
+		`{"model":"claude-fable-5-1","messages":[{"role":"assistant","content":[{"type":"text","text":"x","index":0}]},{"role":"user","content":"hi"}]}`,
+		// content 块未知键（不走 index 提示分支）
+		`{"model":"claude-fable-5-1","messages":[{"role":"assistant","content":[{"type":"text","text":"x","zzz":1}]},{"role":"user","content":"hi"}]}`,
+		// fable 预填
+		`{"model":"claude-fable-5-1","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"p"}]}`,
+	}
+
+	seen := 0
+	for i, body := range bodies {
+		err := mirasimRequestShapeViolation([]byte(body))
+		// 前提断言：每条 fixture 都必须真的触发一次拒绝。不触发的话，
+		// 下面的"没有禁词"就是在扫一个空字符串——绿得毫无意义。
+		if err == nil {
+			t.Fatalf("第 %d 条 fixture 没有触发拒绝，这条扫描没有承重", i)
+		}
+		seen++
+		lower := strings.ToLower(err.Message)
+		for _, word := range banned {
+			if strings.Contains(lower, word) {
+				t.Errorf("第 %d 条文案泄露了 %q：\n%s", i, word, err.Message)
+			}
+		}
+	}
+	if seen != len(bodies) {
+		t.Fatalf("只扫到 %d 条文案，预期 %d 条", seen, len(bodies))
+	}
+
+	// 探活拒绝那条是逐字复刻上游文案的常量，同样会到客户端。
+	lower := strings.ToLower(mirasimAvailabilityProbeMessage)
+	for _, word := range []string{"mirasim", "relay", "anthropic"} {
+		if strings.Contains(lower, word) {
+			t.Errorf("探活拒绝文案泄露了 %q：\n%s", word, mirasimAvailabilityProbeMessage)
 		}
 	}
 }

@@ -173,15 +173,15 @@ func mirasimToolsViolation(body []byte) *MirasimInvalidRequestError {
 		}
 		if offending, ok := firstCharOutsideMirasimToolNameSet(name); ok {
 			bad = &MirasimInvalidRequestError{Message: fmt.Sprintf(
-				"mirasim rejected this request locally: tools[%d].name %q contains %q, "+
-					"which is outside the accepted character set [a-zA-Z0-9_-]. "+
-					"Rename the tool (the upstream accepts any length, only the character set is enforced).",
+				"Invalid request: tools[%d].name %q contains %q, which is outside the "+
+					"accepted character set [a-zA-Z0-9_-]. Rename the tool; the length is "+
+					"not restricted, only the character set is.",
 				idx, name, offending)}
 			return false
 		}
 		if prev, dup := seen[name]; dup {
 			bad = &MirasimInvalidRequestError{Message: fmt.Sprintf(
-				"mirasim rejected this request locally: tools[%d].name %q duplicates tools[%d].name. "+
+				"Invalid request: tools[%d].name %q duplicates tools[%d].name. "+
 					"Tool names must be unique.", idx, name, prev)}
 			return false
 		}
@@ -227,10 +227,10 @@ func mirasimMessagesViolation(body []byte) *MirasimInvalidRequestError {
 				return true
 			}
 			bad = &MirasimInvalidRequestError{Message: fmt.Sprintf(
-				"mirasim rejected this request locally: messages[%d] carries the key %q, "+
-					"but the upstream accepts only \"role\" and \"content\" on a message object. "+
-					"This is usually a client that stores the whole API response and replays it as "+
-					"conversation history — drop everything except role and content.", mi, k)}
+				"Invalid request: messages[%d] carries the key %q. A message object accepts "+
+					"only \"role\" and \"content\". This usually comes from a client that stores "+
+					"the whole API response and replays it as conversation history — drop "+
+					"everything except role and content.", mi, k)}
 			return false
 		})
 		if bad != nil {
@@ -271,8 +271,8 @@ func mirasimContentViolation(mi int, content gjson.Result) *MirasimInvalidReques
 					"deltas into a block must drop it before replaying the block as history."
 			}
 			bad = &MirasimInvalidRequestError{Message: fmt.Sprintf(
-				"mirasim rejected this request locally: messages[%d].content[%d] (type %q) carries "+
-					"the key %q, which the upstream does not accept on that block type.%s",
+				"Invalid request: messages[%d].content[%d] (type %q) carries the key %q, "+
+					"which is not accepted on that block type.%s",
 				mi, bi, blockType, k, hint)}
 			return false
 		})
@@ -302,8 +302,8 @@ func mirasimPrefillViolation(body []byte) *MirasimInvalidRequestError {
 		return nil
 	}
 	return &MirasimInvalidRequestError{Message: fmt.Sprintf(
-		"mirasim rejected this request locally: the conversation ends with an assistant turn "+
-			"(messages[%d]), i.e. a prefill, which the fable models do not accept. "+
-			"Append a user turn, or send the same conversation to a claude model.",
+		"Invalid request: the conversation ends with an assistant turn (messages[%d]), "+
+			"i.e. a prefill, which the requested model does not accept. Append a user "+
+			"turn, or send the same conversation to a claude model.",
 		len(arr)-1)}
 }
