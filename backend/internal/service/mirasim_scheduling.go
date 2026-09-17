@@ -227,17 +227,31 @@ func mirasimModelFamily(model string) string {
 	return ""
 }
 
-// mirasimFamilyScope returns the model-rate-limit scope key for a model's
-// family, or "" when the model belongs to no known family (such a request still
-// consumes the two global windows, which are account-level).
-func mirasimFamilyScope(model string) string {
+// mirasimFamilyScopes returns EVERY family scope key a model's request draws on.
+//
+// # claude ⊇ fable —— 这是包含关系，不是两个并列家族
+//
+// 2026-09-17 生产实证：`claude-fable-5-1` 打到一个 `mirasim:7d_claude` 已耗尽、
+// `mirasim:7d_fable` 干净的账号上，上游回 429
+// `已用满 7d_claude 用量上限 (this model family's allowance is spent)`。
+// 也就是说 **7d_claude 用满之后 fable 也不能用**；反过来 7d_fable 用满只挡 fable。
+//
+// 旧实现把两者当互斥兄弟：mirasimModelFamily 先判 "fable"，于是 fable 请求**只**查
+// 7d_fable、完全不查 7d_claude。后果是调度器认为那 32 个 7d_claude 已耗尽的号对
+// fable 仍然可用，一路选中、一路撞 429，而池里 70 个 7d_claude 干净的号一次都没被
+// 试过 —— 对客户表现为「fable 一直限流，换号也换不出来」。
+//
+// 返回切片而不是单个 scope，正是因为 fable 同时受两个窗口约束；调用方必须
+// **全部**清空才算可调度。
+func mirasimFamilyScopes(model string) []string {
 	switch mirasimModelFamily(model) {
 	case mirasimFamilyFable:
-		return mirasimFable7dRateLimitKey
+		// 顺序无关紧要（调用方是全称判断），但把被包含方放前面便于读日志。
+		return []string{mirasimFable7dRateLimitKey, mirasimClaude7dRateLimitKey}
 	case mirasimFamilyClaude:
-		return mirasimClaude7dRateLimitKey
+		return []string{mirasimClaude7dRateLimitKey}
 	}
-	return ""
+	return nil
 }
 
 // MirasimWindowsForModel lists every window a request for model draws on. The
@@ -246,7 +260,9 @@ func MirasimWindowsForModel(model string) []string {
 	windows := []string{MirasimWindow5h, MirasimWindow7d}
 	switch mirasimModelFamily(model) {
 	case mirasimFamilyFable:
-		return append(windows, MirasimWindow7dFable)
+		// fable 落在 claude 的额度里（见 mirasimFamilyScopes 的实证），所以它同时
+		// 受 7d_claude 与 7d_fable 约束，两个都要清空。
+		return append(windows, MirasimWindow7dClaude, MirasimWindow7dFable)
 	case mirasimFamilyClaude:
 		return append(windows, MirasimWindow7dClaude)
 	}
@@ -291,9 +307,7 @@ func mirasimModelRateLimitKeys(a *Account, modelKey string) []string {
 		return nil
 	}
 	var keys []string
-	if scope := mirasimFamilyScope(modelKey); scope != "" {
-		keys = append(keys, scope)
-	}
+	keys = append(keys, mirasimFamilyScopes(modelKey)...)
 	if scope := mirasimCapacityRateLimitScope(modelKey); scope != "" {
 		keys = append(keys, scope)
 	}

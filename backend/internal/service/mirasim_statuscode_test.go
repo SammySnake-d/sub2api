@@ -321,7 +321,7 @@ func TestMirasim4297dWindowCoolsAccountLevelScalarOnly(t *testing.T) {
 	require.Empty(t, repo.callsOf("SetModelRateLimit"))
 }
 
-func TestMirasim4297dClaudeLocksClaudeFamilyOnly(t *testing.T) {
+func TestMirasim4297dClaudeLocksClaudeFamilyIncludingFable(t *testing.T) {
 	// [[cov:SC:429-7d-claude]]
 	ctx := context.Background()
 	svc, repo, account := mirasimServiceWithStub()
@@ -337,9 +337,12 @@ func TestMirasim4297dClaudeLocksClaudeFamilyOnly(t *testing.T) {
 	// A family window must never touch the global scalar.
 	require.Empty(t, repo.callsOf("SetRateLimited"))
 	require.True(t, account.IsSchedulable())
-	// claude family stopped, fable family still served by the same account.
+	// 2026-09-17 语义更正：claude ⊇ fable。7d_claude 耗尽时 fable 也停 ——
+	// 这一条原本断言 fable 仍可调度，那正是让调度器反复撞 429 的缺陷本体。
+	// 写入侧不变（仍然只写一个 mirasim:7d_claude），变的是读取侧要查它。
 	require.False(t, account.IsSchedulableForModelWithContext(ctx, "claude-opus-4-6"))
-	require.True(t, account.IsSchedulableForModelWithContext(ctx, "claude-fable-5"))
+	require.False(t, account.IsSchedulableForModelWithContext(ctx, "claude-fable-5"),
+		"7d_claude 耗尽时 fable 也必须停 —— fable 的额度包含在 claude 窗口里")
 }
 
 func TestMirasim4297dFableLocksFableFamilyOnly(t *testing.T) {

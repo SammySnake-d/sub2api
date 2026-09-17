@@ -414,23 +414,34 @@ func TestMirasimQuotaProbeDistinguishesZeroBudgetFromExhaustion(t *testing.T) {
 // The scheduling linkage
 // ---------------------------------------------------------------------------
 
-// TestMirasimQuotaExhaustedFamilyWindowGatesOnlyThatFamily is the whole point of
-// the per-(account, scope) storage: a spent 7d_claude must stop opus while
-// leaving fable fully served by the same account, and vice versa.
+// TestMirasimQuotaExhaustedFamilyWindowGatesTheRightModels pins the per-(account,
+// scope) storage AND the containment between the two family windows.
 //
-// The second arm is the differential negative — without it, a bug that cooled
-// the ACCOUNT instead of the scope would pass the first arm untouched.
-func TestMirasimQuotaExhaustedFamilyWindowGatesOnlyThatFamily(t *testing.T) {
+// 2026-09-17 语义更正：claude ⊇ fable，两个家族不是并列的。
+//
+//	7d_claude 耗尽 → opus 停，fable **也**停（fable 的额度算在 claude 窗口里）
+//	7d_fable  耗尽 → 只有 fable 停，opus 照常
+//
+// 这条不对称正是判据的鉴别力所在：把两边都写成「全停」或「只停自己」都会让其中
+// 一臂变红。原版第一臂断言 7d_claude 耗尽时 fable 仍可调度，那是缺陷本体 ——
+// 生产上调度器据此反复选中已耗尽的号，一路撞上游 429。
+//
+// 账号级标量那条断言保留：家族窗口永远不该写到 account scalar 上。
+func TestMirasimQuotaExhaustedFamilyWindowGatesTheRightModels(t *testing.T) {
 	reset := time.Now().Add(72 * time.Hour).Truncate(time.Second)
 	cases := []struct {
-		name         string
-		exhausted    string
-		scope        string
-		blockedModel string
-		servedModel  string
+		name          string
+		exhausted     string
+		scope         string
+		blockedModels []string
+		servedModels  []string
 	}{
-		{"claude family spent", MirasimWindow7dClaude, mirasimClaude7dRateLimitKey, mirasimQuotaTestOpusModel, mirasimQuotaTestFableModel},
-		{"fable family spent", MirasimWindow7dFable, mirasimFable7dRateLimitKey, mirasimQuotaTestFableModel, mirasimQuotaTestOpusModel},
+		// 包含方耗尽 → 两个都停。
+		{"claude family spent blocks fable too", MirasimWindow7dClaude, mirasimClaude7dRateLimitKey,
+			[]string{mirasimQuotaTestOpusModel, mirasimQuotaTestFableModel}, nil},
+		// 被包含方耗尽 → 只停自己。
+		{"fable family spent blocks only fable", MirasimWindow7dFable, mirasimFable7dRateLimitKey,
+			[]string{mirasimQuotaTestFableModel}, []string{mirasimQuotaTestOpusModel}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -467,10 +478,14 @@ func TestMirasimQuotaExhaustedFamilyWindowGatesOnlyThatFamily(t *testing.T) {
 				"a family window must never reach the account-level scalar; that would block the other family too")
 
 			ctx := context.Background()
-			require.False(t, account.IsSchedulableForModelWithContext(ctx, tc.blockedModel),
-				"%s is spent, so %s must stop being scheduled to this account", tc.exhausted, tc.blockedModel)
-			require.True(t, account.IsSchedulableForModelWithContext(ctx, tc.servedModel),
-				"%s is spent, but %s draws on a different family window and must still be served", tc.exhausted, tc.servedModel)
+			for _, blocked := range tc.blockedModels {
+				require.Falsef(t, account.IsSchedulableForModelWithContext(ctx, blocked),
+					"%s 耗尽，%s 必须停止被调度到这个账号", tc.exhausted, blocked)
+			}
+			for _, served := range tc.servedModels {
+				require.Truef(t, account.IsSchedulableForModelWithContext(ctx, served),
+					"%s 耗尽不影响 %s —— 它不消耗那个窗口", tc.exhausted, served)
+			}
 			require.True(t, account.IsSchedulable(),
 				"the account itself is healthy; only one family is gated")
 		})

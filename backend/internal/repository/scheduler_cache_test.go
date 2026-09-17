@@ -55,8 +55,15 @@ func TestSchedulerMetadataAccountKeepsMirasimCooldownVisible(t *testing.T) {
 
 	require.False(t, metadata.IsSchedulableForModel("claude-sonnet-4-5"),
 		"mirasim 家族冷却在候选投影上必须生效,否则已耗尽的账号会被反复选中")
-	require.True(t, metadata.IsSchedulableForModel("claude-fable-5"),
-		"7d_fable 窗口没被冷却,同一投影必须仍可调度;否则上一条 false 不能归因到这条冷却")
+	// claude ⊇ fable(2026-09-17 生产实证):7d_claude 耗尽时 fable 也停。
+	// 这条原本是阴性对照(断言 fable 仍可调度),那正是缺陷本体 —— 调度器据此
+	// 把 fable 请求反复发给已耗尽的号,一路撞上游 429。
+	require.False(t, metadata.IsSchedulableForModel("claude-fable-5"),
+		"7d_claude 耗尽时 fable 也必须停 —— fable 的额度包含在 claude 窗口里")
+	// 换一个**不消耗 claude 窗口**的模型当阴性对照:它必须仍可调度,
+	// 否则上面两条 false 可能来自"账号整体不可调度"而不是这条 scope 冷却。
+	require.True(t, metadata.IsSchedulableForModel("kimi-k3"),
+		"不消耗 claude 家族窗口的模型必须不受影响;否则上面的 false 不能归因到这条冷却")
 
 	plain := newAccount(map[string]any{"refresh_token": "secret-refresh-token"})
 	plainMetadata := buildSchedulerMetadataAccount(plain)
