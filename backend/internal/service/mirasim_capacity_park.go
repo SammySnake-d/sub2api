@@ -62,13 +62,36 @@ const (
 	// 是运维在面板上区分「额度用完」与「现在挤」的唯一依据。
 	mirasimCapacityParkReason = "mirasim_model_capacity_overloaded"
 
-	// mirasimCapacityParkDefaultMinutes 是默认停调时长。
-	// 10 分钟来自运营经验：503 的恢复是十分钟量级，不是几秒。
-	mirasimCapacityParkDefaultMinutes = 10
+	// mirasimCapacityParkDefaultMinutes 是停调时长的**上限**默认值。
+	//
+	// 2026-09-18 之前这个值是 10，语义是「每次 503 一律停调 10 分钟」。实测把那个
+	// 语义推翻了（数字见 nextMirasimCapacityParkDuration 的注释）：平坦时长两头都错，
+	// 现在它只当阶梯的封顶用。
+	mirasimCapacityParkDefaultMinutes = 60
 
 	// mirasimCapacityParkMaxMinutes 给配置值封顶。容量紧张是时段性的，
 	// 把它配成小时级等于用一个临时现象换一个长期不可用。
 	mirasimCapacityParkMaxMinutes = 1440
+
+	// mirasimCapacityParkBaseDuration 是阶梯的第一档。
+	//
+	// 取 30 秒不是折中，是**代价不对称**的结论：定短了错，代价是白烧一次换号尝试；
+	// 定长了错，代价是自噬整个号池（实测 2026-09-18：103/143 个号同时被容量停调
+	// 挡在 fable 之外）。所以从短起步、靠复发升档。
+	//
+	// 第一档短还有一个附带作用：它把仪器打开了。号被停调期间根本不可能被选中，
+	// 于是「这个号多久恢复」这个问题在长停调下永远测不出来 —— 2026-09-18 试图测它
+	// 时拿到的「625 次 503 里同号 10 分钟内 0 次成功」正是被 10 分钟停调本身造出来的
+	// 读数，不是号的属性。30 秒起步之后这条才有真实样本。
+	mirasimCapacityParkBaseDuration = 30 * time.Second
+
+	// mirasimCapacityParkDecayWindow 是阶梯的衰减窗口。
+	//
+	// 上一档过期之后静默超过这么久再吃 503，就当成一次新的偶发，从第一档重来。
+	// 没有衰减的纯升档会把整池推到封顶：实测 503 是**全池均摊**的（24 小时内
+	// 104 个号各吃 3–9 次，集中在 5–7 次），不是某几个号坏掉，所以任何只升不降的
+	// 计数器最终会把每个号都升到 1 小时。
+	mirasimCapacityParkDecayWindow = 30 * time.Minute
 )
 
 // mirasimCapacityRateLimitScope 由**映射后**的模型名算出 scope key。
@@ -146,6 +169,80 @@ func (s *RateLimitService) mirasimCapacityParkDuration(ctx context.Context) time
 }
 
 // ---------------------------------------------------------------------------
+// 阶梯退避
+// ---------------------------------------------------------------------------
+
+// nextMirasimCapacityParkDuration 算出这次该停调多久。
+//
+// 序列是从 mirasimCapacityParkBaseDuration 起倍增、以 capLimit 封顶：
+//
+//	30s → 1m → 2m → 4m → 8m → 16m → 32m → 60m（默认封顶）
+//
+// # 档位不用计数器，用上一次的时长
+//
+// SetModelRateLimit 每次**整体覆写** model_rate_limits.<scope>（account_repo.go:2320
+// 的 payload 是固定三个键），所以往那个对象里塞一个 strikes 计数器，下一次写入就没了。
+// 但档位本来就可以从已有的两个时间戳算出来：上一次的时长 = reset_at − limited_at。
+// 倍增它即可，零 schema 改动、零新字段。
+//
+// # 两条归零规则
+//
+//  1. **成功即归零**：LastUsedAt 晚于上一档的到期时刻，说明停调解除后这个号被
+//     成功用过。LastUsedAt 只在计费路径写（gateway_usage_billing.go 的
+//     ScheduleLastUsedUpdate），失败请求不进计费，所以它是干净的成功信号。
+//     它是延迟批量刷的，滞后只会让我们**少**归零一次（保守方向）。
+//  2. **静默即衰减**：上一档到期之后静默超过 mirasimCapacityParkDecayWindow
+//     再吃 503，当成新的偶发，从第一档重来。
+//
+// # 为什么平坦时长两头都错（2026-09-18 实测）
+//
+//	10 分钟：一个撞上限的请求平均打在 10.71 个号上、其中 8.80 次拿到 503，
+//	         每次都写一份 10 分钟停调 —— 一个失败请求连坐停掉 ~9 个号。
+//	         结果此刻 fable 池 143 个号里 103 个被我们自己挡住。自噬。
+//	 1 分钟：对真的坏掉的号太短，它每分钟回到池子里再烧一次换号预算。
+//
+// 返回停调时长与上一档时长（上一档为 0 表示这是第一档），后者只用于日志。
+func nextMirasimCapacityParkDuration(a *Account, scope string, capLimit time.Duration, now time.Time) (time.Duration, time.Duration) {
+	base := mirasimCapacityParkBaseDuration
+	if capLimit > 0 && base > capLimit {
+		// 运维把上限配得比第一档还短：尊重配置，不要偷偷拉长。
+		base = capLimit
+	}
+	if a == nil || scope == "" {
+		return base, 0
+	}
+
+	limitedAt := a.modelRateLimitTimestamp(scope, "rate_limited_at")
+	resetAt := a.modelRateLimitTimestamp(scope, "rate_limit_reset_at")
+	if limitedAt == nil || resetAt == nil {
+		return base, 0
+	}
+	prev := resetAt.Sub(*limitedAt)
+	if prev <= 0 {
+		// 时间戳自相矛盾（人工改过、时钟回拨）：不拿它推档位。
+		return base, 0
+	}
+
+	// 规则 1：停调解除后被成功用过 → 归零。
+	if a.LastUsedAt != nil && a.LastUsedAt.After(*resetAt) {
+		return base, prev
+	}
+	// 规则 2：静默够久 → 衰减归零。上一档还没到期时 now.Sub 为负，判否，继续升档。
+	if now.Sub(*resetAt) > mirasimCapacityParkDecayWindow {
+		return base, prev
+	}
+
+	next := prev * 2
+	if next < base {
+		next = base
+	}
+	if capLimit > 0 && next > capLimit {
+		next = capLimit
+	}
+	return next, prev
+}
+
+// ---------------------------------------------------------------------------
 // 写侧
 // ---------------------------------------------------------------------------
 
@@ -164,8 +261,8 @@ func (s *RateLimitService) parkMirasimModelCapacity(ctx context.Context, account
 		return
 	}
 
-	ttl := s.mirasimCapacityParkDuration(ctx)
-	if ttl <= 0 {
+	capLimit := s.mirasimCapacityParkDuration(ctx)
+	if capLimit <= 0 {
 		// 配置为 0：逃生口生效，行为与本功能上线前完全一致（不写任何状态）。
 		slog.Info("mirasim_capacity_park_disabled",
 			"account_id", account.ID,
@@ -187,7 +284,11 @@ func (s *RateLimitService) parkMirasimModelCapacity(ctx context.Context, account
 	}
 
 	now := time.Now()
+	// 阶梯退避：档位从上一次的停调时长推出来，不用计数器。判据见
+	// nextMirasimCapacityParkDuration。
+	ttl, prevTTL := nextMirasimCapacityParkDuration(account, scope, capLimit, now)
 	resetAt := now.Add(ttl)
+
 	// 已有更长的同 scope 冷却时不缩短。与 shouldPersistAnthropicWindowLimit 同一条
 	// 规则：一次新的短冷却不该把一条仍在生效的长冷却改短。
 	if existing := account.modelRateLimitResetAt(scope); existing != nil && existing.After(resetAt) {
@@ -215,9 +316,12 @@ func (s *RateLimitService) parkMirasimModelCapacity(ctx context.Context, account
 		"requested_model", requestedModel,
 		"scope", scope,
 		"park_for", ttl.String(),
+		"prev_park_for", prevTTL.String(),
+		"park_cap", capLimit.String(),
 		"reset_at", resetAt.UTC().Format(time.RFC3339),
 		"upstream_code", mirasimUpstreamErrorCode(responseBody),
-		"detail", "503 容量池此刻没容量：只停调这个模型，账号对其它模型仍可调度")
+		"detail", "503 容量池此刻没容量：只停调这个模型，账号对其它模型仍可调度；时长按复发阶梯升档")
+
 }
 
 // mirasimUpstreamErrorCode 只用于日志：把上游 error.code（如

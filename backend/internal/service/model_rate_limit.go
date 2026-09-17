@@ -171,7 +171,16 @@ func antigravityModelRateLimitKeys(model string) []string {
 }
 
 func (a *Account) modelRateLimitResetAt(scope string) *time.Time {
-	if a == nil || a.Extra == nil || scope == "" {
+	return a.modelRateLimitTimestamp(scope, "rate_limit_reset_at")
+}
+
+// modelRateLimitTimestamp 读 model_rate_limits.<scope> 下某个 RFC3339 时间字段。
+//
+// 拆出来是因为容量停调的阶梯退避需要读 rate_limited_at：上一次停调的**时长**
+// （reset_at − limited_at）就是它的档位，不需要另存一个计数器。见
+// nextMirasimCapacityParkDuration。
+func (a *Account) modelRateLimitTimestamp(scope, field string) *time.Time {
+	if a == nil || a.Extra == nil || scope == "" || field == "" {
 		return nil
 	}
 	rawLimits, ok := a.Extra[modelRateLimitsKey].(map[string]any)
@@ -182,15 +191,15 @@ func (a *Account) modelRateLimitResetAt(scope string) *time.Time {
 	if !ok {
 		return nil
 	}
-	resetAtRaw, ok := rawLimit["rate_limit_reset_at"].(string)
-	if !ok || strings.TrimSpace(resetAtRaw) == "" {
+	raw, ok := rawLimit[field].(string)
+	if !ok || strings.TrimSpace(raw) == "" {
 		return nil
 	}
-	resetAt, err := time.Parse(time.RFC3339, resetAtRaw)
+	parsed, err := time.Parse(time.RFC3339, raw)
 	if err != nil {
 		return nil
 	}
-	return &resetAt
+	return &parsed
 }
 
 func setAccountModelRateLimitSnapshot(account *Account, scope string, resetAt time.Time, reason string, now time.Time) {

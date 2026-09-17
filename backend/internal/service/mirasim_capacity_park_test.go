@@ -56,7 +56,7 @@ func mirasimCapacityServiceWithSetting(raw string) (*RateLimitService, *mirasimA
 
 func TestMirasim503ParksTheRequestedModelForTheConfiguredTTL(t *testing.T) {
 	ctx := context.Background()
-	svc, repo, account := mirasimCapacityServiceWithSetting("") // 未配置 → 默认 10 分钟
+	svc, repo, account := mirasimCapacityServiceWithSetting("") // 未配置 → 封顶取默认值
 	before := mirasimSnapshotAccount(account)
 
 	shouldDisable := svc.HandleUpstreamError(ctx, account, http.StatusServiceUnavailable,
@@ -68,14 +68,18 @@ func TestMirasim503ParksTheRequestedModelForTheConfiguredTTL(t *testing.T) {
 	require.False(t, account.IsSchedulableForModelWithContext(ctx, mirasimCapacityTestModel),
 		"503 之后同一账号同一模型必须停调，否则它会被后续请求反复选中、反复吃 503")
 
-	// 落库的必须是模型级 scope，且时长是默认的 10 分钟。
+	// 落库的必须是模型级 scope，且首次停调走阶梯的第一档（30 秒），
+	// 不是配置里的那个值 —— 配置值现在只是封顶。
 	modelCalls := repo.callsOf("SetModelRateLimit")
 	require.Len(t, modelCalls, 1)
 	require.Equal(t, mirasimCapacityRateLimitScope(mirasimCapacityTestModel), modelCalls[0].scope)
 	require.Equal(t, mirasimCapacityParkReason, modelCalls[0].reason)
-	require.WithinDuration(t, time.Now().Add(mirasimCapacityParkDefaultMinutes*time.Minute),
+	require.WithinDuration(t, time.Now().Add(mirasimCapacityParkBaseDuration),
 		modelCalls[0].resetAt, 5*time.Second,
-		"默认停调时长必须是 10 分钟：运营经验里 503 的恢复是十分钟量级")
+		"首次 503 必须只停调第一档 30 秒：定长了会自噬号池（实测 103/143 被自己挡住）")
+	require.Less(t, modelCalls[0].resetAt.Sub(time.Now()), time.Minute,
+		"首次停调绝不能是配置里的封顶值，那是阶梯末档不是首档")
+
 
 	// INV-4：账号级状态一个字段都不许动。
 	require.Empty(t, repo.callsOf("SetRateLimited"),
@@ -394,4 +398,139 @@ func TestCapacityFailOpenDoesNotUnblockWindowExhaustedAccounts(t *testing.T) {
 
 	// 没挂观察器时（正常请求路径，不在选号中）不得 panic，也不放行。
 	require.False(t, mirasimCapacityParkAdmits(ctx, &capacityOnly, mirasimCapacityTestModel))
+}
+
+// ---------------------------------------------------------------------------
+// 阶梯退避
+//
+// 2026-09-18 实测推翻了「一律停调 N 分钟」这个平坦形状。两个方向各有实测反例：
+//
+//	定长了：一个撞上限的请求平均打在 10.71 个号上、8.80 次拿到 503，每次写一份
+//	        10 分钟停调 → 一个失败请求连坐停掉 ~9 个号 → 143 个号里 103 个被我们
+//	        自己挡在 fable 之外。自噬。
+//	定短了：真的坏掉的号每分钟回到池子里，再烧一次换号预算。
+//
+// 所以时长由复发情况决定，档位从**上一次的停调时长**推出来（不存计数器，因为
+// SetModelRateLimit 每次整体覆写 scope 对象）。
+// ---------------------------------------------------------------------------
+
+func mirasimParkAccountWith(scope string, limitedAt, resetAt time.Time, lastUsedAt *time.Time) *Account {
+	a := &Account{ID: 1, LastUsedAt: lastUsedAt, Extra: map[string]any{}}
+	setAccountModelRateLimitSnapshot(a, scope, resetAt, mirasimCapacityParkReason, limitedAt)
+	return a
+}
+
+func TestMirasimCapacityParkLadderClimbsOnRecurrence(t *testing.T) {
+	const scope = "mirasim:capacity:claude-fable-5-1"
+	capLimit := time.Hour
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+
+	t.Run("没有任何历史时走第一档", func(t *testing.T) {
+		ttl, prev := nextMirasimCapacityParkDuration(
+			&Account{ID: 1, Extra: map[string]any{}}, scope, capLimit, now)
+		require.Equal(t, mirasimCapacityParkBaseDuration, ttl)
+		require.Equal(t, time.Duration(0), prev, "没有上一档时 prev 必须是 0，否则日志会谎报升档")
+	})
+
+	t.Run("复发时逐档倍增直到封顶", func(t *testing.T) {
+		// 上一档刚过期 1 秒就又吃 503 —— 典型的复发。
+		steps := []time.Duration{
+			30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute,
+			8 * time.Minute, 16 * time.Minute, 32 * time.Minute, time.Hour, time.Hour,
+		}
+		for i := 0; i < len(steps)-1; i++ {
+			prevTTL := steps[i]
+			resetAt := now.Add(-time.Second)
+			limitedAt := resetAt.Add(-prevTTL)
+
+			// 前提断言：构造出来的账号真的带着 prevTTL 这个时长，
+			// 否则下面"升档了"的断言是在测一个空对象。
+			a := mirasimParkAccountWith(scope, limitedAt, resetAt, nil)
+			gotLimited := a.modelRateLimitTimestamp(scope, "rate_limited_at")
+			gotReset := a.modelRateLimitTimestamp(scope, "rate_limit_reset_at")
+			require.NotNil(t, gotLimited, "第 %d 档：读不回 rate_limited_at，fixture 没建起来", i)
+			require.NotNil(t, gotReset)
+			require.Equal(t, prevTTL, gotReset.Sub(*gotLimited), "第 %d 档 fixture 的时长不对", i)
+
+			ttl, prev := nextMirasimCapacityParkDuration(a, scope, capLimit, now)
+			require.Equal(t, steps[i+1], ttl, "从 %s 该升到 %s", prevTTL, steps[i+1])
+			require.Equal(t, prevTTL, prev)
+		}
+	})
+
+	t.Run("封顶之后不再增长", func(t *testing.T) {
+		resetAt := now.Add(-time.Second)
+		a := mirasimParkAccountWith(scope, resetAt.Add(-time.Hour), resetAt, nil)
+		ttl, _ := nextMirasimCapacityParkDuration(a, scope, capLimit, now)
+		require.Equal(t, capLimit, ttl, "封顶是硬的，不能被倍增穿过去")
+	})
+
+	t.Run("上限配得比第一档还短时尊重配置", func(t *testing.T) {
+		ttl, _ := nextMirasimCapacityParkDuration(
+			&Account{ID: 1, Extra: map[string]any{}}, scope, 10*time.Second, now)
+		require.Equal(t, 10*time.Second, ttl, "不能偷偷把运维配的上限拉长到第一档")
+	})
+}
+
+func TestMirasimCapacityParkLadderResets(t *testing.T) {
+	const scope = "mirasim:capacity:claude-fable-5-1"
+	capLimit := time.Hour
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	prevTTL := 16 * time.Minute
+
+	t.Run("停调解除后被成功用过就归零", func(t *testing.T) {
+		resetAt := now.Add(-20 * time.Minute)
+		used := resetAt.Add(time.Minute) // 停调过期之后成功用过
+		a := mirasimParkAccountWith(scope, resetAt.Add(-prevTTL), resetAt, &used)
+
+		// 前提断言：LastUsedAt 真的晚于上一档到期，否则测的是衰减规则不是成功规则。
+		require.True(t, a.LastUsedAt.After(resetAt), "fixture 没建成「过期后被用过」")
+		require.LessOrEqual(t, now.Sub(resetAt), mirasimCapacityParkDecayWindow,
+			"fixture 必须落在衰减窗口内，否则归零可能是衰减造成的，这条断言就不承重")
+
+		ttl, prev := nextMirasimCapacityParkDuration(a, scope, capLimit, now)
+		require.Equal(t, mirasimCapacityParkBaseDuration, ttl,
+			"成功用过说明这个号已经好了，下次 503 该从第一档重来")
+		require.Equal(t, prevTTL, prev)
+	})
+
+	t.Run("静默超过衰减窗口就归零", func(t *testing.T) {
+		resetAt := now.Add(-mirasimCapacityParkDecayWindow - time.Minute)
+		a := mirasimParkAccountWith(scope, resetAt.Add(-prevTTL), resetAt, nil)
+		ttl, _ := nextMirasimCapacityParkDuration(a, scope, capLimit, now)
+		require.Equal(t, mirasimCapacityParkBaseDuration, ttl)
+	})
+
+	t.Run("刚好在衰减窗口内且没被用过则继续升档", func(t *testing.T) {
+		resetAt := now.Add(-mirasimCapacityParkDecayWindow + time.Minute)
+		a := mirasimParkAccountWith(scope, resetAt.Add(-prevTTL), resetAt, nil)
+		ttl, _ := nextMirasimCapacityParkDuration(a, scope, capLimit, now)
+		require.Equal(t, 32*time.Minute, ttl, "窗口内的复发必须升档，否则阶梯不存在")
+	})
+
+	t.Run("停调还没到期时算复发不算衰减", func(t *testing.T) {
+		// now < resetAt，now.Sub(resetAt) 为负，绝不能被当成「静默很久」。
+		resetAt := now.Add(5 * time.Minute)
+		a := mirasimParkAccountWith(scope, resetAt.Add(-prevTTL), resetAt, nil)
+		ttl, _ := nextMirasimCapacityParkDuration(a, scope, capLimit, now)
+		require.Equal(t, 32*time.Minute, ttl,
+			"负的时间差不能穿过衰减判据变成归零")
+	})
+
+	t.Run("成功时刻早于上一档到期时不归零", func(t *testing.T) {
+		resetAt := now.Add(-time.Minute)
+		used := resetAt.Add(-5 * time.Minute) // 停调之前用的，不算恢复证据
+		a := mirasimParkAccountWith(scope, resetAt.Add(-prevTTL), resetAt, &used)
+		ttl, _ := nextMirasimCapacityParkDuration(a, scope, capLimit, now)
+		require.Equal(t, 32*time.Minute, ttl,
+			"停调期之前的成功不能当成恢复证据：那次成功发生在号变坏之前")
+	})
+
+	t.Run("时间戳自相矛盾时退回第一档", func(t *testing.T) {
+		resetAt := now.Add(-time.Minute)
+		a := mirasimParkAccountWith(scope, resetAt.Add(time.Minute), resetAt, nil) // limited 晚于 reset
+		ttl, prev := nextMirasimCapacityParkDuration(a, scope, capLimit, now)
+		require.Equal(t, mirasimCapacityParkBaseDuration, ttl)
+		require.Equal(t, time.Duration(0), prev)
+	})
 }
