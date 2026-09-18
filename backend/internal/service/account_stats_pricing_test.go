@@ -387,6 +387,25 @@ func TestTryCustomRules_FirstMatchWins(t *testing.T) {
 	require.InDelta(t, 2.0, *result, 1e-12)
 }
 
+func TestTryCustomRules_Fable51MaxUsesOnlyConfiguredMultiplier(t *testing.T) {
+	for _, configured := range []*float64{nil, testPtrFloat64(1), testPtrFloat64(1.5)} {
+		pricing := ChannelModelPricing{
+			Models: []string{"claude-fable-5-1"}, InputPrice: testPtrFloat64(0.01),
+			MaxReasoningEffortMultiplier: configured,
+		}
+		channel := &Channel{AccountStatsPricingRules: []AccountStatsPricingRule{{
+			GroupIDs: []int64{1}, Pricing: []ChannelModelPricing{pricing},
+		}}}
+		got := tryCustomRules(channel, 999, 1, "", "claude-fable-5-1", UsageTokens{InputTokens: 100}, 1, "max")
+		require.NotNil(t, got)
+		want := 1.0
+		if configured != nil {
+			want = *configured
+		}
+		require.InDelta(t, want, *got, 1e-12)
+	}
+}
+
 func TestTryCustomRules_SkipsNonMatchingRules(t *testing.T) {
 	channel := &Channel{
 		AccountStatsPricingRules: []AccountStatsPricingRule{
@@ -478,7 +497,7 @@ func TestTryModelFilePricing_Success(t *testing.T) {
 	require.InDelta(t, 0.2, *result, 1e-12)
 }
 
-func TestTryModelFilePricing_Fable51MaxEffortUsesTripleQuota(t *testing.T) {
+func TestTryModelFilePricing_Fable51MaxEffortHasNoImplicitSurcharge(t *testing.T) {
 	bs := newTestBillingServiceWithPrices(map[string]*ModelPricing{
 		"claude-fable-5-1": {InputPricePerToken: 0.001},
 	})
@@ -487,7 +506,7 @@ func TestTryModelFilePricing_Fable51MaxEffortUsesTripleQuota(t *testing.T) {
 	max := tryModelFilePricing(bs, "claude-fable-5-1", tokens, "", time.Time{}, "max")
 	require.NotNil(t, standard)
 	require.NotNil(t, max)
-	require.InDelta(t, *standard*3, *max, 1e-12)
+	require.Equal(t, *standard, *max)
 }
 
 func TestTryModelFilePricing_AppliesLongContextPricing(t *testing.T) {

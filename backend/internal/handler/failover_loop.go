@@ -255,8 +255,19 @@ func (s *FailoverState) HandleFailoverError(
 		zap.Int("max_switches", s.MaxSwitches),
 	)
 
-	// Antigravity 平台换号线性递增延时
-	if platform == service.PlatformAntigravity {
+	// Anthropic 请求级容量错误换号也需要退避；换号不会立即恢复模型容量。
+	// 复用有上限的指数间隔，保留 MaxSwitches 预算与客户端取消边界。
+	if platform == service.PlatformAnthropic && failoverErr.RequestScopedTransient {
+		delay := sameAccountRetryDelayFor(failoverErr, s.SwitchCount)
+		logger.FromContext(ctx).Warn("gateway.failover_capacity_backoff",
+			zap.Duration("retry_delay", delay),
+			zap.Int("switch_count", s.SwitchCount),
+		)
+		if !sleepWithContext(ctx, delay) {
+			return FailoverCanceled
+		}
+	} else if platform == service.PlatformAntigravity {
+		// Antigravity 平台换号线性递增延时
 		delay := time.Duration(s.SwitchCount-1) * time.Second
 		if !sleepWithContext(ctx, delay) {
 			return FailoverCanceled

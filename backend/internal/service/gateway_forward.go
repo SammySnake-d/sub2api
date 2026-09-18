@@ -718,6 +718,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 				StatusCode:             resp.StatusCode,
 				ResponseBody:           respBody,
 				RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
+				RequestScopedTransient: IsMirasimAccount(account) && MirasimClassifyStatus(resp.StatusCode, respBody) == MirasimActionModelCapacityPark,
 			}
 		}
 		return s.handleRetryExhaustedError(ctx, resp, c, account)
@@ -754,6 +755,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			StatusCode:             resp.StatusCode,
 			ResponseBody:           respBody,
 			RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
+			RequestScopedTransient: IsMirasimAccount(account) && MirasimClassifyStatus(resp.StatusCode, respBody) == MirasimActionModelCapacityPark,
 		}
 	}
 	if resp.StatusCode >= 400 {

@@ -57,17 +57,24 @@ func TestListPlazaGroups_GroupCentricAggregation(t *testing.T) {
 	require.Equal(t, "claude-sonnet", out[0].Models[1].Name)
 }
 
-func TestWithDefaultMaxReasoningEffortMultiplier_Fable51(t *testing.T) {
+func TestFillDisplayPricing_Fable51HasNoImplicitSurcharge(t *testing.T) {
 	base := &ChannelModelPricing{BillingMode: BillingModeToken}
-	got := withDefaultMaxReasoningEffortMultiplier(base, "claude-fable-5-1")
-	require.NotSame(t, base, got)
-	require.NotNil(t, got.MaxReasoningEffortMultiplier)
-	require.Equal(t, 3.0, *got.MaxReasoningEffortMultiplier)
+	m := &PlazaModel{Name: "claude-fable-5-1", Pricing: base}
+	s := &ModelPlazaService{}
+	s.fillDisplayPricing(context.Background(), m, nil)
+	require.Same(t, base, m.Pricing)
 	require.Nil(t, base.MaxReasoningEffortMultiplier)
 
 	configured := 1.25
 	custom := &ChannelModelPricing{MaxReasoningEffortMultiplier: &configured}
-	require.Same(t, custom, withDefaultMaxReasoningEffortMultiplier(custom, "claude-fable-5-1"))
+	m.Pricing = custom
+	s.fillDisplayPricing(context.Background(), m, nil)
+	require.Same(t, custom, m.Pricing)
+
+	models := []SupportedModel{{Name: m.Name, Pricing: base}, {Name: m.Name, Pricing: custom}}
+	fillGlobalPricingFallback(nil, models)
+	require.Nil(t, models[0].Pricing.MaxReasoningEffortMultiplier)
+	require.Equal(t, configured, *models[1].Pricing.MaxReasoningEffortMultiplier)
 }
 
 func TestListPlazaGroups_DedupFirstWinsWithPricingUpgrade(t *testing.T) {

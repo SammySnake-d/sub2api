@@ -158,7 +158,7 @@
             <div>
               <label class="text-xs text-gray-400">{{ t('admin.channels.form.maxReasoningEffortMultiplier') }}</label>
               <input :value="entry.max_reasoning_effort_multiplier" @input="emitField('max_reasoning_effort_multiplier', ($event.target as HTMLInputElement).value)"
-                type="number" step="any" min="0.000001" class="input mt-0.5 text-sm" :placeholder="maxReasoningEffortMultiplierPlaceholder" />
+                type="number" step="any" min="0.000001" class="input mt-0.5 text-sm" :placeholder="t('admin.channels.form.maxReasoningMultiplierPlaceholder')" />
             </div>
           </div>
 
@@ -312,12 +312,6 @@ const billingModeLabel = computed(() => {
   const opt = billingModeOptions.value.find(o => o.value === props.entry.billing_mode)
   return opt ? opt.label : props.entry.billing_mode
 })
-
-const maxReasoningEffortMultiplierPlaceholder = computed(() =>
-  props.entry.models.some(model => /fable(?:-5-1|-5\.1|5\.1|51)(?!\d)/i.test(model))
-    ? t('admin.channels.form.fable51DefaultMaxReasoningMultiplier')
-    : t('admin.channels.form.multiplierPlaceholder')
-)
 
 function emitField(field: keyof PricingFormEntry, value: string) {
   emit('update', { ...props.entry, [field]: value === '' ? null : value })

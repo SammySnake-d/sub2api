@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -62,6 +63,61 @@ func TestSameAccountRetryDelayFor(t *testing.T) {
 	t.Run("explicit oauth delay wins", func(t *testing.T) {
 		err := &service.UpstreamFailoverError{SameAccountRetryDelay: 3 * time.Second}
 		require.Equal(t, 3*time.Second, sameAccountRetryDelayFor(err, 1))
+	})
+}
+
+func TestHandleFailoverError_CapacitySwitchBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		transient   bool
+		maxSwitches int
+		want        FailoverAction
+	}{
+		{"capacity waits and respects cancellation", true, 10, FailoverCanceled},
+		{"ordinary error switches immediately", false, 10, FailoverContinue},
+		{"exhausted budget does not wait", true, 0, FailoverExhausted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := NewFailoverState(tc.maxSwitches, false)
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			err := &service.UpstreamFailoverError{StatusCode: http.StatusServiceUnavailable, RequestScopedTransient: tc.transient}
+			got := fs.HandleFailoverError(ctx, &mockTempUnscheduler{}, 1, service.PlatformAnthropic, 0, err)
+			require.Equal(t, tc.want, got)
+			require.Contains(t, fs.FailedAccountIDs, int64(1))
+			require.LessOrEqual(t, fs.SwitchCount, fs.MaxSwitches)
+		})
+	}
+}
+
+func TestHandleFailoverError_CapacitySwitchEventuallyContinues(t *testing.T) {
+	fs := NewFailoverState(10, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := &service.UpstreamFailoverError{StatusCode: http.StatusServiceUnavailable, RequestScopedTransient: true}
+	require.Equal(t, FailoverContinue, fs.HandleFailoverError(ctx, &mockTempUnscheduler{}, 1, service.PlatformAnthropic, 0, err))
+	require.GreaterOrEqual(t, time.Since(start), 500*time.Millisecond)
+	require.Equal(t, 1, fs.SwitchCount)
+}
+
+func TestHandleFailoverError_CapacitySwitchBudget(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fs := NewFailoverState(10, false)
+		err := &service.UpstreamFailoverError{StatusCode: http.StatusServiceUnavailable, RequestScopedTransient: true}
+		start := time.Now()
+		for attempt := 0; attempt <= 10; attempt++ {
+			action := fs.HandleFailoverError(context.Background(), &mockTempUnscheduler{}, int64(attempt+1), service.PlatformAnthropic, 0, err)
+			if attempt < 10 {
+				require.Equal(t, FailoverContinue, action)
+			} else {
+				require.Equal(t, FailoverExhausted, action)
+			}
+		}
+		// 0.5 + 1 + 2 + 4 + 6*8 seconds: retry budget spans a recovery window.
+		require.Equal(t, 55500*time.Millisecond, time.Since(start))
+		require.Equal(t, 10, fs.SwitchCount)
+		require.Len(t, fs.FailedAccountIDs, 11)
 	})
 }
 

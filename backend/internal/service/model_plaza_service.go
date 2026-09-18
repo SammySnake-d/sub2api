@@ -231,7 +231,7 @@ func (s *ModelPlazaService) fillDisplayPricing(ctx context.Context, m *PlazaMode
 			Platform: m.Platform,
 		})
 		if err == nil && sched != nil && len(sched.Tiers) > 0 {
-			m.Pricing = withDefaultMaxReasoningEffortMultiplier(plazaPricingFromSchedule(m.Pricing, sched), m.Name)
+			m.Pricing = plazaPricingFromSchedule(m.Pricing, sched)
 			if len(sched.Tiers) > 1 {
 				m.LongContextBasis = sched.Basis
 			}
@@ -239,20 +239,7 @@ func (s *ModelPlazaService) fillDisplayPricing(ctx context.Context, m *PlazaMode
 			return
 		}
 	}
-	m.Pricing = withDefaultMaxReasoningEffortMultiplier(plazaImageDisplayPricing(m.Pricing, g), m.Name)
-}
-
-func withDefaultMaxReasoningEffortMultiplier(pricing *ChannelModelPricing, model string) *ChannelModelPricing {
-	if pricing == nil || pricing.MaxReasoningEffortMultiplier != nil {
-		return pricing
-	}
-	multiplier := defaultMaxReasoningEffortMultiplier(model)
-	if multiplier == nil {
-		return pricing
-	}
-	cloned := pricing.Clone()
-	cloned.MaxReasoningEffortMultiplier = multiplier
-	return &cloned
+	m.Pricing = plazaImageDisplayPricing(m.Pricing, g)
 }
 
 // plazaPricingFromSchedule 把阶梯表压成展示用的 ChannelModelPricing：

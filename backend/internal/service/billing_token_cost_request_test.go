@@ -217,7 +217,7 @@ func TestCalculateTokenCostForRequest_NoResolverFallsBackToCatalog(t *testing.T)
 	require.Equal(t, want, got)
 }
 
-func TestCalculateTokenCostForRequest_Fable51MaxEffortUsesDefaultMultiplier(t *testing.T) {
+func TestCalculateTokenCostForRequest_Fable51MaxEffortHasNoImplicitSurcharge(t *testing.T) {
 	bs := NewBillingService(&config.Config{}, nil)
 	tokens := UsageTokens{InputTokens: 1000, OutputTokens: 10}
 	standard, err := bs.CalculateTokenCostForRequest(TokenCostRequest{
@@ -228,29 +228,37 @@ func TestCalculateTokenCostForRequest_Fable51MaxEffortUsesDefaultMultiplier(t *t
 		Model: "claude-fable-5-1", Tokens: tokens, RateMultiplier: 1, ReasoningEffort: "max",
 	})
 	require.NoError(t, err)
-	require.InDelta(t, standard.TotalCost*3, max.TotalCost, 1e-12)
-	require.InDelta(t, standard.ActualCost*3, max.ActualCost, 1e-12)
-	require.InDelta(t, standard.InputCost*3, max.InputCost, 1e-12)
-	require.InDelta(t, standard.OutputCost*3, max.OutputCost, 1e-12)
+	require.Equal(t, standard, max)
 }
 
 func TestCalculateTokenCostForRequest_ChannelOverridesFable51MaxEffortMultiplier(t *testing.T) {
-	configured := 1.5
-	bs, resolver := newTokenCostTestEnv(t, PlatformAnthropic, []ChannelModelPricing{{
-		Platform: PlatformAnthropic, Models: []string{"claude-fable-5-1"}, BillingMode: BillingModeToken,
-		InputPrice: testPtrFloat64(10e-6), OutputPrice: testPtrFloat64(50e-6),
-		MaxReasoningEffortMultiplier: &configured,
-	}}, nil)
-	group := &Group{ID: 100, Platform: PlatformAnthropic}
-	gid := group.ID
-	resolved := resolver.Resolve(context.Background(), PricingInput{Model: "claude-fable-5-1", GroupID: &gid, Group: group})
+	for _, tc := range []struct {
+		name       string
+		configured *float64
+		want       float64
+	}{
+		{"unset", nil, 1},
+		{"explicit one", testPtrFloat64(1), 1},
+		{"explicit surcharge", testPtrFloat64(1.5), 1.5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bs, resolver := newTokenCostTestEnv(t, PlatformAnthropic, []ChannelModelPricing{{
+				Platform: PlatformAnthropic, Models: []string{"claude-fable-5-1"}, BillingMode: BillingModeToken,
+				InputPrice: testPtrFloat64(10e-6), OutputPrice: testPtrFloat64(50e-6),
+				MaxReasoningEffortMultiplier: tc.configured,
+			}}, nil)
+			group := &Group{ID: 100, Platform: PlatformAnthropic}
+			gid := group.ID
+			resolved := resolver.Resolve(context.Background(), PricingInput{Model: "claude-fable-5-1", GroupID: &gid, Group: group})
 
-	got, err := bs.CalculateTokenCostForRequest(TokenCostRequest{
-		Ctx: context.Background(), Model: "claude-fable-5-1", Group: group,
-		Tokens: UsageTokens{InputTokens: 1000}, RateMultiplier: 1, ReasoningEffort: "max",
-		Resolver: resolver, Resolved: resolved,
-	})
-	require.NoError(t, err)
-	require.InDelta(t, 1000*10e-6*configured, got.TotalCost, 1e-12)
-	require.InDelta(t, got.TotalCost, got.ActualCost, 1e-12)
+			got, err := bs.CalculateTokenCostForRequest(TokenCostRequest{
+				Ctx: context.Background(), Model: "claude-fable-5-1", Group: group,
+				Tokens: UsageTokens{InputTokens: 1000}, RateMultiplier: 1, ReasoningEffort: "max",
+				Resolver: resolver, Resolved: resolved,
+			})
+			require.NoError(t, err)
+			require.InDelta(t, 1000*10e-6*tc.want, got.TotalCost, 1e-12)
+			require.InDelta(t, got.TotalCost, got.ActualCost, 1e-12)
+		})
+	}
 }
