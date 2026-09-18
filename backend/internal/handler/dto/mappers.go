@@ -281,7 +281,7 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 	}
 
 	// 提取 5h 窗口费用控制和会话数量控制配置（仅 Anthropic OAuth/SetupToken 账号有效）
-	if a.IsAnthropicOAuthOrSetupToken() {
+	if a.SupportsAnthropicPoolControls() {
 		if limit := a.GetWindowCostLimit(); limit > 0 {
 			out.WindowCostLimit = &limit
 		}
@@ -297,6 +297,9 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		if rpm := a.GetBaseRPM(); rpm > 0 {
 			out.BaseRPM = &rpm
 			strategy := a.GetRPMStrategy()
+			if service.IsMirasimAccount(a) {
+				strategy = "strict"
+			}
 			out.RPMStrategy = &strategy
 			buffer := a.GetRPMStickyBuffer()
 			out.RPMStickyBuffer = &buffer

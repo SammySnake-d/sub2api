@@ -933,6 +933,7 @@ export default {
 	  },
       // Quota control (Anthropic OAuth/SetupToken only)
       quotaControl: {
+        mirasimHint: '0 disables a limit. RPM counts admitted upstream attempts, including failures; sticky sessions are not exempt. Spend uses the provider window, or a rolling five hours when unavailable. Prompts and models are unchanged.',
         title: 'Quota Control',
         hint: 'Configure cost window, session limits, client affinity and other scheduling controls.',
         windowCost: {

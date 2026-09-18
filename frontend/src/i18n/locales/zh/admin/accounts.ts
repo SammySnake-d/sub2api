@@ -1036,6 +1036,7 @@ export default {
 	  },
       // Quota control (Anthropic OAuth/SetupToken only)
       quotaControl: {
+        mirasimHint: '0 表示关闭对应限制。RPM 按实际发起的上游尝试计数（失败也计入），同会话不豁免；费用窗口使用上游窗口，缺失时按最近5小时统计。不会修改提示词或模型。',
         title: '配额控制',
         hint: '配置费用窗口、会话限制、客户端亲和等调度控制。',
         windowCost: {

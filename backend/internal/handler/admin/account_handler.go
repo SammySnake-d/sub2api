@@ -391,7 +391,7 @@ func (h *AccountHandler) buildAccountResponseWithRuntime(ctx context.Context, ac
 		}
 	}
 
-	if account.IsAnthropicOAuthOrSetupToken() {
+	if account.SupportsAnthropicPoolControls() {
 		if h.accountUsageService != nil && account.GetWindowCostLimit() > 0 {
 			startTime := account.GetCurrentWindowStartTime()
 			if stats, err := h.accountUsageService.GetAccountWindowStats(ctx, account.ID, startTime); err == nil && stats != nil {
@@ -741,7 +741,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 	sessionIdleTimeouts := make(map[int64]time.Duration) // 各账号的会话空闲超时配置
 	for i := range accounts {
 		acc := &accounts[i]
-		if acc.IsAnthropicOAuthOrSetupToken() {
+		if acc.SupportsAnthropicPoolControls() {
 			if acc.GetWindowCostLimit() > 0 {
 				windowCostAccountIDs = append(windowCostAccountIDs, acc.ID)
 			}
@@ -780,7 +780,7 @@ func (h *AccountHandler) List(c *gin.Context) {
 
 		for i := range accounts {
 			acc := &accounts[i]
-			if !acc.IsAnthropicOAuthOrSetupToken() || acc.GetWindowCostLimit() <= 0 {
+			if !acc.SupportsAnthropicPoolControls() || acc.GetWindowCostLimit() <= 0 {
 				continue
 			}
 			accCopy := acc // 闭包捕获

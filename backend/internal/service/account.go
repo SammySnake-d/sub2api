@@ -2425,6 +2425,13 @@ func (a *Account) IsAnthropicOAuthOrSetupToken() bool {
 	return a.Platform == PlatformAnthropic && (a.Type == AccountTypeOAuth || a.Type == AccountTypeSetupToken)
 }
 
+// SupportsAnthropicPoolControls is about admission, not credential identity.
+// Never widen IsAnthropicOAuthOrSetupToken: it also owns OAuth-only headers,
+// refresh and fingerprint behavior that must not leak into Mirasim API keys.
+func (a *Account) SupportsAnthropicPoolControls() bool {
+	return a != nil && (a.IsAnthropicOAuthOrSetupToken() || IsMirasimAccount(a))
+}
+
 // IsTLSFingerprintEnabled 检查是否启用 TLS 指纹伪装
 // 仅适用于 Anthropic OAuth/SetupToken 类型账号
 // 启用后将模拟 Claude Code (Node.js) 客户端的 TLS 握手特征
@@ -3073,7 +3080,7 @@ func (a *Account) GetWindowCostStickyReserve() float64 {
 	}
 	if v, ok := a.Extra["window_cost_sticky_reserve"]; ok {
 		val := parseExtraFloat64(v)
-		if val > 0 {
+		if val > 0 || (IsMirasimAccount(a) && val == 0) {
 			return val
 		}
 	}
@@ -3193,6 +3200,11 @@ func (a *Account) CheckRPMSchedulability(currentRPM int) WindowCostSchedulabilit
 		return WindowCostSchedulable
 	}
 
+	// Mira's transport enforces an atomic hard attempt budget, including
+	// failures. Sticky sessions do not waive this limit.
+	if IsMirasimAccount(a) {
+		return WindowCostNotSchedulable
+	}
 	strategy := a.GetRPMStrategy()
 	if strategy == "sticky_exempt" {
 		return WindowCostStickyOnly // 粘性豁免无红区
@@ -3238,6 +3250,12 @@ func (a *Account) GetCurrentWindowStartTime() time.Time {
 	// 窗口未过期，使用记录的窗口开始时间
 	if a.SessionWindowStart != nil && a.SessionWindowEnd != nil && now.Before(*a.SessionWindowEnd) {
 		return *a.SessionWindowStart
+	}
+
+	// Without a provider window, Mira uses a rolling five-hour spend view,
+	// never the legacy top-of-hour prediction which resets the budget hourly.
+	if IsMirasimAccount(a) {
+		return now.Add(-5 * time.Hour)
 	}
 
 	// 窗口已过期或未设置，预测新的窗口开始时间（从当前整点开始）

@@ -1699,3 +1699,25 @@ describe('EditAccountModal OpenAI 自动使用重置卡', () => {
     wrapper.unmount()
   })
 })
+
+describe('Mirasim pool admission editing', () => {
+  it('loads and saves Mira limits without showing OAuth fingerprint controls', async () => {
+    updateAccountMock.mockReset()
+    const account = { ...buildAccount(), platform: 'anthropic', type: 'apikey', credentials: { provider: 'mirasim', base_url: 'https://example.invalid', api_key: 'test-fixture' }, extra: { base_rpm: 12, max_sessions: 3, window_cost_limit: 50, model_rate_limits: { keep: { reset: 'future' } } } }
+    updateAccountMock.mockResolvedValue(account)
+    const wrapper = mountModal(account)
+    expect(wrapper.find('[data-testid="mirasim-pool-controls"]').exists()).toBe(true)
+    expect((wrapper.get('[data-testid="mirasim-base-rpm"]').element as HTMLInputElement).value).toBe('12')
+    await wrapper.get('[data-testid="mirasim-base-rpm"]').setValue('20')
+    await wrapper.get('[data-testid="mirasim-max-sessions"]').setValue('4')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    await vi.waitFor(() => expect(updateAccountMock).toHaveBeenCalledTimes(1))
+    expect(updateAccountMock.mock.calls[0][1].extra).toMatchObject({ base_rpm: 20, max_sessions: 4, window_cost_limit: 50, rpm_strategy: 'strict', model_rate_limits: { keep: { reset: 'future' } } })
+    wrapper.unmount()
+  })
+  it('does not show Mira controls for ordinary API keys', () => {
+    const wrapper = mountModal()
+    expect(wrapper.find('[data-testid="mirasim-pool-controls"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+})

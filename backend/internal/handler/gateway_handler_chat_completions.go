@@ -172,6 +172,15 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		fs = NewFailoverState(h.maxAccountSwitchesGemini, false)
 	}
 
+	sessionAccounts := make(map[int64]*service.Account)
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		for _, acc := range sessionAccounts {
+			h.gatewayService.ReleaseAccountSession(cleanupCtx, acc, selectionSessionHash)
+		}
+	}()
+
 	for {
 		if c.Request.Context().Err() != nil {
 			return
@@ -224,6 +233,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 			}
 		}
 		account := selection.Account
+		sessionAccounts[account.ID] = account
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
 		// 4. Acquire account concurrency slot
@@ -252,6 +262,10 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		admissionCtx := service.ContextWithSelectionProfitGate(c.Request.Context(), selection)
 		latest, vetoed, reason := h.gatewayService.GatewayProfitControlVetoLatest(admissionCtx, account)
 		if vetoed {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			h.gatewayService.ReleaseAccountSession(cleanupCtx, account, selectionSessionHash)
+			cancel()
+			delete(sessionAccounts, account.ID)
 			if accountReleaseFunc != nil {
 				accountReleaseFunc()
 			}
@@ -324,6 +338,10 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		}
 
 		if err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			h.gatewayService.ReleaseAccountSession(cleanupCtx, account, selectionSessionHash)
+			cancel()
+			delete(sessionAccounts, account.ID)
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
 				if c.Writer.Size() != writerSizeBeforeForward {
@@ -356,6 +374,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 			return
 		}
 
+		delete(sessionAccounts, account.ID) // success retains idle-session membership
 		h.gatewayService.RecordMirasimModelRecovery(c.Request.Context(), account, reqModel)
 		// 6. Record usage
 		userAgent := c.GetHeader("User-Agent")

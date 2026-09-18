@@ -2511,6 +2511,8 @@
         <p class="input-hint">{{ t('admin.accounts.autoResetCredit.thresholdHint') }}</p>
       </div>
 
+      <MirasimPoolControls v-if="isMirasimAccount" v-model="mirasimPoolControls" />
+
       <!-- 配额控制 (Anthropic OAuth/SetupToken: 亲和 + 窗口费用 + 会话 + RPM 等) -->
       <div
         v-if="account?.platform === 'anthropic' && (account?.type === 'oauth' || account?.type === 'setup-token')"
@@ -3050,6 +3052,8 @@ import ProxyAdBanner from '@/components/common/ProxyAdBanner.vue'
 import GroupSelector from '@/components/common/GroupSelector.vue'
 import ModelWhitelistSelector from '@/components/account/ModelWhitelistSelector.vue'
 import QuotaLimitCard from '@/components/account/QuotaLimitCard.vue'
+import MirasimPoolControls from './MirasimPoolControls.vue'
+import { isMirasimPoolAccount, readMirasimPoolControls, writeMirasimPoolControls } from './mirasimPoolControls'
 import GrokBaseUrlPresets from '@/components/account/GrokBaseUrlPresets.vue'
 import CnBaseUrlPresets from '@/components/account/CnBaseUrlPresets.vue'
 import OpenCodeGoProtocolRulesEditor from '@/components/account/OpenCodeGoProtocolRulesEditor.vue'
@@ -3121,6 +3125,12 @@ interface Props {
 }
 
 const props = defineProps<Props>()
+const isMirasimAccount = computed(() => isMirasimPoolAccount(props.account))
+const mirasimPoolControls = ref(readMirasimPoolControls(undefined))
+watch(() => props.account, account => {
+  mirasimPoolControls.value = readMirasimPoolControls(account?.extra)
+}, { immediate: true })
+
 const emit = defineEmits<{
   close: []
   updated: [account: Account]
@@ -5372,6 +5382,11 @@ const handleSubmit = async () => {
         delete newExtra.allow_overages
       }
       updatePayload.extra = newExtra
+    }
+
+    if (isMirasimAccount.value) {
+      const current = (updatePayload.extra as Record<string, unknown>) || (props.account.extra as Record<string, unknown>) || {}
+      updatePayload.extra = writeMirasimPoolControls(current, mirasimPoolControls.value)
     }
 
     // For Anthropic OAuth/SetupToken accounts, handle quota control settings in extra

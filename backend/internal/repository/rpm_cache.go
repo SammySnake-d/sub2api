@@ -139,3 +139,24 @@ func (c *RPMCacheImpl) GetRPMBatch(ctx context.Context, accountIDs []int64) (map
 	}
 	return result, nil
 }
+
+// Atomically admit Mira attempts before dispatch. A rejected request does not
+// increment the budget, and a failed admitted upstream attempt is not refunded.
+// The existing minute key lets scheduler prefetch and admin runtime read it.
+var acquireRPMAttempt = redis.NewScript(`
+local count=tonumber(redis.call('GET',KEYS[1]) or '0')
+if count>=tonumber(ARGV[1]) then return 0 end
+redis.call('INCR',KEYS[1]); redis.call('EXPIRE',KEYS[1],ARGV[2]); return 1
+`)
+
+func (c *RPMCacheImpl) TryAcquireRPM(ctx context.Context, accountID int64, limit int) (bool, error) {
+	if limit <= 0 {
+		return true, nil
+	}
+	key, err := c.currentMinuteKey(ctx, accountID)
+	if err != nil {
+		return false, err
+	}
+	n, err := acquireRPMAttempt.Run(ctx, c.rdb, []string{key}, limit, int(rpmKeyTTL/time.Second)).Int()
+	return n == 1, err
+}

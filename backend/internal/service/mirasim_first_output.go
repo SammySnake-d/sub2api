@@ -47,6 +47,9 @@ func anthropicMeaningfulOutput(data string) bool {
 // splice two responses. Once meaningful output is ready, the ordinary stream
 // lifecycle takes over; this deadline never truncates accepted output.
 func (s *GatewayService) doMirasimAwareUpstream(ctx context.Context, c *gin.Context, account *Account, req *http.Request, proxy, model string, stream bool) (*http.Response, error) {
+	if err := s.admitMirasimAttempt(ctx, account); err != nil {
+		return nil, err
+	}
 	seconds := 0
 	if s.cfg != nil {
 		seconds = s.cfg.Gateway.MirasimFirstOutputTimeoutSeconds

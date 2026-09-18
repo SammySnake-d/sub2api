@@ -1266,7 +1266,7 @@ func (s *GatewayService) withWindowCostPrefetch(ctx context.Context, accounts []
 	accountIDs := make([]int64, 0, len(accounts))
 	for i := range accounts {
 		account := &accounts[i]
-		if account == nil || !account.IsAnthropicOAuthOrSetupToken() {
+		if account == nil || !account.SupportsAnthropicPoolControls() {
 			continue
 		}
 		if account.GetWindowCostLimit() <= 0 {
@@ -1370,11 +1370,11 @@ func (s *GatewayService) isAccountSchedulableForQuota(account *Account) bool {
 }
 
 // isAccountSchedulableForWindowCost 检查账号是否可根据窗口费用进行调度
-// 仅适用于 Anthropic OAuth/SetupToken 账号
+// 适用于 Anthropic OAuth/SetupToken 与 Mirasim APIKey 账号
 // 返回 true 表示可调度，false 表示不可调度
 func (s *GatewayService) isAccountSchedulableForWindowCost(ctx context.Context, account *Account, isSticky bool) bool {
-	// 只检查 Anthropic OAuth/SetupToken 账号
-	if !account.IsAnthropicOAuthOrSetupToken() {
+	// Credential identity remains separate from pool-admission capability.
+	if !account.SupportsAnthropicPoolControls() {
 		return true
 	}
 
@@ -1401,10 +1401,13 @@ func (s *GatewayService) isAccountSchedulableForWindowCost(ctx context.Context, 
 		// 使用统一的窗口开始时间计算逻辑（考虑窗口过期情况）
 		startTime := account.GetCurrentWindowStartTime()
 
+		if s.usageLogRepo == nil {
+			return !IsMirasimAccount(account)
+		}
 		stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, account.ID, startTime)
-		if err != nil {
-			// 失败开放：查询失败时允许调度
-			return true
+		if err != nil || stats == nil {
+			// Preserve legacy OAuth behavior; enabled Mira guards fail closed.
+			return !IsMirasimAccount(account)
 		}
 
 		// 使用标准费用（不含账号倍率）
@@ -1451,7 +1454,7 @@ func (s *GatewayService) withRPMPrefetch(ctx context.Context, accounts []Account
 
 	var ids []int64
 	for i := range accounts {
-		if accounts[i].IsAnthropicOAuthOrSetupToken() && accounts[i].GetBaseRPM() > 0 {
+		if accounts[i].SupportsAnthropicPoolControls() && accounts[i].GetBaseRPM() > 0 {
 			ids = append(ids, accounts[i].ID)
 		}
 	}
@@ -1467,9 +1470,9 @@ func (s *GatewayService) withRPMPrefetch(ctx context.Context, accounts []Account
 }
 
 // isAccountSchedulableForRPM 检查账号是否可根据 RPM 进行调度
-// 仅适用于 Anthropic OAuth/SetupToken 账号
+// 适用于 Anthropic OAuth/SetupToken 与 Mirasim APIKey 账号
 func (s *GatewayService) isAccountSchedulableForRPM(ctx context.Context, account *Account, isSticky bool) bool {
-	if !account.IsAnthropicOAuthOrSetupToken() {
+	if !account.SupportsAnthropicPoolControls() {
 		return true
 	}
 	baseRPM := account.GetBaseRPM()
@@ -1513,30 +1516,30 @@ func (s *GatewayService) IncrementAccountRPM(ctx context.Context, accountID int6
 }
 
 // checkAndRegisterSession 检查并注册会话，用于会话数量限制
-// 仅适用于 Anthropic OAuth/SetupToken 账号
+// 适用于 Anthropic OAuth/SetupToken 与 Mirasim APIKey 账号
 // sessionID: 会话标识符（使用粘性会话的 hash）
 // 返回 true 表示允许（在限制内或会话已存在），false 表示拒绝（超出限制且是新会话）
 func (s *GatewayService) checkAndRegisterSession(ctx context.Context, account *Account, sessionID string) bool {
-	// 只检查 Anthropic OAuth/SetupToken 账号
-	if !account.IsAnthropicOAuthOrSetupToken() {
+	// Credential identity remains separate from pool-admission capability.
+	if !account.SupportsAnthropicPoolControls() {
 		return true
 	}
 
 	maxSessions := account.GetMaxSessions()
-	if maxSessions <= 0 || sessionID == "" {
+	if maxSessions <= 0 {
 		return true // 未启用会话限制或无会话ID
 	}
 
-	if s.sessionLimitCache == nil {
-		return true // 缓存不可用时允许通过
+	if sessionID == "" || s.sessionLimitCache == nil {
+		return !IsMirasimAccount(account) // 缓存不可用时允许通过
 	}
 
 	idleTimeout := time.Duration(account.GetSessionIdleTimeoutMinutes()) * time.Minute
 
 	allowed, err := s.sessionLimitCache.RegisterSession(ctx, account.ID, sessionID, maxSessions, idleTimeout)
 	if err != nil {
-		// 失败开放：缓存错误时允许通过
-		return true
+		// Preserve OAuth behavior; an enabled Mira limit cannot disappear.
+		return !IsMirasimAccount(account)
 	}
 	return allowed
 }
@@ -1550,7 +1553,7 @@ func (s *GatewayService) ReleaseAccountSession(ctx context.Context, account *Acc
 	if s == nil || s.sessionLimitCache == nil || account == nil || sessionID == "" {
 		return
 	}
-	if !account.IsAnthropicOAuthOrSetupToken() {
+	if !account.SupportsAnthropicPoolControls() {
 		return
 	}
 	if account.GetMaxSessions() <= 0 {
