@@ -91,6 +91,7 @@ func (s *GatewayService) ForwardAsChatCompletions(
 		return nil, fmt.Errorf("marshal anthropic request: %w", err)
 	}
 
+	RecordRequestLimitTrace(ctx, "forward", anthropicBody, account.ID)
 	anthropicBody, err = s.normalizeMirasimSingleToken(ctx, account, anthropicBody)
 	if err != nil {
 		return nil, err

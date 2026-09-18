@@ -60,6 +60,10 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		return
 	}
 
+	if h.cfg != nil && h.cfg.Gateway.MirasimRequestLimitTraceEnabled {
+		c.Request = c.Request.WithContext(service.BeginRequestLimitTrace(c.Request.Context(), body, apiKey.ID))
+	}
+
 	setOpsRequestContext(c, "", false)
 
 	// Validate JSON

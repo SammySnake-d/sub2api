@@ -23,3 +23,9 @@ Observability:
 - Canceled Anthropic requests retain cancellation classification instead of a generic upstream 502.
 
 Verification includes Redis concurrent claims/owner renewal/expiry, quota/model exclusions, hour-long cooldown recovery, first-output pings/header stalls, cancellation, and no truncation of accepted streams. Three protocol entrypoints are tested for account failover, exactly one usage record, cooldown recovery, and end-to-end duration. These simulated results do not prove live upstream capacity; release acceptance must include a real completion event.
+
+## Output-budget origin diagnostics
+
+`gateway.mirasim_request_limit_trace_enabled` defaults to false. Enabling it at startup records `gateway.request_limit_trace` with stages `ingress`, `forward`, and `egress` (final signed body before transport send). Each record carries the same gateway request correlation IDs, numeric API key/account IDs, the immutable ingress budget snapshot and the current one. Only numeric/type information for `max_tokens`, `max_output_tokens`, `max_completion_tokens`, and `stream` is retained; prompts, raw bodies, secrets and arbitrary string field values are never retained. These diagnostic events stay in normal rotating logs, not the Ops database log index.
+
+Trace collection does not change output budgets. Existing compatibility rewriting has its own event. Disabled instrumentation produces no trace events. Enable only while diagnosing and disable again after collecting the relevant request. A final outgoing body record proves the sender's payload, not successful upstream receipt. An unrelated synthetic verification request must not be used as evidence for an external evaluator's original request.

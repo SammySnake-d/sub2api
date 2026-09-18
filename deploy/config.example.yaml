@@ -229,6 +229,8 @@ gateway:
   # 显式兼容 max_tokens=1 的调用方：只将1改成上游最小2，最多多生成1 token。
   # 真实请求/实际用量照常计费，不伪造成功。默认关闭。
   mirasim_single_token_compatibility: false
+  # 临时定位参数来源：仅记输出预算类型/数值及stream，不记正文/密钥。重启生效。
+  mirasim_request_limit_trace_enabled: false
   mirasim_cooldown_base_seconds: 30
   mirasim_cooldown_decay_seconds: 1800
   # OpenAI/Codex upstream response header timeout (seconds, 0=disabled)

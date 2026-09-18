@@ -1156,6 +1156,7 @@ type GatewayConfig struct {
 	MirasimBackoffMaxMS                 int     `mapstructure:"mirasim_backoff_max_ms"`
 	MirasimBackoffJitter                float64 `mapstructure:"mirasim_backoff_jitter"`
 	MirasimCooldownBaseSeconds          int     `mapstructure:"mirasim_cooldown_base_seconds"`
+	MirasimRequestLimitTraceEnabled     bool    `mapstructure:"mirasim_request_limit_trace_enabled"`
 	MirasimSingleTokenCompatibility     bool    `mapstructure:"mirasim_single_token_compatibility"`
 	MirasimFirstOutputTimeoutSeconds    int     `mapstructure:"mirasim_first_output_timeout_seconds"`
 	MirasimRecoveryProbeIntervalSeconds int     `mapstructure:"mirasim_recovery_probe_interval_seconds"`
@@ -2492,6 +2493,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.mirasim_recovery_probe_interval_seconds", 5)
 	viper.SetDefault("gateway.mirasim_first_output_timeout_seconds", 60)
 	viper.SetDefault("gateway.mirasim_single_token_compatibility", false)
+	viper.SetDefault("gateway.mirasim_request_limit_trace_enabled", false)
 	viper.SetDefault("gateway.max_account_switches_gemini", 3)
 	viper.SetDefault("gateway.force_codex_cli", false)
 	viper.SetDefault("gateway.disable_codex_identity_enforcement", false)

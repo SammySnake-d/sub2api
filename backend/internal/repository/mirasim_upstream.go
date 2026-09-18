@@ -226,6 +226,7 @@ func (m *mirasimUpstream) sign(req *http.Request, proxyURL string, accountID int
 	if err := mirasim.SignAndSeal(req.Header, prepared.Signer, req.Method, signaturePath, body, prepared.Credential); err != nil {
 		return false, err
 	}
+	service.RecordRequestLimitTrace(req.Context(), "egress", body, accountID)
 	return true, nil
 }
 
