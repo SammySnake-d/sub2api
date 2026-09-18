@@ -641,10 +641,17 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 	}()
 
 	for {
-		fs := NewFailoverState(h.maxAccountSwitches, hasBoundSession)
+		fs := h.newGatewayFailoverState(hasBoundSession)
 		retryWithFallback := false
 
 		for {
+			if failoverClientGone(c) {
+				return
+			}
+			if fs.RecoveryExpired() {
+				h.handleFailoverExhausted(c, fs.LastFailoverErr, platform, streamStarted)
+				return
+			}
 			attemptParsedReq, err := parsedReq.CloneForBody(body)
 			if err != nil {
 				h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
@@ -660,7 +667,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			)
 			selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), currentAPIKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, parsedReq.MetadataUserID, subject.UserID)
 			if err != nil {
-				if len(fs.FailedAccountIDs) == 0 {
+				if len(fs.FailedAccountIDs) == 0 && !fs.Recovering() {
 					cls := classifyNoAccountErrorFromGin(c, h.gatewayService, currentAPIKey, reqModel, reqModel, platform)
 					if !cls.ModelNotFound {
 						markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
@@ -864,6 +871,17 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			attemptParsedReq.OnUpstreamAccepted = queueRelease
 			// ===== 用户消息串行队列 END =====
 
+			if fs.RecoveryExpired() {
+				if queueRelease != nil {
+					queueRelease()
+				}
+				if accountReleaseFunc != nil {
+					accountReleaseFunc()
+				}
+				h.handleFailoverExhausted(c, fs.LastFailoverErr, platform, streamStarted)
+				return
+			}
+
 			// 渠道模型映射只作用于本次账号尝试，避免 failover 后污染原始 ParsedRequest。
 			if channelMapping.Mapped {
 				attemptParsedReq.Model = channelMapping.MappedModel
@@ -1053,7 +1071,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, account.Platform, true)
 						return
 					}
-					action := fs.HandleFailoverError(c.Request.Context(), h.gatewayService, account.ID, account.Platform, account.GetPoolModeRetryCount(), failoverErr)
+					action := fs.HandleAccountFailover(c.Request.Context(), h.gatewayService, account, failoverErr)
 					switch action {
 					case FailoverContinue:
 						// 本次尝试已确定性失败，立即释放该账号的会话注册

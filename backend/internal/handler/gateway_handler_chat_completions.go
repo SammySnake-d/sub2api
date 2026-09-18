@@ -162,7 +162,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		selectionSessionHash = "gemini:" + selectionSessionHash
 	}
 	// 3. Account selection + failover loop
-	fs := NewFailoverState(h.maxAccountSwitches, false)
+	fs := h.newGatewayFailoverState(false)
 	if groupPlatform == service.PlatformGemini {
 		fs = NewFailoverState(h.maxAccountSwitchesGemini, false)
 	}
@@ -171,9 +171,13 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		if c.Request.Context().Err() != nil {
 			return
 		}
+		if fs.RecoveryExpired() {
+			h.handleCCFailoverExhausted(c, fs.LastFailoverErr, streamStarted)
+			return
+		}
 		selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, selectionSessionHash, reqModel, fs.FailedAccountIDs, "", int64(0))
 		if err != nil {
-			if len(fs.FailedAccountIDs) == 0 {
+			if len(fs.FailedAccountIDs) == 0 && !fs.Recovering() {
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, groupPlatform)
 				cls = classifySelectionFailureError(err, cls)
 				if !cls.ModelNotFound {
@@ -259,6 +263,14 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 			continue
 		}
 
+		if fs.RecoveryExpired() {
+			if accountReleaseFunc != nil {
+				accountReleaseFunc()
+			}
+			h.handleCCFailoverExhausted(c, fs.LastFailoverErr, streamStarted)
+			return
+		}
+
 		// 5. Forward request
 		writerSizeBeforeForward := c.Writer.Size()
 		forwardBody := body
@@ -301,7 +313,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 					h.handleCCFailoverExhausted(c, failoverErr, true)
 					return
 				}
-				action := fs.HandleFailoverError(c.Request.Context(), h.gatewayService, account.ID, account.Platform, account.GetPoolModeRetryCount(), failoverErr)
+				action := fs.HandleAccountFailover(c.Request.Context(), h.gatewayService, account, failoverErr)
 				switch action {
 				case FailoverContinue:
 					continue

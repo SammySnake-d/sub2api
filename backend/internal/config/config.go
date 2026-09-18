@@ -1151,7 +1151,10 @@ type GatewayConfig struct {
 	// 是否允许对部分 400 错误触发 failover（默认关闭以避免改变语义）
 	FailoverOn400 bool `mapstructure:"failover_on_400"`
 
-	// 账户切换最大次数（遇到上游错误时切换到其他账户的次数上限）
+	// Mirasim 临时故障恢复窗口（秒）。0 关闭池遍历恢复，回到次数预算。
+	// 窗口限制新尝试的发起，不会中断已成功开始的响应。
+	MirasimFailoverWindowSeconds int `mapstructure:"mirasim_failover_window_seconds"`
+	// 账户切换最大次数（Mirasim 临时故障在恢复窗口内使用池遍历预算）
 	MaxAccountSwitches int `mapstructure:"max_account_switches"`
 	// Gemini 账户切换最大次数（Gemini 平台单独配置，因 API 限制更严格）
 	MaxAccountSwitchesGemini int `mapstructure:"max_account_switches_gemini"`
@@ -2470,6 +2473,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.inject_beta_for_apikey", false)
 	viper.SetDefault("gateway.failover_on_400", false)
 	viper.SetDefault("gateway.max_account_switches", 10)
+	viper.SetDefault("gateway.mirasim_failover_window_seconds", DefaultMirasimFailoverWindowSeconds)
 	viper.SetDefault("gateway.max_account_switches_gemini", 3)
 	viper.SetDefault("gateway.force_codex_cli", false)
 	viper.SetDefault("gateway.disable_codex_identity_enforcement", false)
@@ -3394,6 +3398,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Gateway.ResponseHeaderTimeout < 0 {
 		return fmt.Errorf("gateway.response_header_timeout must be non-negative")
+	}
+	if c.Gateway.MirasimFailoverWindowSeconds < 0 || c.Gateway.MirasimFailoverWindowSeconds > 600 {
+		return fmt.Errorf("gateway.mirasim_failover_window_seconds must be between 0-600 seconds")
 	}
 	if c.Gateway.OpenAIResponseHeaderTimeout < 0 {
 		return fmt.Errorf("gateway.openai_response_header_timeout must be non-negative")

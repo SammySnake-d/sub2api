@@ -167,15 +167,19 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 	sessionHash := h.gatewayService.GenerateSessionHash(parsedReq)
 
 	// 3. Account selection + failover loop
-	fs := NewFailoverState(h.maxAccountSwitches, false)
+	fs := h.newGatewayFailoverState(false)
 
 	for {
 		if requestCtx.Err() != nil {
 			return
 		}
+		if fs.RecoveryExpired() {
+			h.handleResponsesFailoverExhausted(c, fs.LastFailoverErr, streamStarted)
+			return
+		}
 		selection, err := h.gatewayService.SelectAccountWithLoadAwareness(requestCtx, apiKey.GroupID, sessionHash, reqModel, fs.FailedAccountIDs, "", int64(0))
 		if err != nil {
-			if len(fs.FailedAccountIDs) == 0 {
+			if len(fs.FailedAccountIDs) == 0 && !fs.Recovering() {
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, effectiveAPIKeyPlatform(c, apiKey))
 				cls = classifySelectionFailureError(err, cls)
 				if !cls.ModelNotFound {
@@ -255,6 +259,14 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		}
 		accountReleaseFunc = wrapReleaseOnDone(c.Request.Context(), accountReleaseFunc)
 
+		if fs.RecoveryExpired() {
+			if accountReleaseFunc != nil {
+				accountReleaseFunc()
+			}
+			h.handleResponsesFailoverExhausted(c, fs.LastFailoverErr, streamStarted)
+			return
+		}
+
 		// 5. Forward request
 		writerSizeBeforeForward := c.Writer.Size()
 		forwardBody := body
@@ -289,7 +301,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 					h.handleResponsesFailoverExhausted(c, failoverErr, true)
 					return
 				}
-				action := fs.HandleFailoverError(requestCtx, h.gatewayService, account.ID, account.Platform, account.GetPoolModeRetryCount(), failoverErr)
+				action := fs.HandleAccountFailover(requestCtx, h.gatewayService, account, failoverErr)
 				switch action {
 				case FailoverContinue:
 					continue

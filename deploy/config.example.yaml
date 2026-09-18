@@ -212,6 +212,10 @@ gateway:
   # Timeout for waiting upstream response headers (seconds)
   # 等待上游响应头超时时间（秒）
   response_header_timeout: 600
+  # Mirasim 502/503/504/529: immediately try untried eligible accounts, then
+  # retry exhausted pools with jitter until this window closes (0 disables).
+  # 仅限制新重试的发起；已经开始的成功响应继续正常传输。
+  mirasim_failover_window_seconds: 90
   # OpenAI/Codex upstream response header timeout (seconds, 0=disabled)
   # OpenAI/Codex 等待上游响应头超时时间（秒，0=禁用本地响应头超时）
   openai_response_header_timeout: 0

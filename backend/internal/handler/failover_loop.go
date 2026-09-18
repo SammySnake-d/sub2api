@@ -130,6 +130,10 @@ type FailoverState struct {
 	LastFailoverErr       *service.UpstreamFailoverError
 	ForceCacheBilling     bool
 	hasBoundSession       bool
+	recoveryWindow        time.Duration
+	recoveryDeadline      time.Time
+	recoveryAccountIDs    map[int64]struct{}
+	recoveryRound         int
 
 	// profitVetoedAccountIDs 记录被分组利润门终检否决的账号，是 FailedAccountIDs
 	// 的子集。之所以单独维护：HandleSelectionExhausted 的 503 退避分支会清空
@@ -289,6 +293,9 @@ func (s *FailoverState) HandleSelectionExhausted(ctx context.Context) FailoverAc
 	// 不代表账号耗尽，直接按取消终止。
 	if ctx.Err() != nil {
 		return FailoverCanceled
+	}
+	if s.Recovering() {
+		return s.retryMirasimPool(ctx)
 	}
 
 	if s.LastFailoverErr != nil &&

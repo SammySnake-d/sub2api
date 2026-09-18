@@ -207,7 +207,7 @@ export default {
         pricingEntry: 'Pricing Entry',
         noModels: 'No models added',
         applyPricingToAccountStats: 'Apply Pricing to Account Stats',
-        applyPricingToAccountStatsDesc: 'When enabled, requests not matched by custom rules will use standard model pricing for account stats calculation',
+        applyPricingToAccountStatsDesc: 'When enabled, account stats use this request’s cost before the user multiplier, then apply the account multiplier. When disabled, they use separate model pricing. Custom account rules take precedence.',
         accountStatsPricingRules: 'Custom Account Stats Pricing Rules',
         addRule: 'Add Rule',
         noRulesConfigured: 'No custom rules configured. Channel model pricing above will be used.',
