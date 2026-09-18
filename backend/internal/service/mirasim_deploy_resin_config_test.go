@@ -290,7 +290,7 @@ func TestResinSecretScannerActuallyCatchesSecrets(t *testing.T) {
 		"环境文件形态":  `RESIN_ADMIN_TOKEN=Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5`,
 		"请求头形态":   `Authorization: Bearer Zm9vYmFyYmF6cXV4MTIzNDU2`,
 		"64位十六进制": `"secret": "5f4c48ffc3e93347631c03bc21ec41c1890595529a98f99ac2989ef0275d8d2a"`,
-		"API key": `key=sk-0b6860ff99569c54b1d7e0b39a92201633991cf8a4e14bb71ebce962bf30f70f`,
+		"API key": `key=sk-0000000000000000000000000000000000000000000000000000000000000000`,
 	}
 	for name, sample := range positives {
 		require.NotEmpty(t, resinScanForCredentialValues(sample),
