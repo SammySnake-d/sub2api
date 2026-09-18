@@ -1151,7 +1151,13 @@ type GatewayConfig struct {
 	// 是否允许对部分 400 错误触发 failover（默认关闭以避免改变语义）
 	FailoverOn400 bool `mapstructure:"failover_on_400"`
 
-	// Mirasim 临时故障恢复窗口（秒）。0 关闭池遍历恢复，回到次数预算。
+	MirasimFailoverEnabled      bool    `mapstructure:"mirasim_failover_enabled"`
+	MirasimBackoffInitialMS     int     `mapstructure:"mirasim_backoff_initial_ms"`
+	MirasimBackoffMaxMS         int     `mapstructure:"mirasim_backoff_max_ms"`
+	MirasimBackoffJitter        float64 `mapstructure:"mirasim_backoff_jitter"`
+	MirasimCooldownBaseSeconds  int     `mapstructure:"mirasim_cooldown_base_seconds"`
+	MirasimCooldownDecaySeconds int     `mapstructure:"mirasim_cooldown_decay_seconds"`
+	// Mirasim 临时故障恢复窗口（秒）。0 等到成功或客户端取消。
 	// 窗口限制新尝试的发起，不会中断已成功开始的响应。
 	MirasimFailoverWindowSeconds int `mapstructure:"mirasim_failover_window_seconds"`
 	// 账户切换最大次数（Mirasim 临时故障在恢复窗口内使用池遍历预算）
@@ -2474,6 +2480,12 @@ func setDefaults() {
 	viper.SetDefault("gateway.failover_on_400", false)
 	viper.SetDefault("gateway.max_account_switches", 10)
 	viper.SetDefault("gateway.mirasim_failover_window_seconds", DefaultMirasimFailoverWindowSeconds)
+	viper.SetDefault("gateway.mirasim_failover_enabled", true)
+	viper.SetDefault("gateway.mirasim_backoff_initial_ms", 1000)
+	viper.SetDefault("gateway.mirasim_backoff_max_ms", 8000)
+	viper.SetDefault("gateway.mirasim_backoff_jitter", 0.5)
+	viper.SetDefault("gateway.mirasim_cooldown_base_seconds", 30)
+	viper.SetDefault("gateway.mirasim_cooldown_decay_seconds", 1800)
 	viper.SetDefault("gateway.max_account_switches_gemini", 3)
 	viper.SetDefault("gateway.force_codex_cli", false)
 	viper.SetDefault("gateway.disable_codex_identity_enforcement", false)
@@ -3401,6 +3413,15 @@ func (c *Config) Validate() error {
 	}
 	if c.Gateway.MirasimFailoverWindowSeconds < 0 || c.Gateway.MirasimFailoverWindowSeconds > 600 {
 		return fmt.Errorf("gateway.mirasim_failover_window_seconds must be between 0-600 seconds")
+	}
+	if c.Gateway.MirasimFailoverEnabled && (c.Gateway.MirasimBackoffInitialMS < 100 || c.Gateway.MirasimBackoffMaxMS < c.Gateway.MirasimBackoffInitialMS || c.Gateway.MirasimBackoffMaxMS > 60000) {
+		return fmt.Errorf("gateway.mirasim_backoff_initial_ms/max_ms must satisfy 100 <= initial <= max <= 60000")
+	}
+	if math.IsNaN(c.Gateway.MirasimBackoffJitter) || c.Gateway.MirasimBackoffJitter < 0 || c.Gateway.MirasimBackoffJitter > 0.9 {
+		return fmt.Errorf("gateway.mirasim_backoff_jitter must be between 0-0.9")
+	}
+	if c.Gateway.MirasimCooldownBaseSeconds < 1 || c.Gateway.MirasimCooldownBaseSeconds > 3600 || c.Gateway.MirasimCooldownDecaySeconds < 1 || c.Gateway.MirasimCooldownDecaySeconds > 86400 {
+		return fmt.Errorf("gateway.mirasim_cooldown_base_seconds must be 1-3600 and decay_seconds 1-86400")
 	}
 	if c.Gateway.OpenAIResponseHeaderTimeout < 0 {
 		return fmt.Errorf("gateway.openai_response_header_timeout must be non-negative")

@@ -3,12 +3,14 @@ package handler
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
 
@@ -93,9 +95,59 @@ func TestMirasimRecovery_OptInAndClassification(t *testing.T) {
 		{"disabled", 0, FailoverExhausted}, {"enabled", 20, FailoverContinue},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := &GatewayHandler{cfg: &config.Config{Gateway: config.GatewayConfig{MirasimFailoverWindowSeconds: tc.seconds}}}
+			policy := config.DefaultMirasimRecoveryConfig()
+			policy.MirasimFailoverEnabled = tc.seconds > 0
+			policy.MirasimFailoverWindowSeconds = tc.seconds
+			h := &GatewayHandler{cfg: &config.Config{Gateway: policy}}
 			fs := h.newGatewayFailoverState(false)
 			require.Equal(t, tc.want, fs.HandleAccountFailover(context.Background(), &mockTempUnscheduler{}, recoveryAccount(1), &service.UpstreamFailoverError{StatusCode: http.StatusServiceUnavailable}))
 		})
 	}
+}
+
+func TestMirasimRecovery_UnlimitedWindowAndConfiguredBackoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		policy := config.DefaultMirasimRecoveryConfig()
+		policy.MirasimBackoffInitialMS = 2000
+		policy.MirasimBackoffMaxMS = 4000
+		policy.MirasimBackoffJitter = 0
+		fs := (&GatewayHandler{cfg: &config.Config{Gateway: policy}}).newGatewayFailoverState(false)
+		ctx := context.Background()
+		require.Equal(t, FailoverContinue, fs.HandleAccountFailover(ctx, &mockTempUnscheduler{}, recoveryAccount(1), &service.UpstreamFailoverError{StatusCode: 503}))
+		start := time.Now()
+		for i := 0; i < 40; i++ {
+			require.Equal(t, FailoverContinue, fs.HandleSelectionExhausted(ctx))
+		}
+		require.Equal(t, 158*time.Second, time.Since(start))
+		require.False(t, fs.RecoveryExpired(), "zero window must not recreate the old 90-second cutoff")
+	})
+}
+
+func TestMirasimRecovery_InitialCooldownWaitsWithoutRequests(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fs := (&GatewayHandler{}).newGatewayFailoverState(false)
+		reset := time.Now().Add(30 * time.Second)
+		start := time.Now()
+		for time.Now().Before(reset) {
+			action, handled := fs.HandleCooldownSelection(context.Background(), &service.MirasimCooldownError{RetryAt: reset})
+			require.True(t, handled)
+			require.Equal(t, FailoverContinue, action)
+		}
+		require.Equal(t, 30*time.Second, time.Since(start))
+		require.Zero(t, fs.SwitchCount, "waiting must not send requests to cooled accounts")
+	})
+}
+
+func TestMirasimRecovery_StreamWaitSendsOnlyComments(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest("POST", "/v1/messages", nil)
+		fs := (&GatewayHandler{}).newGatewayFailoverState(false)
+		started := false
+		fs.keepRecoveryStreamAlive(c, true, &started)
+		require.True(t, fs.recoveryWait(context.Background(), 21*time.Second))
+		require.True(t, started)
+		require.Equal(t, "text/event-stream", c.Writer.Header().Get("Content-Type"))
+		require.Greater(t, c.Writer.Size(), 0)
+	})
 }

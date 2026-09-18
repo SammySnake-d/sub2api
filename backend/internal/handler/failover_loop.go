@@ -123,17 +123,23 @@ func effectiveSameAccountRetryLimit(failoverErr *service.UpstreamFailoverError, 
 
 // FailoverState 跨循环迭代共享的 failover 状态
 type FailoverState struct {
-	SwitchCount           int
-	MaxSwitches           int
-	FailedAccountIDs      map[int64]struct{}
-	SameAccountRetryCount map[int64]int
-	LastFailoverErr       *service.UpstreamFailoverError
-	ForceCacheBilling     bool
-	hasBoundSession       bool
-	recoveryWindow        time.Duration
-	recoveryDeadline      time.Time
-	recoveryAccountIDs    map[int64]struct{}
-	recoveryRound         int
+	SwitchCount            int
+	MaxSwitches            int
+	FailedAccountIDs       map[int64]struct{}
+	SameAccountRetryCount  map[int64]int
+	LastFailoverErr        *service.UpstreamFailoverError
+	ForceCacheBilling      bool
+	hasBoundSession        bool
+	recoveryWindow         time.Duration
+	recoveryEnabled        bool
+	recoveryStarted        bool
+	recoveryBackoffInitial time.Duration
+	recoveryBackoffMax     time.Duration
+	recoveryJitter         float64
+	recoveryWait           func(context.Context, time.Duration) bool
+	recoveryDeadline       time.Time
+	recoveryAccountIDs     map[int64]struct{}
+	recoveryRound          int
 
 	// profitVetoedAccountIDs 记录被分组利润门终检否决的账号，是 FailedAccountIDs
 	// 的子集。之所以单独维护：HandleSelectionExhausted 的 503 退避分支会清空

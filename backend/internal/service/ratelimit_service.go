@@ -335,6 +335,12 @@ func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Acc
 	// 同请求内与 fastpath 调用点的重复触发由方法内去重吸收。
 	s.maybeHandleOpenAITeamLinkedError(ctx, account, statusCode, responseBody)
 	customErrorCodesEnabled := account.IsCustomErrorCodesEnabled()
+	// These are real upstream accounts, even when the credential uses pool_mode.
+	// Persist model-scoped failures before the generic pool-mode early return.
+	if IsMirasimAccount(account) && (statusCode == 502 || statusCode == 503 || statusCode == 504 || statusCode == 529) {
+		s.parkMirasimModelCapacity(ctx, account, statusCode, responseBody)
+		return false
+	}
 
 	// 池模式默认不标记本地账号状态；但管理员显式配置的临时不可调度规则优先。
 	// 401 保留现有认证错误语义，不在这里改变池模式的认证处理。

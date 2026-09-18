@@ -163,6 +163,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 	}
 	// 3. Account selection + failover loop
 	fs := h.newGatewayFailoverState(false)
+	fs.keepRecoveryStreamAlive(c, reqStream, &streamStarted)
 	if groupPlatform == service.PlatformGemini {
 		fs = NewFailoverState(h.maxAccountSwitchesGemini, false)
 	}
@@ -177,6 +178,18 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		}
 		selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), apiKey.GroupID, selectionSessionHash, reqModel, fs.FailedAccountIDs, "", int64(0))
 		if err != nil {
+			if action, waiting := fs.HandleCooldownSelection(c.Request.Context(), err); waiting {
+				switch action {
+				case FailoverContinue:
+					continue
+				case FailoverCanceled:
+					failoverClientGone(c)
+					return
+				default:
+					h.handleCCFailoverExhausted(c, fs.LastFailoverErr, streamStarted)
+					return
+				}
+			}
 			if len(fs.FailedAccountIDs) == 0 && !fs.Recovering() {
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, groupPlatform)
 				cls = classifySelectionFailureError(err, cls)
@@ -339,6 +352,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 			return
 		}
 
+		h.gatewayService.RecordMirasimModelRecovery(c.Request.Context(), account, reqModel)
 		// 6. Record usage
 		userAgent := c.GetHeader("User-Agent")
 		clientIP := ip.GetClientIP(c)

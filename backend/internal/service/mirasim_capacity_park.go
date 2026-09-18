@@ -46,6 +46,7 @@ package service
 
 import (
 	"context"
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -117,12 +118,12 @@ func isMirasimCapacityParkScope(scope string) bool {
 }
 
 // ---------------------------------------------------------------------------
-// 配置：默认 10 分钟，0 = 完全不 park
+// 配置：默认最高 60 分钟，0 = 完全不 park
 // ---------------------------------------------------------------------------
 
 // parseMirasimCapacityParkMinutes 把配置值翻成时长。
 //
-//	""/非法        → 默认 10 分钟（配置读不出来不该静默变成「不停调」）
+//	""/非法        → 默认 60 分钟（配置读不出来不该静默变成「不停调」）
 //	0              → 0，**完全不写任何冷却**，行为与加这个功能之前逐字节一致。
 //	                 这是运维的逃生口：容量紧张形态变了、停调反而伤可用性时，
 //	                 一个配置就能退回原状，不需要发版。
@@ -185,14 +186,9 @@ func (s *RateLimitService) mirasimCapacityParkDuration(ctx context.Context) time
 // 但档位本来就可以从已有的两个时间戳算出来：上一次的时长 = reset_at − limited_at。
 // 倍增它即可，零 schema 改动、零新字段。
 //
-// # 两条归零规则
-//
-//  1. **成功即归零**：LastUsedAt 晚于上一档的到期时刻，说明停调解除后这个号被
-//     成功用过。LastUsedAt 只在计费路径写（gateway_usage_billing.go 的
-//     ScheduleLastUsedUpdate），失败请求不进计费，所以它是干净的成功信号。
-//     它是延迟批量刷的，滞后只会让我们**少**归零一次（保守方向）。
-//  2. **静默即衰减**：上一档到期之后静默超过 mirasimCapacityParkDecayWindow
-//     再吃 503，当成新的偶发，从第一档重来。
+// # 历史重置
+// 同模型成功由 RecordMirasimModelRecovery 按冷却代次条件清除；其他模型成功
+// 不作恢复证据。静默超过配置的衰减窗口也从第一档重新开始。
 //
 // # 为什么平坦时长两头都错（2026-09-18 实测）
 //
@@ -203,7 +199,10 @@ func (s *RateLimitService) mirasimCapacityParkDuration(ctx context.Context) time
 //
 // 返回停调时长与上一档时长（上一档为 0 表示这是第一档），后者只用于日志。
 func nextMirasimCapacityParkDuration(a *Account, scope string, capLimit time.Duration, now time.Time) (time.Duration, time.Duration) {
-	base := mirasimCapacityParkBaseDuration
+	return nextMirasimCapacityParkDurationWithPolicy(a, scope, capLimit, now, mirasimCapacityParkBaseDuration, mirasimCapacityParkDecayWindow)
+}
+
+func nextMirasimCapacityParkDurationWithPolicy(a *Account, scope string, capLimit time.Duration, now time.Time, base, decay time.Duration) (time.Duration, time.Duration) {
 	if capLimit > 0 && base > capLimit {
 		// 运维把上限配得比第一档还短：尊重配置，不要偷偷拉长。
 		base = capLimit
@@ -223,12 +222,10 @@ func nextMirasimCapacityParkDuration(a *Account, scope string, capLimit time.Dur
 		return base, 0
 	}
 
-	// 规则 1：停调解除后被成功用过 → 归零。
-	if a.LastUsedAt != nil && a.LastUsedAt.After(*resetAt) {
-		return base, prev
-	}
+	// LastUsedAt is account-wide: success on Opus says nothing about Fable.
+	// Only the exact model's successful response may clear its failure history.
 	// 规则 2：静默够久 → 衰减归零。上一档还没到期时 now.Sub 为负，判否，继续升档。
-	if now.Sub(*resetAt) > mirasimCapacityParkDecayWindow {
+	if now.Sub(*resetAt) > decay {
 		return base, prev
 	}
 
@@ -286,7 +283,16 @@ func (s *RateLimitService) parkMirasimModelCapacity(ctx context.Context, account
 	now := time.Now()
 	// 阶梯退避：档位从上一次的停调时长推出来，不用计数器。判据见
 	// nextMirasimCapacityParkDuration。
-	ttl, prevTTL := nextMirasimCapacityParkDuration(account, scope, capLimit, now)
+	policy := config.DefaultMirasimRecoveryConfig()
+	if s.cfg != nil {
+		if s.cfg.Gateway.MirasimCooldownBaseSeconds > 0 {
+			policy.MirasimCooldownBaseSeconds = s.cfg.Gateway.MirasimCooldownBaseSeconds
+		}
+		if s.cfg.Gateway.MirasimCooldownDecaySeconds > 0 {
+			policy.MirasimCooldownDecaySeconds = s.cfg.Gateway.MirasimCooldownDecaySeconds
+		}
+	}
+	ttl, prevTTL := nextMirasimCapacityParkDurationWithPolicy(account, scope, capLimit, now, time.Duration(policy.MirasimCooldownBaseSeconds)*time.Second, time.Duration(policy.MirasimCooldownDecaySeconds)*time.Second)
 	resetAt := now.Add(ttl)
 
 	// 已有更长的同 scope 冷却时不缩短。与 shouldPersistAnthropicWindowLimit 同一条
@@ -395,6 +401,13 @@ func mirasimCapacityParkIsSoleBlocker(ctx context.Context, a *Account, requested
 type mirasimCapacityParkObserver struct {
 	blocked atomic.Bool
 }
+
+// MirasimCooldownError means an eligible account exists, but must not receive
+// another upstream request until its persisted model cooldown expires.
+type MirasimCooldownError struct{ RetryAt time.Time }
+
+func (e *MirasimCooldownError) Error() string { return "eligible upstream accounts are cooling down" }
+func (e *MirasimCooldownError) Unwrap() error { return ErrNoAvailableAccounts }
 
 type mirasimCapacityParkObserverKey struct{}
 

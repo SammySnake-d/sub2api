@@ -121,7 +121,9 @@ func TestMirasimRecoveryHandler(t *testing.T) {
 				t.Run(name, func(t *testing.T) {
 					upstream := &mirasimRecoveryUpstream{failedAttempts: scenario.failed}
 					h, key := newMirasimRecoveryHandler(t, scenario.pool, upstream)
-					h.cfg = &config.Config{RunMode: config.RunModeSimple, Gateway: config.GatewayConfig{MirasimFailoverWindowSeconds: scenario.window}}
+					policy := config.DefaultMirasimRecoveryConfig()
+					policy.MirasimFailoverWindowSeconds = scenario.window
+					h.cfg = &config.Config{RunMode: config.RunModeSimple, Gateway: policy}
 					synctest.Test(t, func(t *testing.T) {
 						rec := httptest.NewRecorder()
 						c, _ := gin.CreateTestContext(rec)

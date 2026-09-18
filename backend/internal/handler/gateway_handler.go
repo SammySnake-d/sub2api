@@ -539,6 +539,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 				return
 			}
 
+			h.gatewayService.RecordMirasimModelRecovery(c.Request.Context(), account, reqModel)
 			// RPM 计数递增（Forward 成功后）
 			// 注意：TOCTOU 竞态是已知且可接受的设计权衡，与 WindowCost 一致的 soft-limit 模式。
 			// 在高并发下可能短暂超出 RPM 限制，但不会导致请求失败。
@@ -642,6 +643,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 
 	for {
 		fs := h.newGatewayFailoverState(hasBoundSession)
+		fs.keepRecoveryStreamAlive(c, reqStream, &streamStarted)
 		retryWithFallback := false
 
 		for {
@@ -667,6 +669,18 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			)
 			selection, err := h.gatewayService.SelectAccountWithLoadAwareness(c.Request.Context(), currentAPIKey.GroupID, sessionKey, reqModel, fs.FailedAccountIDs, parsedReq.MetadataUserID, subject.UserID)
 			if err != nil {
+				if action, waiting := fs.HandleCooldownSelection(c.Request.Context(), err); waiting {
+					switch action {
+					case FailoverContinue:
+						continue
+					case FailoverCanceled:
+						failoverClientGone(c)
+						return
+					default:
+						h.handleFailoverExhausted(c, fs.LastFailoverErr, platform, streamStarted)
+						return
+					}
+				}
 				if len(fs.FailedAccountIDs) == 0 && !fs.Recovering() {
 					cls := classifyNoAccountErrorFromGin(c, h.gatewayService, currentAPIKey, reqModel, reqModel, platform)
 					if !cls.ModelNotFound {

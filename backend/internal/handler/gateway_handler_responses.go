@@ -168,6 +168,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 
 	// 3. Account selection + failover loop
 	fs := h.newGatewayFailoverState(false)
+	fs.keepRecoveryStreamAlive(c, reqStream, &streamStarted)
 
 	for {
 		if requestCtx.Err() != nil {
@@ -179,6 +180,18 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		}
 		selection, err := h.gatewayService.SelectAccountWithLoadAwareness(requestCtx, apiKey.GroupID, sessionHash, reqModel, fs.FailedAccountIDs, "", int64(0))
 		if err != nil {
+			if action, waiting := fs.HandleCooldownSelection(requestCtx, err); waiting {
+				switch action {
+				case FailoverContinue:
+					continue
+				case FailoverCanceled:
+					failoverClientGone(c)
+					return
+				default:
+					h.handleResponsesFailoverExhausted(c, fs.LastFailoverErr, streamStarted)
+					return
+				}
+			}
 			if len(fs.FailedAccountIDs) == 0 && !fs.Recovering() {
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, effectiveAPIKeyPlatform(c, apiKey))
 				cls = classifySelectionFailureError(err, cls)
@@ -327,6 +340,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 			return
 		}
 
+		h.gatewayService.RecordMirasimModelRecovery(c.Request.Context(), account, reqModel)
 		// 6. Record usage
 		userAgent := c.GetHeader("User-Agent")
 		clientIP := ip.GetClientIP(c)

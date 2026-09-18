@@ -99,17 +99,8 @@ func (s *GatewayService) SelectAccountForModelWithExclusions(ctx context.Context
 // metadataUserID: 用于客户端亲和调度，从中提取客户端 ID
 // sub2apiUserID: 系统用户 ID，用于二维亲和调度
 //
-// 它在真正的选号外面包了一层 mirasim 503 容量停调的 fail-open：先严格选一轮，
-// 只有在严格轮**确实**返回 ErrNoAvailableAccounts、且本轮至少有一个账号是
-// 「只被容量停调挡住」时，才忽略容量停调重选一轮。
-//
-// 判据放在这里而不是选号内部，是因为「候选到底空不空」是选号全部过滤跑完之后
-// 才知道的事实；任何在过滤之前做的预测都会漏掉后面那几道（渠道限制、模型不支持、
-// 配额、RPM……），说「不用退化」而候选集其实是空的。
-//
-// 重选是安全的：选号过滤是纯读，不改粘性绑定，也不消耗并发槽位——槽位获取发生在
-// 选出账号之后。正常情况下（没有任何账号被容量停调）observer 恒为 false，
-// 第二轮根本不会发生，对非 mirasim 渠道是零行为变化、零额外开销。
+// 先严格过滤冷却账号。若唯一障碍是 Mirasim 模型冷却，再走完整过滤链确认
+// 有合法候选，释放临时槽位并返回等待提示。等待期间绝不绕过冷却请求上游。
 func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, metadataUserID string, sub2apiUserID int64) (*AccountSelectionResult, error) {
 	strictCtx, parkObserver := withMirasimCapacityParkObserver(ctx)
 	result, err := s.selectAccountWithLoadAwarenessOnce(strictCtx, groupID, sessionHash, requestedModel, excludedIDs, metadataUserID, sub2apiUserID)
@@ -117,13 +108,22 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 		return result, err
 	}
 
-	slog.Info("mirasim_capacity_park_fail_open",
-		"model", requestedModel,
-		"group_id", derefGroupID(groupID),
-		"session", shortSessionHash(sessionHash),
-		"detail", "严格轮无可用账号且有号仅被 503 容量停调挡住，忽略停调重选：宁可撞 503，也不返回无可用账号")
-
-	return s.selectAccountWithLoadAwarenessOnce(withMirasimCapacityParkIgnored(ctx), groupID, sessionHash, requestedModel, excludedIDs, metadataUserID, sub2apiUserID)
+	// The second pass proves eligibility through ALL existing guards. Its
+	// candidate is only a wait hint, never permission to bypass the cooldown.
+	result, err = s.selectAccountWithLoadAwarenessOnce(withMirasimCapacityParkIgnored(ctx), groupID, sessionHash, requestedModel, excludedIDs, metadataUserID, sub2apiUserID)
+	if err != nil || result == nil || result.Account == nil {
+		return result, err
+	}
+	scope := mirasimCapacityRateLimitScope(result.Account.GetMappedModel(requestedModel))
+	reset := result.Account.modelRateLimitResetAt(scope)
+	if reset == nil || !reset.After(time.Now()) {
+		return result, nil
+	}
+	if result.ReleaseFunc != nil {
+		result.ReleaseFunc()
+	}
+	s.ReleaseAccountSession(ctx, result.Account, sessionHash)
+	return nil, &MirasimCooldownError{RetryAt: *reset}
 }
 
 func (s *GatewayService) selectAccountWithLoadAwarenessOnce(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, metadataUserID string, sub2apiUserID int64) (*AccountSelectionResult, error) {

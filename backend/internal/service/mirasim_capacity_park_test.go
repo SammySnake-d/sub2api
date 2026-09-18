@@ -20,6 +20,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
 	"time"
@@ -80,7 +81,6 @@ func TestMirasim503ParksTheRequestedModelForTheConfiguredTTL(t *testing.T) {
 	require.Less(t, modelCalls[0].resetAt.Sub(time.Now()), time.Minute,
 		"首次停调绝不能是配置里的封顶值，那是阶梯末档不是首档")
 
-
 	// INV-4：账号级状态一个字段都不许动。
 	require.Empty(t, repo.callsOf("SetRateLimited"),
 		"容量 503 绝不能写账号级限流：额度是好的，写了会让整号对所有模型下线")
@@ -93,6 +93,35 @@ func TestMirasim503ParksTheRequestedModelForTheConfiguredTTL(t *testing.T) {
 	require.Equal(t, before.RateLimitResetAt, after.RateLimitResetAt)
 	require.Equal(t, before.TempUnschedulableUntil, after.TempUnschedulableUntil)
 	require.True(t, account.IsSchedulable(), "账号本身仍然健康可调度")
+}
+
+func TestMirasimPoolModeRemembersTransientFailureAcrossRequests(t *testing.T) {
+	for _, status := range []int{502, 503, 504, 529} {
+		svc, repo, account := mirasimCapacityServiceWithSetting("")
+		account.Credentials["pool_mode"] = true
+		require.False(t, svc.HandleUpstreamError(context.Background(), account, status, http.Header{}, []byte(mirasimCapacity503Body), mirasimCapacityTestModel))
+		require.Len(t, repo.callsOf("SetModelRateLimit"), 1, "pool mode must persist the model cooldown for %d", status)
+		require.False(t, account.IsSchedulableForModelWithContext(context.Background(), mirasimCapacityTestModel))
+		require.True(t, account.IsSchedulableForModelWithContext(context.Background(), mirasimCapacityTestOtherModel))
+	}
+}
+
+func TestMirasimCooldownReloadSkipsFailedAccount(t *testing.T) {
+	limiter, repo, account := mirasimCapacityServiceWithSetting("")
+	limiter.cfg = &config.Config{Gateway: config.GatewayConfig{MirasimCooldownBaseSeconds: 45, MirasimCooldownDecaySeconds: 120}}
+	account.Credentials["pool_mode"] = true
+	limiter.HandleUpstreamError(context.Background(), account, 503, http.Header{}, []byte(mirasimCapacity503Body), mirasimCapacityTestModel)
+	call := repo.callsOf("SetModelRateLimit")[0]
+	require.WithinDuration(t, time.Now().Add(45*time.Second), call.resetAt, time.Second)
+	// Round-trip the persisted JSON; the new scheduler has no in-memory history.
+	raw, err := json.Marshal(account.Extra)
+	require.NoError(t, err)
+	fresh := mirasimCapacityParkedAccount(1, "")
+	require.NoError(t, json.Unmarshal(raw, &fresh.Extra))
+	svc, ctx, gid := mirasimCapacityGatewayFixture(t, []Account{fresh, mirasimCapacityParkedAccount(2, "")})
+	selection, err := svc.SelectAccountWithLoadAwareness(ctx, &gid, "", mirasimCapacityTestModel, nil, "", 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), selection.Account.ID)
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +289,7 @@ func mirasimCapacityGatewayFixture(t *testing.T, accounts []Account) (*GatewaySe
 
 // ★ 最重要的一条：全池 503 停调时，选号必须仍然返回一个账号。
 // 没有这条退化，一次全池级容量紧张会让这个模型从「慢」直接变成「10 分钟完全不可用」。
-func TestSelectAccountFailsOpenWhenWholePoolIsCapacityParked(t *testing.T) {
+func TestSelectAccountWaitsForCooldownWhenWholePoolIsCapacityParked(t *testing.T) {
 	svc, ctx, groupID := mirasimCapacityGatewayFixture(t, []Account{
 		mirasimCapacityParkedAccount(1, mirasimCapacityTestModel),
 		mirasimCapacityParkedAccount(2, mirasimCapacityTestModel),
@@ -274,9 +303,10 @@ func TestSelectAccountFailsOpenWhenWholePoolIsCapacityParked(t *testing.T) {
 
 	result, err := svc.SelectAccountWithLoadAwareness(ctx, &groupID, "", mirasimCapacityTestModel, nil, "", 0)
 
-	require.NoError(t, err, "全池被 503 停调时必须退化放行，宁可撞 503 也不能返回「无可用账号」")
-	require.NotNil(t, result)
-	require.NotNil(t, result.Account)
+	var cooling *MirasimCooldownError
+	require.ErrorAs(t, err, &cooling)
+	require.Nil(t, result)
+	require.True(t, cooling.RetryAt.After(time.Now()))
 }
 
 // INV-7 的反向对照：只要还有一个健康候选，被停调的号就绝不能被选中。
@@ -312,7 +342,7 @@ func TestSelectAccountSkipsCapacityParkedAccountWhenHealthyOneExists(t *testing.
 // 选 model_mapping 而不是配额/平台/窗口费用，是因为只有它同时满足三个条件：
 // 不被仓库查询层的 IsSchedulable 预先滤掉（配额会）、不被按平台的查询滤掉
 // （平台会）、也不对 APIKey 账号直接短路（窗口费用与 RPM 会）。
-func TestSelectAccountFailsOpenWhenSurvivorIsFilteredByALaterGate(t *testing.T) {
+func TestSelectAccountWaitsForCooldownWhenSurvivorIsFilteredByALaterGate(t *testing.T) {
 	parked := mirasimCapacityParkedAccount(1, mirasimCapacityTestModel)
 
 	survivorAccount := mirasimCapacityParkedAccount(2, "") // 无停调 → 过得了弱判据
@@ -344,11 +374,9 @@ func TestSelectAccountFailsOpenWhenSurvivorIsFilteredByALaterGate(t *testing.T) 
 
 	result, err := svc.SelectAccountWithLoadAwareness(ctx, &groupID, "", mirasimCapacityTestModel, nil, "", 0)
 
-	require.NoError(t, err,
-		"真正的候选集是空的（唯一的幸存者被模型白名单挡掉），必须退化放行被停调的号")
-	require.NotNil(t, result)
-	require.NotNil(t, result.Account)
-	require.Equal(t, int64(1), result.Account.ID, "退化放行的应当是那个仅被容量停调挡住的号")
+	var cooling *MirasimCooldownError
+	require.ErrorAs(t, err, &cooling)
+	require.Nil(t, result)
 }
 
 // fail-open 只放行「唯一原因是容量停调」的账号：窗口耗尽的号必须照旧被挡住，
@@ -478,7 +506,7 @@ func TestMirasimCapacityParkLadderResets(t *testing.T) {
 	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
 	prevTTL := 16 * time.Minute
 
-	t.Run("停调解除后被成功用过就归零", func(t *testing.T) {
+	t.Run("其他模型成功不得重置本模型冷却", func(t *testing.T) {
 		resetAt := now.Add(-20 * time.Minute)
 		used := resetAt.Add(time.Minute) // 停调过期之后成功用过
 		a := mirasimParkAccountWith(scope, resetAt.Add(-prevTTL), resetAt, &used)
@@ -489,8 +517,8 @@ func TestMirasimCapacityParkLadderResets(t *testing.T) {
 			"fixture 必须落在衰减窗口内，否则归零可能是衰减造成的，这条断言就不承重")
 
 		ttl, prev := nextMirasimCapacityParkDuration(a, scope, capLimit, now)
-		require.Equal(t, mirasimCapacityParkBaseDuration, ttl,
-			"成功用过说明这个号已经好了，下次 503 该从第一档重来")
+		require.Equal(t, 32*time.Minute, ttl,
+			"账号级 LastUsedAt 不能证明该模型恢复")
 		require.Equal(t, prevTTL, prev)
 	})
 
