@@ -5,6 +5,9 @@ package ctxkey
 type Key string
 
 const (
+	// RequestStartedAt is set once at HTTP ingress, never reset by retries.
+	RequestStartedAt Key = "ctx_request_started_at"
+
 	// ForcePlatform 强制平台（用于 /antigravity 路由），由 middleware.ForcePlatform 设置
 	ForcePlatform Key = "ctx_force_platform"
 

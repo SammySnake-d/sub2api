@@ -15,7 +15,7 @@ package service
 //	INV-3 0 = 关闭       配置为 0 时行为与本功能上线前逐字节一致
 //	INV-4 不写账号级状态  停调不得改 RateLimitResetAt / Status / Schedulable
 //	INV-5 不与窗口冷却互相覆盖  mirasim:7d_claude / mirasim:7d_fable 与容量 scope 各管各的
-//	INV-6 fail-open      全池停调时选号仍然返回账号，而不是「无可用账号」
+//	INV-6 wait          全池停调返回等待提示；仅共享半开租约允许受控探测
 //	INV-7 fail-open 不滥用 还有正常候选时绝不放行被停调的账号
 
 import (
@@ -287,7 +287,7 @@ func mirasimCapacityGatewayFixture(t *testing.T, accounts []Account) (*GatewaySe
 	return svc, context.WithValue(context.Background(), ctxkey.Group, group), groupID
 }
 
-// ★ 最重要的一条：全池 503 停调时，选号必须仍然返回一个账号。
+// 全池容量冷却且无半开租约时返回等待提示，不绕过冷却。
 // 没有这条退化，一次全池级容量紧张会让这个模型从「慢」直接变成「10 分钟完全不可用」。
 func TestSelectAccountWaitsForCooldownWhenWholePoolIsCapacityParked(t *testing.T) {
 	svc, ctx, groupID := mirasimCapacityGatewayFixture(t, []Account{
@@ -561,4 +561,23 @@ func TestMirasimCapacityParkLadderResets(t *testing.T) {
 		require.Equal(t, mirasimCapacityParkBaseDuration, ttl)
 		require.Equal(t, time.Duration(0), prev)
 	})
+}
+
+// Diagnostic only: a cooldown wait hint should identify the earliest otherwise
+// eligible account, not the normal priority winner. No upstream calls occur.
+func TestMirasimCooldownHintEarliestRecovery(t *testing.T) {
+	now := time.Now()
+	slow := mirasimCapacityParkedAccount(1, "")
+	fast := mirasimCapacityParkedAccount(2, "")
+	scope := mirasimCapacityRateLimitScope(mirasimCapacityTestModel)
+	earliest := now.Add(time.Second).Truncate(time.Second)
+	setAccountModelRateLimitSnapshot(&slow, scope, now.Add(time.Hour), mirasimCapacityParkReason, now)
+	setAccountModelRateLimitSnapshot(&fast, scope, earliest, mirasimCapacityParkReason, now)
+	svc, ctx, groupID := mirasimCapacityGatewayFixture(t, []Account{slow, fast})
+	result, err := svc.SelectAccountWithLoadAwareness(ctx, &groupID, "", mirasimCapacityTestModel, nil, "", 0)
+	var cooling *MirasimCooldownError
+	require.ErrorAs(t, err, &cooling)
+	require.Nil(t, result)
+	t.Logf("wait hint=%s; earliest eligible reset=%s; delta=%s", cooling.RetryAt.Format(time.RFC3339Nano), earliest.Format(time.RFC3339Nano), cooling.RetryAt.Sub(earliest))
+	require.WithinDuration(t, earliest, cooling.RetryAt, time.Millisecond, "wait hint must select earliest recovery; current handler caps this extra delay to an 8-second polling interval")
 }

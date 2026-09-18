@@ -8,6 +8,9 @@ package service
 // 这里把那三臂逐条钉住，外加两条阴性对照。
 
 import (
+	"context"
+	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/tidwall/gjson"
 	"strings"
 	"testing"
 
@@ -120,4 +123,36 @@ func TestMirasimAvailabilityProbeMessageNamesTheFieldAndTheFix(t *testing.T) {
 		"客户端文案不许暴露我们是个代理")
 	require.NotContains(t, msg, "/v1/limits",
 		"不许引用我们不对外暴露的上游端点——那是上游指纹")
+}
+
+func TestMirasimSingleTokenCompatibilityIsExplicitAndScoped(t *testing.T) {
+	svc := &GatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{MirasimSingleTokenCompatibility: true}}}
+	for _, tc := range []struct {
+		input   string
+		want    int
+		changed bool
+	}{
+		{`{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"Write a Python division function"}]}`, 2, true},
+		{`{"max_tokens":0}`, 0, false}, {`{"max_tokens":-1}`, -1, false}, {`{"max_tokens":1.5}`, 1, false}, {`{"max_tokens":256}`, 256, false}, {`{"max_tokens":"1"}`, 1, false},
+	} {
+		body := []byte(tc.input)
+		out, err := svc.normalizeMirasimSingleToken(context.Background(), probeTestMirasimAccount(), body)
+		require.NoError(t, err)
+		if tc.changed {
+			require.Equal(t, int64(tc.want), gjson.GetBytes(out, "max_tokens").Int())
+			require.Equal(t, gjson.GetBytes(body, "messages").Raw, gjson.GetBytes(out, "messages").Raw)
+			require.Nil(t, mirasimAvailabilityProbeBlock(probeTestMirasimAccount(), out))
+		} else {
+			require.Equal(t, body, out)
+		}
+		plain, err := svc.normalizeMirasimSingleToken(context.Background(), probeTestPlainAccount(), body)
+		require.NoError(t, err)
+		require.Equal(t, body, plain)
+	}
+	svc.cfg.Gateway.MirasimSingleTokenCompatibility = false
+	body := []byte(`{"max_tokens":1}`)
+	out, err := svc.normalizeMirasimSingleToken(context.Background(), probeTestMirasimAccount(), body)
+	require.NoError(t, err)
+	require.Equal(t, body, out)
+	require.Nil(t, mirasimAvailabilityProbeBlock(probeTestMirasimAccount(), []byte(`{"max_tokens":1.5}`)))
 }

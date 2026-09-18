@@ -27,11 +27,19 @@ type mirasimRecoveryUpstream struct {
 	failedAttempts int
 	accounts       []int64
 	usage          []*service.UsageLog
+	recovered      []int64
+	stallFirst     bool
+	tokenBudgets   []int64
 }
 
 func (u *mirasimRecoveryUpstream) Do(req *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
 	u.accounts = append(u.accounts, accountID)
 	requestBody, _ := io.ReadAll(req.Body)
+	u.tokenBudgets = append(u.tokenBudgets, gjson.GetBytes(requestBody, "max_tokens").Int())
+	if u.stallFirst && len(u.accounts) == 1 {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	}
 	status := http.StatusOK
 	contentType := "application/json"
 	body := `{"id":"msg_recovered","type":"message","role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"recovered"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
@@ -65,6 +73,16 @@ func (r *mirasimRecoveryUsageRepo) Create(_ context.Context, log *service.UsageL
 	return true, nil
 }
 
+type mirasimRecoveryAccountRepo struct {
+	service.AccountRepository
+	upstream *mirasimRecoveryUpstream
+}
+
+func (r *mirasimRecoveryAccountRepo) ClearMirasimCapacityIfUnchanged(_ context.Context, id int64, scope, limited, reset string) (bool, error) {
+	r.upstream.recovered = append(r.upstream.recovered, id)
+	return true, nil
+}
+
 func newMirasimRecoveryHandler(t *testing.T, poolSize int, upstream *mirasimRecoveryUpstream) (*GatewayHandler, *service.APIKey) {
 	t.Helper()
 	group := &service.Group{ID: 9900, Hydrated: true, Platform: service.PlatformAnthropic, Status: service.StatusActive}
@@ -75,7 +93,7 @@ func newMirasimRecoveryHandler(t *testing.T, poolSize int, upstream *mirasimReco
 			ID: id, Platform: service.PlatformAnthropic, Type: service.AccountTypeAPIKey,
 			Status: service.StatusActive, Schedulable: true, Concurrency: 1, Priority: i,
 			Credentials:   map[string]any{"provider": "mirasim", "api_key": "test-key", "pool_mode": true, "pool_mode_retry_count": float64(0)},
-			Extra:         map[string]any{"anthropic_passthrough": true},
+			Extra:         map[string]any{"anthropic_passthrough": true, "model_rate_limits": map[string]any{"mirasim:capacity:claude-fable-5-1": map[string]any{"rate_limited_at": time.Unix(0, 0).UTC().Format(time.RFC3339), "rate_limit_reset_at": time.Unix(3600, 0).UTC().Format(time.RFC3339)}}},
 			AccountGroups: []service.AccountGroup{{AccountID: id, GroupID: group.ID}},
 		}
 	}
@@ -83,9 +101,11 @@ func newMirasimRecoveryHandler(t *testing.T, poolSize int, upstream *mirasimReco
 	t.Cleanup(cleanup)
 	h.maxAccountSwitches = 10
 	snapshot := service.NewSchedulerSnapshotService(&fakeSchedulerCache{accounts: accounts}, nil, nil, nil, nil)
-	cfg := &config.Config{RunMode: config.RunModeSimple}
+	cfg := &config.Config{RunMode: config.RunModeSimple, Gateway: config.DefaultMirasimRecoveryConfig()}
+	cfg.Gateway.MirasimFirstOutputTimeoutSeconds = 2
+	cfg.Gateway.MirasimSingleTokenCompatibility = true
 	h.gatewayService = service.NewGatewayService(
-		nil, &fakeGroupRepo{group: group}, &mirasimRecoveryUsageRepo{upstream: upstream}, nil, nil, nil, nil, nil, cfg, snapshot,
+		&mirasimRecoveryAccountRepo{upstream: upstream}, &fakeGroupRepo{group: group}, &mirasimRecoveryUsageRepo{upstream: upstream}, nil, nil, nil, nil, nil, cfg, snapshot,
 		nil, service.NewBillingService(cfg, nil), nil, nil, nil, upstream, service.NewDeferredService(nil, nil, time.Minute), nil, nil, nil, nil, nil,
 		&service.TLSFingerprintProfileService{}, nil, nil, nil, nil, nil,
 	)
@@ -106,10 +126,12 @@ func TestMirasimRecoveryHandler(t *testing.T) {
 		pool, failed, window int
 		minWait, maxWait     time.Duration
 		success              bool
+		stall                bool
 	}{
-		{"healthy_beyond_ten", 13, 12, 90, 0, time.Second, true},
-		{"recovers_after_two_full_rounds", 3, 6, 90, 1500 * time.Millisecond, 3 * time.Second, true},
-		{"all_down_stops_at_window", 2, 10000, 2, 2 * time.Second, 2*time.Second + time.Nanosecond, false},
+		{"healthy_beyond_ten", 13, 12, 90, 0, time.Second, true, false},
+		{"recovers_after_two_full_rounds", 3, 6, 90, 1500 * time.Millisecond, 3 * time.Second, true, false},
+		{"stalled_attempt_switches", 2, 0, 90, 2 * time.Second, 3 * time.Second, true, true},
+		{"all_down_stops_at_window", 2, 10000, 2, 2 * time.Second, 2*time.Second + time.Nanosecond, false, false},
 	}
 	for _, endpoint := range endpoints {
 		for _, scenario := range scenarios {
@@ -119,7 +141,7 @@ func TestMirasimRecoveryHandler(t *testing.T) {
 					name = endpoint.path + "/" + scenario.name + "/stream"
 				}
 				t.Run(name, func(t *testing.T) {
-					upstream := &mirasimRecoveryUpstream{failedAttempts: scenario.failed}
+					upstream := &mirasimRecoveryUpstream{failedAttempts: scenario.failed, stallFirst: scenario.stall}
 					h, key := newMirasimRecoveryHandler(t, scenario.pool, upstream)
 					policy := config.DefaultMirasimRecoveryConfig()
 					policy.MirasimFailoverWindowSeconds = scenario.window
@@ -128,6 +150,7 @@ func TestMirasimRecoveryHandler(t *testing.T) {
 						rec := httptest.NewRecorder()
 						c, _ := gin.CreateTestContext(rec)
 						ctx := context.WithValue(context.Background(), ctxkey.Group, key.Group)
+						ctx = context.WithValue(ctx, ctxkey.RequestStartedAt, time.Now())
 						body := strings.TrimSuffix(endpoint.body, "}") + `,"stream":` + strconv.FormatBool(stream) + `}`
 						c.Request = httptest.NewRequest(http.MethodPost, endpoint.path, strings.NewReader(body)).WithContext(ctx)
 						c.Request.Header.Set("Content-Type", "application/json")
@@ -148,11 +171,19 @@ func TestMirasimRecoveryHandler(t *testing.T) {
 						if scenario.success {
 							require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 							require.Contains(t, rec.Body.String(), "recovered")
-							require.Len(t, upstream.accounts, scenario.failed+1)
+							expected := scenario.failed + 1
+							if scenario.stall {
+								expected++
+							}
+							require.Len(t, upstream.accounts, expected)
 							require.Len(t, upstream.usage, 1, "only the successful attempt records usage")
+							require.NotNil(t, upstream.usage[0].DurationMs)
+							require.GreaterOrEqual(t, *upstream.usage[0].DurationMs, int(scenario.minWait.Milliseconds()), "stored duration includes all retry rounds")
+							require.Equal(t, []int64{upstream.accounts[len(upstream.accounts)-1]}, upstream.recovered, "all entrypoints clear only the successful account/model generation")
 						} else {
 							require.GreaterOrEqual(t, rec.Code, 500, rec.Body.String())
 							require.Empty(t, upstream.usage)
+							require.Empty(t, upstream.recovered)
 							require.Less(t, len(upstream.accounts), 20, "exhaustion must not spin")
 						}
 						for offset := 0; offset < len(upstream.accounts); offset += scenario.pool {

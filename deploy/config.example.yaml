@@ -220,6 +220,15 @@ gateway:
   mirasim_backoff_initial_ms: 1000
   mirasim_backoff_max_ms: 8000
   mirasim_backoff_jitter: 0.5
+  # 全池容量冷却时，共享半开探测最小间隔；0关闭。不会绕过额度/权限限制。
+  # 用真实等待请求探测，无后台合成推理；成功仅恢复该账号的该模型。
+  mirasim_recovery_probe_interval_seconds: 5
+  # 单次尝试从发起到首次有效输出的期限（秒）；ping/message_start不算输出，0关闭。
+  # 思考内容/工具调用属于有效输出，已提交后绝不跨账号拼接或重放。
+  mirasim_first_output_timeout_seconds: 60
+  # 显式兼容 max_tokens=1 的调用方：只将1改成上游最小2，最多多生成1 token。
+  # 真实请求/实际用量照常计费，不伪造成功。默认关闭。
+  mirasim_single_token_compatibility: false
   mirasim_cooldown_base_seconds: 30
   mirasim_cooldown_decay_seconds: 1800
   # OpenAI/Codex upstream response header timeout (seconds, 0=disabled)

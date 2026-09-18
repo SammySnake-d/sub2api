@@ -33,19 +33,16 @@ package service
 // 客户 key，集中打在 2 个账号上（mirasim-112 ×17、mirasim-137 ×2），
 // 占同期 /v1/messages 总量的约 28%。
 //
-// # 为什么不改写 max_tokens 让它成功
-//
-// 把 1 改成 2 确实能让它返回 200（第三臂已证），但那是偷改客户声明的参数：
-// max_tokens 是调用方的契约，一个真的只要 1 个 token 的调用方会拿到 2 个。
-// 用一个静默的语义违规去换一条探测请求的成功，不划算。
-//
-// # 为什么不本地合成一个假的 200
-//
-// 那会向客户报告一次从未发生的模型调用。探活场景下看着无害，但只要有一个调用方
-// 真的在读那 1 个 token 的内容，我们返回的就是编造的。
+// 默认保持调用方的输出预算。运维显式启用 single-token compatibility 时，
+// 允许 1→2 以满足该上游最小输出限制；真实请求、usage 和费用照常记录。
+// 0、负数、分数和其他供应商不参与兼容；不合成模型回复。
 
 import (
+	"context"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+	"go.uber.org/zap"
 )
 
 // mirasimAvailabilityProbeMaxTokens 是上游判定「探活」的输出上限门槛。
@@ -83,7 +80,7 @@ func isMirasimAvailabilityProbe(body []byte) bool {
 	}
 	// 非整数或负数一律不拦：那是另一类坏 body，该由上游给出它自己的判定。
 	n := maxTokens.Int()
-	return n >= 0 && n <= mirasimAvailabilityProbeMaxTokens
+	return maxTokens.Float() == float64(n) && n >= 0 && n <= mirasimAvailabilityProbeMaxTokens
 }
 
 // MirasimAvailabilityProbeError 表示这条请求会被 mirasim 当成探活拒掉，我们在本地
@@ -120,4 +117,21 @@ func mirasimAvailabilityProbeModelHint(body []byte) string {
 		return "(未记录模型)"
 	}
 	return model
+}
+
+// Normalize only a valid, explicitly configured one-token budget. All caller
+// content and model identities are left intact, including on retries.
+func (s *GatewayService) normalizeMirasimSingleToken(ctx context.Context, account *Account, body []byte) ([]byte, error) {
+	if !IsMirasimAccount(account) || s.cfg == nil || !s.cfg.Gateway.MirasimSingleTokenCompatibility {
+		return body, nil
+	}
+	value := gjson.GetBytes(body, "max_tokens")
+	if value.Type != gjson.Number || value.Float() != 1 || !gjson.ValidBytes(body) {
+		return body, nil
+	}
+	out, err := sjson.SetBytes(body, "max_tokens", 2)
+	if err == nil {
+		logger.FromContext(ctx).Info("gateway.mirasim_output_limit_compatibility", zap.Int64("account_id", account.ID), zap.Int("requested_max_tokens", 1), zap.Int("upstream_max_tokens", 2))
+	}
+	return out, err
 }

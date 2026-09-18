@@ -7,5 +7,5 @@ const DefaultMirasimFailoverWindowSeconds = 0
 func DefaultMirasimRecoveryConfig() GatewayConfig {
 	return GatewayConfig{MirasimFailoverEnabled: true, MirasimFailoverWindowSeconds: DefaultMirasimFailoverWindowSeconds,
 		MirasimBackoffInitialMS: 1000, MirasimBackoffMaxMS: 8000, MirasimBackoffJitter: 0.5,
-		MirasimCooldownBaseSeconds: 30, MirasimCooldownDecaySeconds: 1800}
+		MirasimFirstOutputTimeoutSeconds: 60, MirasimRecoveryProbeIntervalSeconds: 5, MirasimCooldownBaseSeconds: 30, MirasimCooldownDecaySeconds: 1800}
 }

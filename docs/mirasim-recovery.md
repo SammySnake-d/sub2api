@@ -1,0 +1,25 @@
+# Mirasim recovery controls
+
+Capacity errors remain separate from account quota/auth failures. Normal selection skips persisted per-account/model cooldowns. When every otherwise eligible account is cooling, an optional Redis lease admits one real waiting request as an early recovery probe. Probe start rate is shared by requested model across groups/instances; every group/model/quota/profit/session guard still applies. Failed probes retain their history. Success clears only the exact account/model cooldown generation observed by that attempt, including `/v1/messages`.
+
+`gateway` settings in the operator's `config.yaml` (environment overrides use uppercase `GATEWAY_` names):
+
+| Setting | Default | Behavior |
+|---|---:|---|
+| `mirasim_recovery_probe_interval_seconds` | 5 | Minimum interval between half-open probe starts; 0 disables. Distributed lease prevents concurrent probes while valid. Fresh failures wait at least the configured cooldown base before probing. Redis unavailable means ordinary cooldown selection only. |
+| `mirasim_first_output_timeout_seconds` | 60 | Per-attempt signing/header/first meaningful SSE output deadline. Non-stream responses must complete within this deadline. 0 disables. Pings and empty metadata do not count. Text, thinking and tool starts commit the attempt; an accepted stream is never cut off by this deadline or replayed. |
+| `mirasim_single_token_compatibility` | false | Explicitly allow `max_tokens: 1` to become 2 for Mirasim only. The upstream does not accept a one-token budget. This may produce one extra token; actual usage is billed. It never returns synthetic success. Other values/providers are unchanged. |
+
+Existing recovery window, backoff/jitter, cooldown base/decay, and `mirasim_capacity_park_minutes` remain effective. Window 0 continues waiting until recovery or client cancellation. A long-wait policy cannot promise success while the provider has no capacity; caller/proxy deadlines still apply.
+
+Edit the persistent operator configuration and restart the inactive blue/green instance; these are startup settings, not a hot-reload API. Validate that instance, switch the proxy after acceptance, then drain the old instance. Existing cooldown/quota rows require no reset or migration. Rolling back the binary is compatible with the new Redis lease keys, which expire.
+
+Observability:
+
+- `gateway.waiting_capacity`: next selection time, wait interval, account switch count.
+- `gateway.mirasim_capacity_probe`: admitted account/model and age since failure.
+- `gateway.request_timing`: total request duration, final attempt, preceding selection/retries, first output. Usage duration/TTFT includes time before the final attempt. Token amounts/prices/idempotency are unchanged.
+- `gateway.mirasim_output_limit_compatibility`: requested and upstream output limits.
+- Canceled Anthropic requests retain cancellation classification instead of a generic upstream 502.
+
+Verification includes Redis concurrent claims/owner renewal/expiry, quota/model exclusions, hour-long cooldown recovery, first-output pings/header stalls, cancellation, and no truncation of accepted streams. Three protocol entrypoints are tested for account failover, exactly one usage record, cooldown recovery, and end-to-end duration. These simulated results do not prove live upstream capacity; release acceptance must include a real completion event.

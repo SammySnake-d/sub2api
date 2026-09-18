@@ -1151,12 +1151,15 @@ type GatewayConfig struct {
 	// 是否允许对部分 400 错误触发 failover（默认关闭以避免改变语义）
 	FailoverOn400 bool `mapstructure:"failover_on_400"`
 
-	MirasimFailoverEnabled      bool    `mapstructure:"mirasim_failover_enabled"`
-	MirasimBackoffInitialMS     int     `mapstructure:"mirasim_backoff_initial_ms"`
-	MirasimBackoffMaxMS         int     `mapstructure:"mirasim_backoff_max_ms"`
-	MirasimBackoffJitter        float64 `mapstructure:"mirasim_backoff_jitter"`
-	MirasimCooldownBaseSeconds  int     `mapstructure:"mirasim_cooldown_base_seconds"`
-	MirasimCooldownDecaySeconds int     `mapstructure:"mirasim_cooldown_decay_seconds"`
+	MirasimFailoverEnabled              bool    `mapstructure:"mirasim_failover_enabled"`
+	MirasimBackoffInitialMS             int     `mapstructure:"mirasim_backoff_initial_ms"`
+	MirasimBackoffMaxMS                 int     `mapstructure:"mirasim_backoff_max_ms"`
+	MirasimBackoffJitter                float64 `mapstructure:"mirasim_backoff_jitter"`
+	MirasimCooldownBaseSeconds          int     `mapstructure:"mirasim_cooldown_base_seconds"`
+	MirasimSingleTokenCompatibility     bool    `mapstructure:"mirasim_single_token_compatibility"`
+	MirasimFirstOutputTimeoutSeconds    int     `mapstructure:"mirasim_first_output_timeout_seconds"`
+	MirasimRecoveryProbeIntervalSeconds int     `mapstructure:"mirasim_recovery_probe_interval_seconds"`
+	MirasimCooldownDecaySeconds         int     `mapstructure:"mirasim_cooldown_decay_seconds"`
 	// Mirasim 临时故障恢复窗口（秒）。0 等到成功或客户端取消。
 	// 窗口限制新尝试的发起，不会中断已成功开始的响应。
 	MirasimFailoverWindowSeconds int `mapstructure:"mirasim_failover_window_seconds"`
@@ -2486,6 +2489,9 @@ func setDefaults() {
 	viper.SetDefault("gateway.mirasim_backoff_jitter", 0.5)
 	viper.SetDefault("gateway.mirasim_cooldown_base_seconds", 30)
 	viper.SetDefault("gateway.mirasim_cooldown_decay_seconds", 1800)
+	viper.SetDefault("gateway.mirasim_recovery_probe_interval_seconds", 5)
+	viper.SetDefault("gateway.mirasim_first_output_timeout_seconds", 60)
+	viper.SetDefault("gateway.mirasim_single_token_compatibility", false)
 	viper.SetDefault("gateway.max_account_switches_gemini", 3)
 	viper.SetDefault("gateway.force_codex_cli", false)
 	viper.SetDefault("gateway.disable_codex_identity_enforcement", false)
@@ -3410,6 +3416,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Gateway.ResponseHeaderTimeout < 0 {
 		return fmt.Errorf("gateway.response_header_timeout must be non-negative")
+	}
+	if c.Gateway.MirasimFirstOutputTimeoutSeconds < 0 || c.Gateway.MirasimFirstOutputTimeoutSeconds > 1800 {
+		return fmt.Errorf("gateway.mirasim_first_output_timeout_seconds must be 0-1800 (0 disables)")
+	}
+	if c.Gateway.MirasimRecoveryProbeIntervalSeconds < 0 || c.Gateway.MirasimRecoveryProbeIntervalSeconds > 300 {
+		return fmt.Errorf("gateway.mirasim_recovery_probe_interval_seconds must be 0-300 (0 disables half-open probes)")
 	}
 	if c.Gateway.MirasimFailoverWindowSeconds < 0 || c.Gateway.MirasimFailoverWindowSeconds > 600 {
 		return fmt.Errorf("gateway.mirasim_failover_window_seconds must be between 0-600 seconds")

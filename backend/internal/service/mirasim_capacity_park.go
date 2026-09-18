@@ -50,6 +50,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -399,11 +400,14 @@ func mirasimCapacityParkIsSoleBlocker(ctx context.Context, a *Account, requested
 // mirasimCapacityParkObserver 记录「本轮有没有账号是只被容量停调挡住的」。
 // 它只在选号期间挂在 ctx 上，所以正常请求路径上不会有任何额外开销。
 type mirasimCapacityParkObserver struct {
-	blocked atomic.Bool
+	blocked    atomic.Bool
+	earliest   atomic.Int64
+	mu         sync.Mutex
+	candidates map[int64]time.Time
 }
 
-// MirasimCooldownError means an eligible account exists, but must not receive
-// another upstream request until its persisted model cooldown expires.
+// MirasimCooldownError reports the next selection wake-up. Normal admission
+// observes persisted cooldowns; a distributed half-open permit may probe early.
 type MirasimCooldownError struct{ RetryAt time.Time }
 
 func (e *MirasimCooldownError) Error() string { return "eligible upstream accounts are cooling down" }
@@ -415,7 +419,7 @@ type mirasimCapacityParkIgnoreKey struct{}
 
 // withMirasimCapacityParkObserver 给一轮选号挂上观察器。
 func withMirasimCapacityParkObserver(ctx context.Context) (context.Context, *mirasimCapacityParkObserver) {
-	obs := &mirasimCapacityParkObserver{}
+	obs := &mirasimCapacityParkObserver{candidates: make(map[int64]time.Time)}
 	return context.WithValue(ctx, mirasimCapacityParkObserverKey{}, obs), obs
 }
 
@@ -447,11 +451,26 @@ func mirasimCapacityParkAdmits(ctx context.Context, a *Account, requestedModel s
 		return false
 	}
 	if mirasimCapacityParkIgnored(ctx) {
+		if only, ok := ctx.Value(mirasimProbeAccountKey{}).(int64); ok && only != a.ID {
+			return false
+		}
 		return true
 	}
 	// 严格轮：不放行，但记下「退化是有意义的」，供入口决定要不要重选。
 	if obs := mirasimCapacityParkObserverFrom(ctx); obs != nil {
 		obs.blocked.Store(true)
+		if failed := a.modelRateLimitTimestamp(mirasimCapacityRateLimitScope(a.GetMappedModel(requestedModel)), "rate_limited_at"); failed != nil {
+			obs.mu.Lock()
+			obs.candidates[a.ID] = *failed
+			obs.mu.Unlock()
+		}
+		if reset := a.modelRateLimitResetAt(mirasimCapacityRateLimitScope(a.GetMappedModel(requestedModel))); reset != nil {
+			for old := obs.earliest.Load(); old == 0 || reset.UnixNano() < old; old = obs.earliest.Load() {
+				if obs.earliest.CompareAndSwap(old, reset.UnixNano()) {
+					break
+				}
+			}
+		}
 	}
 	return false
 }

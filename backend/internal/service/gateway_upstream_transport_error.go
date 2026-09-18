@@ -50,6 +50,11 @@ func (s *GatewayService) handleUpstreamTransportError(ctx context.Context, c *gi
 	event.Message = safeErr
 	appendOpsUpstreamError(c, event)
 
+	var preOutputFailure *UpstreamFailoverError
+	if errors.As(err, &preOutputFailure) {
+		return preOutputFailure
+	}
+
 	// Client disconnected: do NOT fail over to another account and do NOT
 	// evict this one — the upstream never had a chance to exhibit a fault.
 	if errors.Is(err, context.Canceled) || (errors.Is(err, context.DeadlineExceeded) && errors.Is(ctx.Err(), context.DeadlineExceeded)) {

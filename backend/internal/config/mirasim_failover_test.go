@@ -69,3 +69,26 @@ func TestLoadMirasimRecoveryKnobs(t *testing.T) {
 	require.Equal(t, 45, cfg.Gateway.MirasimCooldownBaseSeconds)
 	require.Equal(t, 900, cfg.Gateway.MirasimCooldownDecaySeconds)
 }
+
+func TestLoadMirasimProbeAndFirstOutputPersist(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(file, []byte("gateway:\n  mirasim_recovery_probe_interval_seconds: 7\n  mirasim_first_output_timeout_seconds: 90\n  mirasim_single_token_compatibility: true\n"), 0600))
+	for i := 0; i < 2; i++ {
+		resetViperWithJWTSecret(t)
+		t.Setenv("CONFIG_FILE", file)
+		cfg, err := Load()
+		require.NoError(t, err)
+		require.Equal(t, 7, cfg.Gateway.MirasimRecoveryProbeIntervalSeconds)
+		require.Equal(t, 90, cfg.Gateway.MirasimFirstOutputTimeoutSeconds)
+		require.True(t, cfg.Gateway.MirasimSingleTokenCompatibility)
+	}
+	for _, key := range []string{"GATEWAY_MIRASIM_RECOVERY_PROBE_INTERVAL_SECONDS", "GATEWAY_MIRASIM_FIRST_OUTPUT_TIMEOUT_SECONDS"} {
+		resetViperWithJWTSecret(t)
+		t.Setenv(key, "-1")
+		_, err := Load()
+		require.Error(t, err)
+		t.Setenv(key, "0")
+		_, err = Load()
+		require.NoError(t, err)
+	}
+}

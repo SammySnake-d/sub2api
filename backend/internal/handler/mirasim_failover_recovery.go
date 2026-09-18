@@ -120,6 +120,7 @@ func (s *FailoverState) HandleCooldownSelection(ctx context.Context, err error) 
 	if !s.recoveryDeadline.IsZero() && delay > time.Until(s.recoveryDeadline) {
 		delay = time.Until(s.recoveryDeadline)
 	}
+	logger.FromContext(ctx).Info("gateway.waiting_capacity", zap.Time("retry_at", cooling.RetryAt), zap.Duration("wait", delay), zap.Int("switch_count", s.SwitchCount))
 	if !s.recoveryWait(ctx, delay) {
 		return FailoverCanceled, true
 	}

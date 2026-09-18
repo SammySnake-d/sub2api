@@ -90,6 +90,7 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 // Forward 转发请求到Claude API
 func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, parsed *ParsedRequest) (result *ForwardResult, err error) {
 	startTime := time.Now()
+	defer func() { recordGatewayEndToEndTiming(ctx, startTime, result) }()
 	if parsed == nil {
 		return nil, fmt.Errorf("parse request: empty request")
 	}
@@ -120,10 +121,12 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 				passthroughModel = mappedModel
 			}
 		}
-		// mirasim 把 max_tokens ≤ 1 的请求读成「探活」并 400 拒掉，而我们补不了
-		// 任何东西让它成功（带上合法 metadata.user_id 实测照样 400）。既然注定失败，
-		// 就在这里用上游的原样文案回掉，不再白烧一次上游往返、也不把账号往
-		// 「探活器」那个特征上推。判据与实测见 mirasim_availability_probe.go。
+		// An explicit operator compatibility setting may lift 1 to the
+		// provider minimum 2; otherwise retain the original 400 contract.
+		passthroughBody, err = s.normalizeMirasimSingleToken(ctx, account, passthroughBody)
+		if err != nil {
+			return nil, err
+		}
 		if probeErr := mirasimAvailabilityProbeBlock(account, passthroughBody); probeErr != nil {
 			logger.LegacyPrintf("service.gateway",
 				"mirasim availability probe rejected locally: model=%s account=%s (upstream would reject it anyway)",

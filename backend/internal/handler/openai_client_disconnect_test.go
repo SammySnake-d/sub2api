@@ -23,3 +23,20 @@ func TestOpenAIEnsureForwardErrorResponse_SkipsCanceledClient(t *testing.T) {
 	require.Equal(t, statusClientClosedRequest, c.Writer.Status())
 	require.Empty(t, recorder.Body.String())
 }
+
+func TestAnthropicCanceledClientMustNotBecome502(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	ctx, cancel := context.WithCancel(context.Background())
+	c.Request = httptest.NewRequest(http.MethodPost, EndpointResponses, nil).WithContext(ctx)
+	cancel()
+
+	h := &GatewayHandler{}
+	wrote := h.ensureForwardErrorResponse(c, false)
+	t.Logf("canceled=%v; fallback_written=%v; status=%d", ctx.Err(), wrote, c.Writer.Status())
+	require.Equal(t, statusClientClosedRequest, c.Writer.Status(), "canceled request must not be classified as an upstream 502")
+	require.False(t, wrote)
+	require.Equal(t, statusClientClosedRequest, c.Writer.Status())
+	require.Empty(t, recorder.Body.String())
+}

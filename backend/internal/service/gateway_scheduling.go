@@ -108,6 +108,10 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 		return result, err
 	}
 
+	if probe := s.tryMirasimCapacityProbe(ctx, groupID, sessionHash, requestedModel, excludedIDs, metadataUserID, sub2apiUserID, parkObserver); probe != nil {
+		return probe, nil
+	}
+
 	// The second pass proves eligibility through ALL existing guards. Its
 	// candidate is only a wait hint, never permission to bypass the cooldown.
 	result, err = s.selectAccountWithLoadAwarenessOnce(withMirasimCapacityParkIgnored(ctx), groupID, sessionHash, requestedModel, excludedIDs, metadataUserID, sub2apiUserID)
@@ -123,7 +127,17 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 		result.ReleaseFunc()
 	}
 	s.ReleaseAccountSession(ctx, result.Account, sessionHash)
-	return nil, &MirasimCooldownError{RetryAt: *reset}
+	// A wait hint is not admission: wake for the earliest potential recovery,
+	// then run every guard again. Never sleep until a sticky/priority winner
+	// while another candidate could become eligible sooner.
+	retryAt := *reset
+	if earliest := parkObserver.earliest.Load(); earliest > 0 && time.Unix(0, earliest).Before(retryAt) {
+		retryAt = time.Unix(0, earliest)
+	}
+	if interval := s.mirasimProbeInterval(); interval > 0 && time.Now().Add(interval).Before(retryAt) {
+		retryAt = time.Now().Add(interval)
+	}
+	return nil, &MirasimCooldownError{RetryAt: retryAt}
 }
 
 func (s *GatewayService) selectAccountWithLoadAwarenessOnce(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, metadataUserID string, sub2apiUserID int64) (*AccountSelectionResult, error) {
